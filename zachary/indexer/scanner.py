@@ -93,7 +93,9 @@ def _list_dir(store: FileStore, dir_path: str, root_dev: int | None) -> _Listing
                     is_dir = de.is_dir(follow_symlinks=False)
                     if not is_dir and not de.is_file(follow_symlinks=False):
                         continue
-                    if matcher.excludes_name(name, is_dir=is_dir):
+                    if matcher.excludes_name(name, is_dir=is_dir) or (
+                        is_dir and matcher.hidden_attr(st)
+                    ):
                         excluded += 1
                         continue
                     path = prefix + name

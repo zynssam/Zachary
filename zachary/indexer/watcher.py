@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 DEFAULT_DEBOUNCE_S = 1.5
 MAX_BATCH = 20_000
 
+_HAS_FILE_ATTRS = hasattr(os.stat_result, "st_file_attributes")
 _IGNORED = frozenset({EVENT_TYPE_OPENED, EVENT_TYPE_CLOSED_NO_WRITE})
 
 
@@ -66,8 +67,10 @@ class _Handler(FileSystemEventHandler):
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.event_type in _IGNORED:
             return
-        if event.is_directory and event.event_type == "modified":
+        if event.is_directory and event.event_type == "modified" and not _HAS_FILE_ATTRS:
             return  # a folder's own mtime; its children report themselves
+        # Where folders have a "hidden" attribute (Windows), hiding/un-hiding shows up only
+        # as a modified event on the folder itself, so those are kept there.
         paths = [_s(event.src_path)]
         dest = getattr(event, "dest_path", "")
         if dest:

@@ -141,3 +141,15 @@ def test_edit_logged_once(watcher: Watcher, store: FileStore, home: Path) -> Non
         "SELECT count(*) FROM access_log WHERE file_id = ? AND source = 'edit'", (fid,)
     ).fetchone()[0]
     assert n == 1
+
+
+def test_unhiding_a_folder_indexes_it(watcher: Watcher, store: FileStore, home: Path) -> None:
+    hidden = home / ".notes"
+    write(hidden / "plan.md")
+    marker = write(home / "docs" / "sync.txt")
+    wait_until(lambda: _row(store, marker) is not None)
+    assert _row(store, hidden / "plan.md") is None  # hidden: not indexed
+    os.rename(hidden, home / "notes")  # un-hide
+    wait_until(lambda: _row(store, home / "notes" / "plan.md") is not None)
+    os.rename(home / "notes", hidden)  # hide again
+    wait_until(lambda: _row(store, home / "notes" / "plan.md") is None)

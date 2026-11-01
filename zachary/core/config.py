@@ -191,6 +191,9 @@ def canonical_path(path: str | os.PathLike[str], *, case_insensitive: bool) -> s
     return p
 
 
+FILE_ATTRIBUTE_HIDDEN = 0x2  # stat().st_file_attributes bit (Windows)
+
+
 @dataclass(frozen=True, slots=True)
 class ExcludeMatcher:
     """Fast, precompiled exclude check used on the scanner/watcher hot path."""
@@ -226,6 +229,15 @@ class ExcludeMatcher:
             case_insensitive,
             frozenset(norm),
             skip_hidden_dirs,
+        )
+
+    def hidden_attr(self, st: os.stat_result) -> bool:
+        """Folder carries the Windows "hidden" attribute (only when hidden folders are skipped).
+
+        ``st_file_attributes`` only exists on Windows, so this is False elsewhere.
+        """
+        return self.skip_hidden_dirs and bool(
+            getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_HIDDEN
         )
 
     def excludes_name(self, name: str, *, is_dir: bool) -> bool:

@@ -116,3 +116,30 @@ def test_usn_read_sees_create_and_rename(home: Path) -> None:
     assert ("diag_a.txt", 0x1000) in mine  # RENAME_OLD_NAME
     assert ("diag_b.txt", 0x2000) in mine  # RENAME_NEW_NAME
     assert nxt.next_usn > cur.next_usn
+
+
+def _set_hidden(path: Path, hidden: bool) -> None:
+    import ctypes
+
+    attrs = 0x2 if hidden else 0x80  # FILE_ATTRIBUTE_HIDDEN / FILE_ATTRIBUTE_NORMAL
+    assert ctypes.windll.kernel32.SetFileAttributesW(str(path), attrs)  # type: ignore[attr-defined,unused-ignore]
+
+
+@win_only
+def test_windows_hidden_attribute_folders(store: FileStore, home: Path) -> None:
+    from zachary.indexer.scanner import scan
+
+    folder = home / "Private"
+    f = write(folder / "secret plan.txt")
+    _set_hidden(folder, True)
+    scan(store)
+    assert store.get_row(store.norm(f)) is None  # hidden attribute: skipped
+    # Watcher-style re-check of a file inside it also refuses it.
+    store.reconcile_paths([str(f)])
+    assert store.get_row(store.norm(f)) is None
+    _set_hidden(folder, False)  # un-hide
+    store.reconcile_paths([str(folder)])
+    assert store.get_row(store.norm(f)) is not None
+    _set_hidden(folder, True)  # hide again: purged on the next check
+    store.reconcile_paths([str(folder)])
+    assert store.get_row(store.norm(f)) is None

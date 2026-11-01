@@ -186,6 +186,29 @@ class FileStore:
     def is_excluded(self, path: str, is_dir: bool) -> bool:
         return self.rules.is_excluded(path, is_dir)
 
+    def in_hidden_folder(self, path: str, is_dir: bool) -> bool:
+        """True if ``path`` (a folder) or a folder between its root and it has the Windows
+        hidden attribute. Dot-folders are handled by name rules; on Linux this is a no-op.
+        Un-hiding a folder makes it (and its contents) indexable again.
+        """
+        if not self.matcher.skip_hidden_dirs or not hasattr(os.stat_result, "st_file_attributes"):
+            return False
+        root = self.root_for(path)
+        if root is None:
+            return False
+        d = path if is_dir else os.path.dirname(path)
+        while len(d) > len(root):
+            try:
+                if self.matcher.hidden_attr(os.lstat(d)):
+                    return True
+            except OSError:
+                return False
+            nxt = os.path.dirname(d)
+            if nxt == d:
+                break
+            d = nxt
+        return False
+
     # -- reads -----------------------------------------------------------------
     def get_row(self, path: str) -> Row | None:
         r = self.conn.execute(f"SELECT {_ROW_COLS} FROM files WHERE path = ?", (path,)).fetchone()
@@ -441,8 +464,8 @@ class FileStore:
             e = stat_entry(raw)
             if e is None:
                 missing.append(raw)
-            elif self.is_excluded(raw, e.is_dir):
-                missing.append(raw)  # excluded now: drop whatever we had
+            elif self.is_excluded(raw, e.is_dir) or self.in_hidden_folder(raw, e.is_dir):
+                missing.append(raw)  # excluded now (or hidden): drop whatever we had
             else:
                 present.append(e)
         # Parents before children; existing paths before deletions so moves keep identity.
