@@ -221,7 +221,9 @@ def _usn_cursor(root: Path) -> JournalCursor | None:
     return None if q is None else JournalCursor(journal_id=q[0], next_usn=q[2])
 
 
-def _usn_read(root: Path, since: JournalCursor) -> tuple[list[JournalRecord], JournalCursor] | None:
+def _usn_read(
+    root: Path, since: JournalCursor, codes: list[int] | None = None
+) -> tuple[list[JournalRecord], JournalCursor] | None:
     if sys.platform != "win32":
         return None
     import ctypes
@@ -242,7 +244,7 @@ def _usn_read(root: Path, since: JournalCursor) -> tuple[list[JournalRecord], Jo
         start = since.next_usn
         buf = ctypes.create_string_buffer(_READ_BUF)
         ret = wintypes.DWORD()
-        codes = [_FSCTL_READ_UNPRIVILEGED_USN_JOURNAL, _FSCTL_READ_USN_JOURNAL]
+        codes = list(codes or [_FSCTL_READ_UNPRIVILEGED_USN_JOURNAL, _FSCTL_READ_USN_JOURNAL])
         while True:
             # READ_USN_JOURNAL_DATA_V0 -> V2 records (64-bit ids, same as st_ino on NTFS).
             req = struct.pack("<qIIQQQ", start, 0xFFFFFFFF, 0, 0, 0, jid)

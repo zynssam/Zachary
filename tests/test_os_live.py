@@ -97,3 +97,33 @@ def test_linux_watch_limit_reads_proc() -> None:
 
     lim = LinuxPlatform().check_watch_limit(1)
     assert lim.ok and (lim.current is None or lim.current > 0)
+
+
+@win_only
+def test_usn_diagnostics(home: Path) -> None:
+    """Which journal read works on this machine, and does it see our own changes?"""
+    from zachary.core.platform import windows as w
+
+    cur = w._usn_cursor(home)
+    if cur is None:
+        pytest.skip("USN journal not readable")
+    a = write(home / "diag_a.txt")
+    os.rename(a, home / "diag_b.txt")
+    report: dict[str, object] = {}
+    for label, code in (
+        ("unprivileged", w._FSCTL_READ_UNPRIVILEGED_USN_JOURNAL),
+        ("classic", w._FSCTL_READ_USN_JOURNAL),
+    ):
+        got = w._usn_read(home, cur, [code])
+        if got is None:
+            report[label] = None
+            continue
+        recs, nxt = got
+        report[label] = (
+            len(recs),
+            nxt.next_usn - cur.next_usn,
+            [(r.name, hex(r.reason)) for r in recs if r.name.startswith("diag_")],
+            [r.name for r in recs][:12],
+        )
+    ok = [k for k, v in report.items() if isinstance(v, tuple) and v[2]]
+    assert ok, f"cursor={cur} home={home} report={report}"
