@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zachary"
+version = "0.0.1"
+description = "Zachary: a fast desktop assistant with file memory"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlite-vec>=0.1.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.setuptools.packages.find]
+include = ["zachary*"]
+
+[tool.setuptools.package-data]
+zachary = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PTH", "C4"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+packages = ["zachary"]
+
+# sys.platform branches look unreachable on the other OS; CI type-checks both.
+[[tool.mypy.overrides]]
+module = ["zachary.core.platform.windows", "zachary.core.platform.linux"]
+warn_unreachable = false
+
+[[tool.mypy.overrides]]
+module = ["sqlite_vec"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
