@@ -147,7 +147,7 @@ def _kernel32() -> Any:
     import ctypes
     from ctypes import wintypes
 
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
     k32.CreateFileW.argtypes = [
         wintypes.LPCWSTR,
         wintypes.DWORD,

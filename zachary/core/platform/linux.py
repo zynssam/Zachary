@@ -10,6 +10,7 @@ import ctypes
 import os
 import platform as _platform
 import re
+import sys
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Iterator
 from datetime import datetime
@@ -243,6 +244,8 @@ class LinuxPlatform:
 
     def lower_process_priority(self) -> None:
         """nice +10 and the lowest best-effort IO class (not 'idle', which can starve)."""
+        if sys.platform == "win32":  # keeps type-checking on Windows CI happy
+            return
         with contextlib.suppress(OSError):
             os.nice(10)
         nr = _IOPRIO_SET_NR.get(_platform.machine())
