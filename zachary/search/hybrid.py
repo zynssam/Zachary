@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from zachary.brain.timeparse import TimeRange, parse_time
-from zachary.core.config import ExcludeMatcher
+from zachary.core.config import PathRules
 from zachary.search.tokens import words
 
 RRF_K = 60
@@ -85,6 +85,52 @@ class SearchResponse:
     took_ms: float
     corrected: dict[str, str] = field(default_factory=dict)
     range_matched: bool = True  # False: nothing in the time range; results ignore it
+
+
+# Words that say what *kind* of file is wanted. They boost that kind and are not
+# matched against names ("linked list code" -> terms "linked list", kind code).
+KIND_HINTS: dict[str, str] = {
+    "document": "document", "documents": "document", "doc": "document", "docs": "document",
+    "spreadsheet": "document", "slides": "document", "presentation": "document",
+    "code": "code", "script": "code", "program": "code", "source": "code",
+    "photo": "image", "photos": "image", "picture": "image", "pictures": "image",
+    "image": "image", "images": "image", "pic": "image", "pics": "image",
+    "video": "video", "videos": "video", "movie": "video", "clip": "video",
+    "song": "audio", "songs": "audio", "music": "audio", "audio": "audio",
+    "folder": "dir", "folders": "dir", "directory": "dir",
+}  # fmt: skip
+KIND_BONUS = 0.015
+# With no hint, a file-memory search mildly prefers documents and code over media.
+KIND_PRIOR = {"document": 0.003, "code": 0.002, "dir": 0.001}
+
+
+def split_kind_hints(
+    terms: list[str], raw_words: list[str], *, keep_if_alone: bool
+) -> tuple[list[str], set[str]]:
+    """Separate kind words from keyword terms. ``raw_words`` include stopwords."""
+    kinds = {KIND_HINTS[w] for w in raw_words if w in KIND_HINTS}
+    kept = [t for t in terms if t not in KIND_HINTS]
+    if not kept and keep_if_alone:
+        return terms, kinds  # "photo" alone: still match names containing "photo"
+    return kept, kinds
+
+
+def _kind_score(r: SearchResult, kinds: set[str]) -> float:
+    if kinds:
+        return KIND_BONUS if r.kind in kinds else 0.0
+    return KIND_PRIOR.get(r.kind, 0.0)
+
+
+def _kinds_of(conn: sqlite3.Connection, ids: list[int]) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for i in range(0, len(ids), 900):
+        chunk = ids[i : i + 900]
+        marks = ",".join("?" * len(chunk))
+        for fid, kind in _raw(conn).execute(
+            f"SELECT id, kind FROM files WHERE id IN ({marks})", chunk
+        ):
+            out[fid] = kind
+    return out
 
 
 def query_terms(text: str) -> list[str]:
@@ -287,15 +333,15 @@ def search(
     limit: int = 10,
     now: datetime | None = None,
     include_dirs: bool = True,
-    exclude: ExcludeMatcher | None = None,
+    rules: PathRules | None = None,
 ) -> SearchResponse:
-    """Search the index. ``exclude`` hides rows the indexer hasn't purged yet."""
+    """Search the index. ``rules`` hides rows newly excluded but not yet purged."""
     t0 = time.perf_counter()
     now_dt = now or datetime.now().astimezone()
     now_ts = now_dt.timestamp()
     tp = parse_time(query, now_dt)
-    terms = query_terms(tp.rest)
     tr = tp.range
+    terms, kinds = split_kind_hints(query_terms(tp.rest), words(tp.rest), keep_if_alone=tr is None)
 
     in_range: dict[int, str] = _ids_in_range(conn, tr, RANGE_LIMIT) if tr else {}
     allowed = set(in_range)
@@ -321,11 +367,17 @@ def search(
         if corrected:
             terms = [corrected.get(t, t) for t in terms]
             kw = lookup(terms)
-    candidates = list(kw) if terms else list(in_range)
+    if terms:
+        candidates = list(kw)
+    elif kinds and in_range:  # "photos last month": time + kind only
+        kind_of = _kinds_of(conn, list(in_range))
+        candidates = [i for i in in_range if kind_of.get(i) in kinds] or list(in_range)
+    else:
+        candidates = list(in_range)
 
     rows = _load(conn, candidates)
-    if exclude is not None:
-        rows = {k: v for k, v in rows.items() if not exclude.is_excluded(v.path, is_dir=v.is_dir)}
+    if rules is not None:
+        rows = {k: v for k, v in rows.items() if not rules.is_excluded(v.path, v.is_dir)}
     if not include_dirs:
         rows = {k: v for k, v in rows.items() if not v.is_dir}
 
@@ -333,7 +385,13 @@ def search(
         # Unranked matches inside the range: tier, then how many terms hit the *name*
         # (not just a folder), then most recent first.
         order = sorted(
-            rows, key=lambda i: (kw[i], -_name_hits(rows[i].name, terms), -rows[i].last_seen)
+            rows,
+            key=lambda i: (
+                kw[i],
+                -_name_hits(rows[i].name, terms),
+                -_kind_score(rows[i], kinds),
+                -rows[i].last_seen,
+            ),
         )
     else:
         order = [i for i in candidates if i in rows]
@@ -357,6 +415,7 @@ def search(
         if range_matched and r.file_id in in_range:
             # A file the user opened in the range is a stronger signal than an mtime.
             s += IN_RANGE_BONUS if in_range[r.file_id] == "opened" else IN_RANGE_BONUS / 2
+        s += _kind_score(r, kinds)
         r.score = s
 
     results = sorted(rows.values(), key=lambda r: (-r.score, -r.last_seen))[:limit]

@@ -69,3 +69,12 @@ def test_config_commands(cli_db: str, home: Path, capsys: pytest.CaptureFixture[
     assert main(["--db", cli_db, "resume"]) == 0
     assert main(["--db", cli_db, "roots"]) == 0
     assert str(home) in capsys.readouterr().out
+
+
+def test_set_command(cli_db: str, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--db", cli_db, "set"]) == 0
+    assert "index_hidden_folders = false" in capsys.readouterr().out
+    assert main(["--db", cli_db, "set", "index_hidden_folders", "true"]) == 0
+    assert main(["--db", cli_db, "set", "index_hidden_folders"]) == 0
+    assert capsys.readouterr().out.strip().endswith("true")
+    assert main(["--db", cli_db, "set", "quickbar_hotkey", "ctrl+space"]) == 0

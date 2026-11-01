@@ -52,7 +52,7 @@ def _open(args: argparse.Namespace) -> tuple[sqlite3.Connection, Config]:
 def cmd_search(args: argparse.Namespace) -> int:
     conn, cfg = _open(args)
     q = " ".join(args.query)
-    resp = search(conn, q, limit=args.limit, exclude=cfg.exclude_matcher())
+    resp = search(conn, q, limit=args.limit, rules=cfg.path_rules())
     if args.json:
         print(
             json.dumps(
@@ -215,6 +215,30 @@ def cmd_forget(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set(args: argparse.Namespace) -> int:
+    """Show or change a setting, e.g. ``set index_hidden_folders true``."""
+    _, cfg = _open(args)
+    if args.key is None:
+        for k, v in vars_of(cfg).items():
+            print(f"  {k} = {json.dumps(v)}")
+        return 0
+    if args.value is None:
+        print(json.dumps(cfg.get_setting(args.key)))
+        return 0
+    try:
+        value = json.loads(args.value)
+    except json.JSONDecodeError:
+        value = args.value
+    cfg.set_setting(args.key, value)
+    print(f"{args.key} = {json.dumps(value)}")
+    return 0
+
+
+def vars_of(cfg: Config) -> dict[str, object]:
+    s = cfg.load()
+    return {k: getattr(s, k) for k in s.__dataclass_fields__}
+
+
 def cmd_pause(args: argparse.Namespace, paused: bool) -> int:
     _, cfg = _open(args)
     cfg.set_setting("indexing_paused", paused)
@@ -262,6 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("forget", help="forget files/folders and all derived data")
     s.add_argument("paths", nargs="+")
     s.set_defaults(fn=cmd_forget)
+
+    s = sub.add_parser("set", help="show/change settings, e.g. set index_hidden_folders true")
+    s.add_argument("key", nargs="?")
+    s.add_argument("value", nargs="?")
+    s.set_defaults(fn=cmd_set)
 
     s = sub.add_parser("pause", help="pause indexing")
     s.set_defaults(fn=lambda a: cmd_pause(a, True))

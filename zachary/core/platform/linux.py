@@ -212,6 +212,8 @@ class LinuxPlatform:
             "/snap",
             "/lost+found",
             str(Path.home() / ".cache"),
+            str(Path.home() / "snap"),  # snap app data
+            str(Path.home() / "go" / "pkg"),  # Go module cache
             str(Path.home() / ".local" / "share" / "Trash"),
             str(Path.home() / ".mozilla"),
             str(Path.home() / ".config" / "google-chrome"),

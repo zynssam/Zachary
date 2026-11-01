@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 class _ConfigSig:
     roots: tuple[str, ...]
     excludes: tuple[tuple[str, str, bool], ...]
+    hidden: bool
     paused: bool
 
 
@@ -66,6 +67,7 @@ class IndexerService:
         return _ConfigSig(
             roots=tuple(self.store.roots),
             excludes=tuple((p, k, e) for p, k, _s, e in self.config.list_excludes()),
+            hidden=bool(self.config.get_setting("index_hidden_folders")),
             paused=bool(self.config.get_setting("indexing_paused")),
         )
 
@@ -192,7 +194,12 @@ class IndexerService:
                 log.info("indexing paused")
                 self._stop_watcher()
             return new
-        if new.roots != old.roots or new.excludes != old.excludes or old.paused:
+        if (
+            new.roots != old.roots
+            or new.excludes != old.excludes
+            or new.hidden != old.hidden
+            or old.paused
+        ):
             log.info("config changed: purging excluded paths and catching up")
             self._stop_watcher()
             self.store.purge_excluded()

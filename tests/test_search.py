@@ -119,7 +119,7 @@ def test_recent_beats_old_for_same_keyword(indexed: FileStore, home: Path) -> No
 
 def test_exclude_hides_results_before_purge(indexed: FileStore, home: Path) -> None:
     indexed.config.add_exclude(home / "College")
-    names = _names(indexed, "fees", exclude=indexed.config.exclude_matcher())
+    names = _names(indexed, "fees", rules=indexed.config.path_rules())
     assert not any("Fee" in n or "fee_structure" in n for n in names)
 
 
@@ -154,3 +154,56 @@ def test_recent_view(indexed: FileStore, home: Path, fake_platform: FakePlatform
 def test_search_speed_small_index(indexed: FileStore) -> None:
     resp = search(indexed.conn, "fees yesterday")
     assert resp.took_ms < 50
+
+
+def test_rules_ignore_excluded_names_above_the_root(
+    conn: object, tmp_path: Path, fake_platform: FakePlatform
+) -> None:
+    """A root inside ~/.cache (or a folder named 'build') must still be searchable."""
+    from zachary.core.config import Config
+    from zachary.core.db import open_db
+
+    root = tmp_path / ".cache" / "build" / "home"
+    write(root / "notes" / "fee receipt.pdf")
+    c = open_db(tmp_path / "rules.db")
+    cfg = Config(c, fake_platform)
+    cfg.seed_defaults()
+    cfg.set_index_roots([root])
+    st = FileStore(c, cfg)
+    scan(st)
+    assert [r.name for r in search(c, "fee receipt", rules=cfg.path_rules()).results] == [
+        "fee receipt.pdf"
+    ]
+    write(root / "node_modules" / "fee.js")  # but names *below* the root still apply
+    assert cfg.path_rules().is_excluded(str(root / "node_modules" / "fee.js"), False)
+    c.close()
+
+
+def test_kind_hints(indexed: FileStore, home: Path, fake_platform: FakePlatform) -> None:
+    # "code" is not in any name: it selects the kind instead of breaking the match.
+    assert _names(indexed, "linked list code")[0] == "linked_list.cpp"
+    # A document opened yesterday beats a song with the same word opened later.
+    write(home / "Music" / "fee song.mp3", mtime=OLD)
+    indexed.reconcile_paths([str(home / "Music" / "fee song.mp3")])
+    y = _yesterday_afternoon()
+    fake_platform.recent = [
+        RecentItem(home / "College" / "Sem5" / "Fee Receipt Sem 5.pdf", y),
+        RecentItem(home / "Music" / "fee song.mp3", y + 3600),
+    ]
+    ingest_recent(indexed, fake_platform)
+    assert _names(indexed, "the fee document I opened yesterday")[0] == "Fee Receipt Sem 5.pdf"
+    assert _names(indexed, "fee song yesterday")[0] == "fee song.mp3"
+    assert _names(indexed, "fees yesterday")[0] == "Fee Receipt Sem 5.pdf"  # document prior
+
+
+def test_split_kind_hints() -> None:
+    from zachary.search.hybrid import split_kind_hints
+
+    assert split_kind_hints(["linked", "list", "code"], ["linked", "list", "code"],
+                            keep_if_alone=True) == (["linked", "list"], {"code"})  # fmt: skip
+    assert split_kind_hints(["photo"], ["photo"], keep_if_alone=True) == (["photo"], {"image"})
+    assert split_kind_hints(["photo"], ["photo"], keep_if_alone=False) == ([], {"image"})
+    assert split_kind_hints(["fee"], ["the", "fee", "document"], keep_if_alone=True) == (
+        ["fee"],
+        {"document"},
+    )

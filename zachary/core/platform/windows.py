@@ -335,6 +335,7 @@ class WindowsPlatform:
             os.environ.get("PROGRAMDATA", r"C:\ProgramData"),
             r"C:\$Recycle.Bin",
             r"C:\System Volume Information",
+            str(home / "AppData"),  # app data, not user files (Recent Items is read directly)
             str(local / "Temp"),
             str(local / "Packages"),
             str(local / "Microsoft"),

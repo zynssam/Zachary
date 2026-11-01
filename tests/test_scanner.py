@@ -223,3 +223,20 @@ def test_inode_key_fits_sqlite() -> None:
     assert -(1 << 63) <= inode_key(big_ntfs) < (1 << 63)  # type: ignore[operator]
     refs_128 = (0xDEADBEEF << 64) | big_ntfs
     assert inode_key(refs_128) == inode_key(big_ntfs)  # low 64 bits = NTFS FRN
+
+
+def test_hidden_folders_skipped_by_default(store: FileStore, home: Path) -> None:
+    write(home / ".config" / "app" / "settings.json")
+    write(home / ".vscode" / "extensions" / "ext" / "package.json")
+    write(home / "proj" / ".git" / "HEAD")
+    write(home / "proj" / "Makefile")
+    write(home / ".bashrc")  # hidden *files* are still indexed (by name)
+    st = scan(store)
+    paths = set(_ids(store.conn))
+    assert not any(".config" in p or ".vscode" in p for p in paths)
+    assert str(home / ".bashrc") in paths
+    assert st.markers[str(home / "proj")] == {".git", "Makefile"}  # markers still seen
+    store.config.set_setting("index_hidden_folders", True)
+    store.reload()
+    scan(store)
+    assert store.get_row(str(home / ".config" / "app" / "settings.json")) is not None

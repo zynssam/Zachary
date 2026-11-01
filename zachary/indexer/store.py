@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
-from zachary.core.config import Config, ExcludeMatcher, is_under
+from zachary.core.config import Config, ExcludeMatcher, PathRules
 from zachary.core.db import transaction
 from zachary.indexer.kinds import classify
 from zachary.search.tokens import name_text, path_text
@@ -163,6 +163,7 @@ class FileStore:
         self.sep = os.sep
         self.roots: list[str] = []
         self.matcher: ExcludeMatcher
+        self.rules: PathRules
         self._ptok: dict[tuple[str, str | None], str] = {}
         self.reload()
 
@@ -170,8 +171,9 @@ class FileStore:
     def reload(self) -> None:
         """Re-read roots and exclude rules (after a config change)."""
         with self.lock:
-            self.roots = [str(r) for r in self.config.index_roots()]
-            self.matcher = self.config.exclude_matcher(self.roots)
+            self.rules = self.config.path_rules()
+            self.roots = list(self.rules.roots)
+            self.matcher = self.rules.matcher
             self._ptok = {}
 
     def norm(self, path: str | os.PathLike[str]) -> str:
@@ -179,25 +181,10 @@ class FileStore:
         return self.config.canonical(path)
 
     def root_for(self, path: str) -> str | None:
-        best: str | None = None
-        for r in self.roots:
-            if is_under(path, r) and (best is None or len(r) > len(best)):
-                best = r
-        return best
+        return self.rules.root_for(path)
 
     def is_excluded(self, path: str, is_dir: bool) -> bool:
-        """Outside every root, under an excluded path, or any component below the root excluded."""
-        root = self.root_for(path)
-        if root is None:
-            return True
-        if self.matcher.excludes_path(path):
-            return True
-        parts = [p for p in path[len(root) :].split(self.sep) if p]
-        last = len(parts) - 1
-        return any(
-            self.matcher.excludes_name(part, is_dir=is_dir or i < last)
-            for i, part in enumerate(parts)
-        )
+        return self.rules.is_excluded(path, is_dir)
 
     # -- reads -----------------------------------------------------------------
     def get_row(self, path: str) -> Row | None:

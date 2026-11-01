@@ -26,6 +26,8 @@ FOLDER_RULES: frozenset[str] = frozenset({"never_touch", "auto_tidy", "name_only
 
 # Directory names skipped wherever they appear.
 DEFAULT_EXCLUDE_DIRNAMES: tuple[str, ...] = (
+    "site-packages",
+    "dist-packages",
     "node_modules",
     ".git",
     ".hg",
@@ -136,6 +138,9 @@ class Settings:
     language_code: str = "en-IN"
     llm_enabled: bool = False
     embed_max_kb: int = 64  # "embed less": first N KB per document by default
+    # Hidden folders (~/.config, ~/.vscode, ~/.local, ...) hold app data, not user
+    # files. Project markers such as .git are still seen.
+    index_hidden_folders: bool = False
 
 
 _SETTING_KEYS: tuple[str, ...] = tuple(Settings.__dataclass_fields__)
@@ -195,6 +200,7 @@ class ExcludeMatcher:
     paths: tuple[str, ...]  # normalized; matched as prefixes on path boundaries
     case_insensitive: bool
     path_set: frozenset[str] = frozenset()
+    skip_hidden_dirs: bool = False
 
     @classmethod
     def build(
@@ -204,6 +210,7 @@ class ExcludeMatcher:
         paths: Iterable[str],
         *,
         case_insensitive: bool,
+        skip_hidden_dirs: bool = False,
     ) -> ExcludeMatcher:
         fold = str.casefold if case_insensitive else str
         globs = list(globs)
@@ -213,13 +220,21 @@ class ExcludeMatcher:
             glob_re = re.compile("|".join(fnmatch.translate(g) for g in globs), flags)
         norm = tuple(sorted({normalize_path(p, case_insensitive=case_insensitive) for p in paths}))
         return cls(
-            frozenset(fold(d) for d in dirnames), glob_re, norm, case_insensitive, frozenset(norm)
+            frozenset(fold(d) for d in dirnames),
+            glob_re,
+            norm,
+            case_insensitive,
+            frozenset(norm),
+            skip_hidden_dirs,
         )
 
     def excludes_name(self, name: str, *, is_dir: bool) -> bool:
         """Check by entry name only (cheap; for use inside ``os.scandir`` loops)."""
-        if is_dir and (name.casefold() if self.case_insensitive else name) in self.dirnames:
-            return True
+        if is_dir:
+            if self.skip_hidden_dirs and name[:1] == "." and len(name) > 1:
+                return True
+            if (name.casefold() if self.case_insensitive else name) in self.dirnames:
+                return True
         return self.glob_re is not None and self.glob_re.match(name) is not None
 
     def excludes_path(self, path: str) -> bool:
@@ -245,6 +260,40 @@ class ExcludeMatcher:
             if self.excludes_name(part, is_dir=is_dir or i < last):
                 return True
         return False
+
+
+@dataclass(frozen=True, slots=True)
+class PathRules:
+    """Read-only "is this path indexable?" check shared by the indexer and search.
+
+    Folder-name rules only apply *below* the index root, so a root that happens to
+    sit inside e.g. ``~/.cache`` or a folder called ``build`` still works.
+    """
+
+    roots: tuple[str, ...]
+    matcher: ExcludeMatcher
+    sep: str = os.sep
+
+    def root_for(self, path: str) -> str | None:
+        best: str | None = None
+        for r in self.roots:
+            if is_under(path, r) and (best is None or len(r) > len(best)):
+                best = r
+        return best
+
+    def is_excluded(self, path: str, is_dir: bool) -> bool:
+        """Outside every root, under an excluded path, or a component below the root excluded."""
+        root = self.root_for(path)
+        if root is None:
+            return True
+        if self.matcher.excludes_path(path):
+            return True
+        parts = [p for p in path[len(root) :].split(self.sep) if p]
+        last = len(parts) - 1
+        return any(
+            self.matcher.excludes_name(part, is_dir=is_dir or i < last)
+            for i, part in enumerate(parts)
+        )
 
 
 class Config:
@@ -388,7 +437,12 @@ class Config:
             by_kind["glob"],
             by_kind["path"],
             case_insensitive=self.platform.case_insensitive_paths,
+            skip_hidden_dirs=not self.get_setting("index_hidden_folders"),
         )
+
+    def path_rules(self) -> PathRules:
+        roots = tuple(str(r) for r in self.index_roots())
+        return PathRules(roots, self.exclude_matcher(roots))
 
     # -- folder rules ------------------------------------------------------
     def add_folder_rule(self, path: str | Path, rule: FolderRule) -> None:
