@@ -44,7 +44,12 @@ TIER_BONUS = (0.01, 0.006, 0.002, 0.0)
 IN_RANGE_BONUS = 0.05
 FTS_LIMIT = 200
 VEC_K = 100  # nearest neighbours taken from the vector index
-VEC_MIN_SIM = 0.3  # below this, a meaning match is noise (Model2Vec cosine)
+# Meaning matches: Model2Vec cosines for relevant files measured 0.25-0.73 while
+# unrelated ones mostly stay < 0.1 but can reach ~0.28, so a fixed cutoff can't
+# separate them. Keep a match if it is above an absolute floor AND within a
+# fraction of the best match for this query.
+VEC_MIN_SIM = 0.15
+VEC_REL_SIM = 0.25
 VEC_WEIGHT = 0.9
 RANGE_KW_ENOUGH = 50  # in-range keyword matches after which looser tiers are skipped
 RANGE_LIMIT = 2000
@@ -441,6 +446,9 @@ def search(
             hits = semantic.index.score_ids(qvec, allowed, min_sim=VEC_MIN_SIM)
         else:
             hits = semantic.index.search(qvec, VEC_K, min_sim=VEC_MIN_SIM)
+        if hits:
+            floor = max(VEC_MIN_SIM, VEC_REL_SIM * hits[0][1])
+            hits = [h for h in hits if h[1] >= floor]
         vec = dict(hits[:VEC_K])
         if tr is not None and vec and not restricted:
             # Nothing in range by keyword, but something in range by meaning.
@@ -504,7 +512,7 @@ def search(
             # A file the user opened in the range is a stronger signal than an mtime.
             s += IN_RANGE_BONUS if in_range[r.file_id] == "opened" else IN_RANGE_BONUS / 2
         if r.file_id in vec_rank:
-            strength = min(1.0, vec[r.file_id] / 0.5)  # scale by how close the meaning is
+            strength = min(1.0, vec[r.file_id] / 0.4)  # scale by how close the meaning is
             s += VEC_WEIGHT * strength / (RRF_K + vec_rank[r.file_id])
         s += _kind_score(r, kinds)
         r.score = s

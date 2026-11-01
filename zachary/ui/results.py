@@ -166,7 +166,7 @@ class ResultsDelegate(QStyledItemDelegate):
 class ResultsView(QListView):
     """List of results. Emits ``chosen(row, action)``; ``painted`` after each paint."""
 
-    chosen = Signal(int, str)  # row, "open" | "reveal"
+    chosen = Signal(int, str)  # row, "open" | "reveal" | "related"
     painted = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -216,6 +216,7 @@ class ResultsView(QListView):
         m = QMenu(self)
         m.addAction("Open", lambda: self.chosen.emit(idx.row(), "open"))
         m.addAction("Show in folder", lambda: self.chosen.emit(idx.row(), "reveal"))
+        m.addAction("Related files", lambda: self.chosen.emit(idx.row(), "related"))
         m.addAction("Copy path", lambda: QGuiApplication.clipboard().setText(it.path))
         self.menu_open = True
         try:

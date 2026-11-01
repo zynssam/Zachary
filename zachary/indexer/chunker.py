@@ -40,11 +40,13 @@ def _cut(text: str, start: int, limit: int) -> int:
 
 
 def chunk_text(text: str, size: int = CHUNK_CHARS, overlap: int = OVERLAP_CHARS) -> list[Chunk]:
-    text = text.strip()
-    if not text:
+    # Offsets refer to ``text`` as given: skip outer whitespace without stripping.
+    stop = len(text.rstrip())
+    start = len(text) - len(text.lstrip())
+    if start >= stop:
         return []
+    text = text[:stop]
     chunks: list[Chunk] = []
-    start = 0
     while start < len(text) and len(chunks) < MAX_CHUNKS:
         end = _cut(text, start, start + size)
         body = text[start:end].strip()

@@ -50,6 +50,7 @@ class Related:
     kind: str  # file kind
     score: float
     reason: str  # content | name | location | coaccess
+    mtime: float = 0.0
 
 
 def _name_words(name: str) -> frozenset[str]:
@@ -243,12 +244,12 @@ class RelationBuilder:
 def related(conn: sqlite3.Connection, file_id: int, limit: int = TOP_K) -> list[Related]:
     """The precomputed related files (one indexed lookup)."""
     rows = conn.execute(
-        "SELECT r.dst_id, f.path, f.name, f.kind, max(r.score), r.kind FROM relations r"
+        "SELECT r.dst_id, f.path, f.name, f.kind, max(r.score), r.kind, f.mtime FROM relations r"
         " JOIN files f ON f.id = r.dst_id WHERE r.src_id = ?"
         " GROUP BY r.dst_id ORDER BY max(r.score) DESC LIMIT ?",
         (file_id, limit),
     ).fetchall()
-    return [Related(r[0], r[1], r[2], r[3], float(r[4]), r[5]) for r in rows]
+    return [Related(r[0], r[1], r[2], r[3], float(r[4]), r[5], float(r[6])) for r in rows]
 
 
 def due_full(conn: sqlite3.Connection, max_age_s: float = 7 * 86400) -> bool:

@@ -10,8 +10,9 @@ Per file:
 - **Media, archives, binaries, ``name_only`` folders**: name + path only.
 
 File vector = normalize((1 - NAME_SHARE) * mean(chunk vectors) + NAME_SHARE *
-vector("name words + folder words + title")). Chunks and their vectors are kept
-for passages ("why it matched", Phase 6 Q&A).
+vector("name words + folder words + title")). Code chunks are embedded as their
+words (identifiers split, punctuation dropped); the original text is stored.
+Chunks and their vectors are kept for passages ("why it matched", Phase 6 Q&A).
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from zachary.search.tokens import name_text, path_text, words
 
 log = logging.getLogger(__name__)
 
-NAME_SHARE = 0.4
+NAME_SHARE = 0.25  # names are often uninformative ("ll.cpp"); keyword search covers them
 QUICK_BLOCK = 64 * 1024
 KEYWORDS = 40
 _KEYWORD_STOP = frozenset(
@@ -134,8 +135,11 @@ class SemanticIndexer:
     # -- work ------------------------------------------------------------------------
     def run(self, limit: int = 64) -> EmbedStats:
         """Embed up to ``limit`` pending files. Returns what was done."""
+        return self.process(self.pending(limit))
+
+    def process(self, rows: list[sqlite3.Row]) -> EmbedStats:
+        """Embed the given pending rows (from :meth:`pending`) in one batch."""
         t0 = time.perf_counter()
-        rows = self.pending(limit)
         stats = EmbedStats()
         if not rows:
             return stats
@@ -227,7 +231,12 @@ class SemanticIndexer:
         texts: list[str] = []
         for job in jobs:
             texts.append(self._name_text(job, job.title or reuse_titles.get(job.id)))
-            texts.extend(c[3] for c in job.chunks)
+            if job.kind == "code":
+                # Embed identifiers and comments, not braces and operators (measured: syntax
+                # noise lowers similarity to the concepts the code is about).
+                texts.extend(" ".join(words(c[3])) for c in job.chunks)
+            else:
+                texts.extend(c[3] for c in job.chunks)
         vecs = self.embedder.encode(texts)
         centroids = self._centroids_now()
         now = time.time()

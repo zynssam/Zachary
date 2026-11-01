@@ -50,9 +50,12 @@ def _open(args: argparse.Namespace) -> tuple[sqlite3.Connection, Config]:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
+    from zachary.search.semantic import local_semantic
+
     conn, cfg = _open(args)
     q = " ".join(args.query)
-    resp = search(conn, q, limit=args.limit, rules=cfg.path_rules())
+    sem = None if args.keywords_only else local_semantic(conn, cfg)
+    resp = search(conn, q, limit=args.limit, rules=cfg.path_rules(), semantic=sem)
     if args.json:
         print(
             json.dumps(
@@ -141,6 +144,65 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_embed(args: argparse.Namespace) -> int:
+    """Index file contents now (in this process): extract, embed, vector index, relations."""
+    from zachary.indexer import relations, versions
+    from zachary.indexer.semantic import SemanticIndexer
+    from zachary.indexer.semantic_worker import default_embedder
+    from zachary.search import vectors
+
+    conn, cfg = _open(args)
+    db_path = Path(args.db or default_db_path())
+    sem = SemanticIndexer(conn, cfg, default_embedder(cfg, db_path))
+    total = sem.pending_count()
+    if args.limit:
+        total = min(total, args.limit)
+    print(f"{total} files to embed (model: {cfg.get_setting('embed_model')})")
+    done = 0
+    t0 = time.perf_counter()
+    agg = {"extracted": 0, "reused": 0, "name_only": 0, "chunks": 0, "bytes": 0}
+    while done < total:
+        st = sem.run(min(64, total - done))
+        if not st.files:
+            break
+        done += st.files
+        for k in agg:
+            agg[k] += getattr(st, k)
+        rate = done / max(time.perf_counter() - t0, 1e-9)
+        print(f"\r  {done}/{total} files  ({rate:.0f} files/s)", end="", flush=True)
+    secs = time.perf_counter() - t0
+    print(
+        f"\nembedded {done} files in {secs:.1f}s: {agg['extracted']} with text "
+        f"({agg['bytes'] / 1e6:.1f} MB, {agg['chunks']} chunks), {agg['reused']} reused, "
+        f"{agg['name_only']} name-only"
+    )
+    b = vectors.build(conn)
+    print(f"vector index: {b.vectors} vectors in {b.clusters} clusters ({b.seconds:.1f}s)")
+    r = relations.RelationBuilder(conn).compute(None)
+    print(f"related files: {r.links} links for {r.files} files ({r.seconds:.1f}s)")
+    print(f"version groups: {versions.rebuild(conn)}")
+    return 0
+
+
+def cmd_related(args: argparse.Namespace) -> int:
+    from zachary.brain.handler import REASONS
+    from zachary.indexer.relations import related
+
+    conn, cfg = _open(args)
+    path = cfg.canonical(args.path)
+    row = conn.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
+    if row is None:
+        print(f"not indexed: {path}")
+        return 1
+    t0 = time.perf_counter()
+    rels = related(conn, int(row[0]))
+    ms = (time.perf_counter() - t0) * 1e3
+    print(f"{len(rels)} related ({ms:.2f} ms)")
+    for i, r in enumerate(rels, 1):
+        print(f"{i:>3}. {r.score:.2f}  {REASONS.get(r.reason, r.reason):<16} {_short(r.path)}")
+    return 0 if rels else 1
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     conn, cfg = _open(args)
     files, dirs = conn.execute("SELECT count(*), coalesce(sum(is_dir), 0) FROM files").fetchone()
@@ -159,6 +221,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     watching = get_state(conn, "indexer.watching")
     if watching is not None:
         print(f"watching:  {watching}")
+    n_emb, n_files = conn.execute(
+        "SELECT coalesce(sum(embedded_at IS NOT NULL), 0), count(*) FROM files WHERE is_dir = 0"
+    ).fetchone()
+    n_chunks = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    n_rel = conn.execute("SELECT count(DISTINCT src_id) FROM relations").fetchone()[0]
+    print(f"semantic:  {n_emb}/{n_files} files embedded, {n_chunks} passages, "
+          f"{n_rel} files with related links")  # fmt: skip
+    waiting = get_state(conn, "semantic.waiting")
+    if waiting:
+        print(f"           waiting: {waiting}")
+    err = get_state(conn, "semantic.error")
+    if err:
+        print(f"           last error: {err}")
     msg = get_state(conn, "indexer.watch_limit_message")
     if msg:
         print("\n" + str(msg))
@@ -255,6 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("query", nargs="+")
     s.add_argument("-n", "--limit", type=int, default=10)
     s.add_argument("--json", action="store_true")
+    s.add_argument("--keywords-only", action="store_true", help="skip meaning search")
     s.set_defaults(fn=cmd_search)
 
     s = sub.add_parser("projects", help="projects by latest activity")
@@ -269,6 +345,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("scan", help="catch up now (in this process)")
     s.add_argument("--full", action="store_true", help="ignore journals; full re-scan")
     s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser("embed", help="index file contents now (downloads the model once)")
+    s.add_argument("--limit", type=int, default=0, help="at most this many files")
+    s.set_defaults(fn=cmd_embed)
+
+    s = sub.add_parser("related", help="files related to a file")
+    s.add_argument("path")
+    s.set_defaults(fn=cmd_related)
 
     s = sub.add_parser("status", help="index and indexer status")
     s.set_defaults(fn=cmd_status)

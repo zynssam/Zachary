@@ -23,6 +23,7 @@ class Item:
     why: list[str] = field(default_factory=list)
     score: float = 0.0
     detail: str = ""  # e.g. project markers
+    versions: list[Item] = field(default_factory=list)  # older versions, newest first
 
 
 @dataclass(slots=True)
@@ -32,12 +33,14 @@ class Context:
     query: str = ""
     view: str = "results"
     updated_at: float = 0.0
+    current: Item | None = None  # last item acted on (may be an older version)
 
     def set_results(
         self, items: list[Item], query: str, view: str, now: float | None = None
     ) -> None:
         self.items = list(items)
         self.focused = 0 if items else None
+        self.current = None
         self.query = query
         self.view = view
         self.updated_at = time.time() if now is None else now
@@ -49,6 +52,7 @@ class Context:
     def focus(self, index: int) -> Item | None:
         if 0 <= index < len(self.items):
             self.focused = index
+            self.current = self.items[index]
             return self.items[index]
         return None
 
@@ -71,15 +75,20 @@ class Context:
         return self._step(older=False)
 
     def _step(self, *, older: bool) -> Item | None:
-        cur = self.focused_item()
-        if cur is None:
+        """Walk by time. If the focused result has versions, walk its versions
+        ("the older one" = the previous version); otherwise walk the shown list."""
+        focused = self.focused_item()
+        cur = self.current or focused
+        if cur is None or focused is None:
             return None
+        pool = [focused, *focused.versions] if focused.versions else self.items
         if older:
-            cands = [(i, it) for i, it in enumerate(self.items) if it.ts < cur.ts]
-            pick = max(cands, key=lambda x: x[1].ts, default=None)
+            pick = max((it for it in pool if it.ts < cur.ts), key=lambda it: it.ts, default=None)
         else:
-            cands = [(i, it) for i, it in enumerate(self.items) if it.ts > cur.ts]
-            pick = min(cands, key=lambda x: x[1].ts, default=None)
+            pick = min((it for it in pool if it.ts > cur.ts), key=lambda it: it.ts, default=None)
         if pick is None:
             return None
-        return self.focus(pick[0])
+        if pick in self.items:
+            self.focus(self.items.index(pick))
+        self.current = pick
+        return pick

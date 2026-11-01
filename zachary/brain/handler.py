@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -20,8 +21,10 @@ from zachary.brain.intents import Intent, parse
 from zachary.brain.timeparse import parse_time
 from zachary.core.config import Config, PathRules
 from zachary.indexer.projects import list_projects
+from zachary.indexer.relations import related as related_files
 from zachary.search.hybrid import SearchResult, recent, search
 from zachary.search.tokens import words
+from zachary.search.vectors import SemanticSearch
 
 RESULT_LIMIT = 8  # shown in the list
 ASK_LIMIT = 5  # "which one?" shows the top 3-5
@@ -68,18 +71,61 @@ def _ago(ts: float, now: float) -> str:
     return "yesterday" if days == 1 else f"{days} days ago"
 
 
-def _item(r: SearchResult) -> Item:
-    return Item(r.file_id, r.path, r.name, r.kind, r.is_dir, r.last_seen, list(r.why), r.score)
+def _item(r: SearchResult, conn: sqlite3.Connection | None = None) -> Item:
+    it = Item(r.file_id, r.path, r.name, r.kind, r.is_dir, r.last_seen, list(r.why), r.score)
+    if r.versions and conn is not None:
+        marks = ",".join("?" * len(r.versions))
+        rows = {
+            row[0]: row
+            for row in conn.execute(
+                f"SELECT id, path, name, kind, mtime FROM files WHERE id IN ({marks})", r.versions
+            )
+        }
+        it.versions = [
+            Item(v, rows[v][1], rows[v][2], rows[v][3], False, float(rows[v][4]), ["older version"])
+            for v in r.versions
+            if v in rows
+        ]
+    return it
+
+
+REASONS = {
+    "content": "similar content",
+    "name": "similar name",
+    "location": "same folder",
+    "coaccess": "opened together",
+    "feedback": "you chose it before",
+}
+SEMANTIC_RETRY_S = 60.0
 
 
 class Handler:
-    def __init__(self, conn: sqlite3.Connection, actions: Actions, config: Config) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        actions: Actions,
+        config: Config,
+        semantic: Callable[[], SemanticSearch | None] | None = None,
+    ) -> None:
         self.conn = conn
         self.actions = actions
         self.config = config
         self.context = Context()
         self._rules: PathRules | None = None
         self._rules_rev = -1
+        self._semantic_provider = semantic
+        self._semantic: SemanticSearch | None = None
+        self._semantic_tried = 0.0
+
+    @property
+    def semantic(self) -> SemanticSearch | None:
+        """Meaning search, once the model is on disk (retried every minute until then)."""
+        if self._semantic is None and self._semantic_provider is not None:
+            now = time.monotonic()
+            if now - self._semantic_tried >= SEMANTIC_RETRY_S or not self._semantic_tried:
+                self._semantic_tried = now
+                self._semantic = self._semantic_provider()
+        return self._semantic
 
     # -- helpers -----------------------------------------------------------------------
     def rules(self) -> PathRules:
@@ -90,7 +136,7 @@ class Handler:
         return self._rules
 
     def _search(self, query: str, limit: int) -> tuple[list[SearchResult], str]:
-        resp = search(self.conn, query, limit=limit, rules=self.rules())
+        resp = search(self.conn, query, limit=limit, rules=self.rules(), semantic=self.semantic)
         note = ""
         if resp.time_range is not None and not resp.range_matched and resp.results:
             note = f"Nothing from {resp.time_range.label}; best matches from any time."
@@ -148,7 +194,9 @@ class Handler:
     def _handle(self, text: str, *, execute: bool) -> Reply:
         t0 = time.perf_counter()
         intent = parse(text)
-        if intent.is_followup:
+        if intent.kind == "related":  # before follow-ups: "related to the first one"
+            reply = self._related(intent)
+        elif intent.is_followup:
             reply = self._followup(intent, execute=execute)
         elif intent.kind == "none":
             items = self._recent("")
@@ -184,12 +232,12 @@ class Handler:
             items = self._projects(intent.query)
             if not items:
                 results, note = self._search(intent.query, RESULT_LIMIT)
-                items = [_item(r) for r in results]
+                items = [_item(r, self.conn) for r in results]
             view = "projects" if items and items[0].kind == "project" else "results"
             winner = len(items) == 1
         else:
             results, note = self._search(intent.query, RESULT_LIMIT)
-            items = [_item(r) for r in results]
+            items = [_item(r, self.conn) for r in results]
             view = "results"
             winner = clear_winner(results)
         self.context.set_results(items, intent.query, view)
@@ -211,6 +259,48 @@ class Handler:
             return Reply(note or f"Which one? I found {len(items)} matches.", view, shown, intent)
         say = note or (f"Found {len(items)}." if len(items) < RESULT_LIMIT else "Top matches.")
         return Reply(say, view, items, intent, selected=0)
+
+    def _related(self, intent: Intent) -> Reply:
+        """Precomputed related files of a shown item or of the best match for a query."""
+        if intent.query:
+            results, _ = self._search(intent.query, 1)
+            if not results:
+                return Reply(f"Nothing found for “{intent.query}”.", "none", [], intent)
+            anchor = _item(results[0])
+        else:
+            ctx = self.context
+            if not ctx.active():
+                return Reply(
+                    "Search for something first, then ask for related files.", "none", [], intent
+                )
+            found = ctx.by_ordinal(intent.ordinal) if intent.ordinal else ctx.focused_item()
+            if found is None:
+                return Reply(
+                    "Which one? Say “related to the first one”.", ctx.view, ctx.items, intent
+                )
+            anchor = found
+        rels = related_files(self.conn, anchor.file_id)
+        rules = self.rules()
+        items = [
+            Item(
+                r.file_id,
+                r.path,
+                r.name,
+                r.kind,
+                False,
+                r.mtime,
+                [REASONS.get(r.reason, "")],
+                r.score,
+            )
+            for r in rels
+            if not rules.is_excluded(r.path, False)
+        ]
+        self.context.set_results(items, f"related:{anchor.file_id}", "related")
+        if not items:
+            return Reply(f"Nothing related to {anchor.name} yet.", "related", [], intent)
+        return Reply(
+            f"{len(items)} files related to {anchor.name}.", "related", items, intent, selected=0
+        )
 
     def _followup(self, intent: Intent, *, execute: bool) -> Reply:
         ctx = self.context

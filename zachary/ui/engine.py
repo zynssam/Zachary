@@ -8,7 +8,9 @@ text arrived while one was queued, the stale one is skipped.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,8 @@ from zachary.brain.handler import Handler, Reply
 from zachary.core.config import Config
 from zachary.core.db import open_db
 from zachary.core.platform import Platform
+from zachary.search.semantic import local_semantic
+from zachary.search.vectors import SemanticSearch
 
 log = logging.getLogger(__name__)
 
@@ -28,10 +32,17 @@ class Engine(QObject):
     failed = Signal(int, str)
     _request = Signal(int, str, object)
 
-    def __init__(self, db_path: Path | str, platform: Platform) -> None:
+    def __init__(
+        self,
+        db_path: Path | str,
+        platform: Platform,
+        semantic_factory: Callable[[sqlite3.Connection, Config], SemanticSearch | None]
+        | None = None,
+    ) -> None:
         super().__init__()
         self.db_path = db_path
         self.platform = platform
+        self.semantic_factory = semantic_factory or local_semantic
         self.handler: Handler | None = None
         self._lock = threading.Lock()
         self._latest_preview = 0
@@ -65,7 +76,11 @@ class Engine(QObject):
     def _init(self) -> None:
         conn = open_db(self.db_path)
         config = Config(conn, self.platform)
-        self.handler = Handler(conn, SafeActions(conn, self.platform), config)
+        factory = self.semantic_factory
+        self.handler = Handler(
+            conn, SafeActions(conn, self.platform), config, lambda: factory(conn, config)
+        )
+        _ = self.handler.semantic  # load the model now, not on the first keystroke
 
     @Slot(int, str, object)
     def _on_request(self, rid: int, op: str, payload: Any) -> None:
@@ -85,7 +100,10 @@ class Engine(QObject):
                 reply = h.submit(str(payload))
             elif op == "act":
                 index, action = payload
-                reply = h.act(int(index), str(action))
+                if action == "related":
+                    reply = h.submit(f"related to #{int(index) + 1}")
+                else:
+                    reply = h.act(int(index), str(action))
             elif op == "pause":
                 h.config.set_setting("indexing_paused", bool(payload))
                 return

@@ -9,6 +9,8 @@ Follow-ups (need a previous result list, see ``context.py``):
   select         "open the second one", "doosra wala", "#3", "the last one"
   reveal         "show its folder", "where is it", "iska folder kholo"
   older / newer  "the older one", "purana wala", "the latest one"
+  related        "related to this file", "similar to the second one",
+                 "files related to fee receipt", "isse related files"
 
 English, Hinglish and Kannada words are accepted; typos in command words are
 corrected (only command words, so a filename like "shop receipts" is left alone).
@@ -46,9 +48,22 @@ PROJECT_WORDS = frozenset("project projects repo repos repository repositories".
 RECENT_WORDS = frozenset("recent recently lately".split())
 FOLDER_WORDS = frozenset("folder directory location containing explorer finder".split())
 REVEAL_VERBS = frozenset("reveal locate".split())
-PRONOUNS = frozenset("it its it's that this isko usko ise use iska uska iski uski idu adu".split())
+PRONOUNS = frozenset(
+    """
+    it its it's that this isko usko ise use iska uska iski uski iske uske isse usse idu adu
+""".split()
+)
 OLDER = frozenset("older old earlier previous purana purani purane haleya hale".split())
 NEWER = frozenset("newer new latest newest naya nayi naye hosa hosadu".split())
+RELATED_WORDS = frozenset("related similar relevant sambandhit sambandhita sambandhisida".split())
+_JAISA = frozenset("jaisa jaise jaisi".split())
+RELATED_FILLER = frozenset(
+    """
+    related similar relevant like more to this these that files file stuff things documents
+    docs other others iss is isse isko iske iski se jaisa jaise jaisi sambandhit sambandhita
+    sambandhisida idakke with
+""".split()
+)
 ORDINALS: dict[str, int] = {
     "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3, "fourth": 4, "4th": 4,
     "fifth": 5, "5th": 5, "sixth": 6, "6th": 6, "seventh": 7, "7th": 7, "eighth": 8, "8th": 8,
@@ -93,14 +108,15 @@ RECENT_FILLER = frozenset(
 _FUZZY_VOCAB = sorted(
     {"open", "launch", "find", "search", "locate", "show", "list", "display", "projects",
      "project", "repository", "repositories", "recent", "recently", "folder", "directory",
-     "first", "second", "third", "fourth", "fifth", "older", "newer", "latest"}
+     "first", "second", "third", "fourth", "fifth", "older", "newer", "latest",
+     "related", "similar"}
 )  # fmt: skip
 _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show", "list", "display"})
 
 
 @dataclass(frozen=True, slots=True)
 class Intent:
-    kind: str  # open | find | show_projects | recent | select | reveal | older | newer | none
+    kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
@@ -110,6 +126,8 @@ class Intent:
 
     @property
     def is_followup(self) -> bool:
+        if self.kind == "related":
+            return not self.query  # "related to this file" refers to the shown results
         return self.kind in {"select", "reveal", "older", "newer"}
 
 
@@ -227,6 +245,32 @@ def parse(text: str) -> Intent:
         if has_pronoun and (has_open or has_show):
             return Intent("select", ordinal=None, action="open", confidence=conf,
                           corrected=corrected)  # fmt: skip
+
+    # --- related files ----------------------------------------------------------------
+    like_this = "like" in toks and (
+        "more" in toks
+        or (
+            "this" in toks
+            and any(t in {"file", "files", "one", "ones", "doc", "docs"} for t in toks)
+        )
+    )
+    rel = (
+        any(t in RELATED_WORDS for t in toks)
+        or like_this
+        or (any(t in _JAISA for t in toks) and has_pronoun)
+    )
+    if rel:
+        lead = 0  # command verbs only at the start ("show me files similar to linked list")
+        while lead < len(toks) and (toks[lead] in verbs or toks[lead] in FILLER):
+            lead += 1
+        rest = [
+            t for i, t in enumerate(toks)
+            if i >= lead and i not in ord_idx and t not in RELATED_FILLER and t not in FILLER
+            and t not in PRONOUNS
+        ]  # fmt: skip
+        if not rest:
+            return Intent("related", ordinal=ordinal, confidence=conf, corrected=corrected)
+        return Intent("related", query=" ".join(rest), confidence=conf, corrected=corrected)
 
     # --- projects -------------------------------------------------------------------
     if any(t in PROJECT_WORDS for t in toks):

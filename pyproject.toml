@@ -70,7 +70,7 @@ disallow_untyped_calls = false
 
 # Third-party parsers without type stubs (document extraction).
 [[tool.mypy.overrides]]
-module = ["zachary.indexer.extract"]
+module = ["zachary.indexer.extract", "tests.semantic_corpus"]
 disallow_untyped_calls = false
 
 [[tool.mypy.overrides]]

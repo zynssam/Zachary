@@ -10,6 +10,7 @@ import errno
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,8 +18,10 @@ from zachary.core.config import Config
 from zachary.core.db import open_db, set_state
 from zachary.core.platform import Platform, get_platform
 from zachary.indexer.catchup import catch_up, save_cursor
+from zachary.indexer.embedder import Embedder
 from zachary.indexer.recent import ingest_recent
-from zachary.indexer.store import FileStore
+from zachary.indexer.semantic_worker import SemanticWorker
+from zachary.indexer.store import FileStore, ReconcileResult
 from zachary.indexer.watcher import DEFAULT_DEBOUNCE_S, Watcher
 
 log = logging.getLogger(__name__)
@@ -44,8 +47,11 @@ class IndexerService:
         cursor_interval: float = 60.0,
         fallback_rescan_interval: float = 600.0,
         lower_priority: bool = True,
+        semantic: bool = True,
+        embedder_factory: Callable[[Config], Embedder] | None = None,
     ) -> None:
         self.platform = platform or get_platform()
+        self.db_path = Path(db_path)
         self.conn = open_db(db_path)
         self.config = Config(self.conn, self.platform)
         self.config.seed_defaults()
@@ -61,6 +67,11 @@ class IndexerService:
         self.ready = threading.Event()  # set after the first catch-up (or a failure)
         self.failed = False
         self._stop = threading.Event()
+        self.semantic: SemanticWorker | None = (
+            SemanticWorker(self.db_path, self.platform, embedder_factory=embedder_factory)
+            if semantic
+            else None
+        )
 
     # -- helpers ---------------------------------------------------------------
     def _sig(self) -> _ConfigSig:
@@ -83,7 +94,7 @@ class IndexerService:
         if not limit.ok:
             log.warning("%s", limit.message)
         self._set_status(watch_limit_ok=limit.ok, watch_limit_message=limit.message)
-        w = Watcher(self.store, debounce=self.debounce)
+        w = Watcher(self.store, debounce=self.debounce, on_batch=self._on_batch)
         try:
             w.start()
         except OSError as e:
@@ -97,6 +108,15 @@ class IndexerService:
         self.watcher = w
         self.watching = True
         self._set_status(watching=True)
+
+    def _on_batch(self, result: ReconcileResult, _took: float) -> None:
+        """Live changes: new/changed files need embedding; names may form versions."""
+        if self.semantic is None:
+            return
+        if result.inserted or result.moved or result.deleted:
+            self.semantic.mark_versions_dirty()
+        if result.changed_files or result.inserted or result.moved:
+            self.semantic.nudge()
 
     def _stop_watcher(self) -> None:
         if self.watcher is not None:
@@ -118,6 +138,8 @@ class IndexerService:
             st.seconds,
         )
         self._set_status(last_catchup=time.time(), last_catchup_seconds=round(st.seconds, 2))
+        if self.semantic is not None:
+            self.semantic.mark_versions_dirty()
 
     def _ingest_recent(self) -> None:
         try:
@@ -152,6 +174,8 @@ class IndexerService:
                 self._catch_up()
                 self._ingest_recent()
                 self._start_watcher()
+            if self.semantic is not None:
+                self.semantic.start()
         except BaseException:
             self.failed = True
             self.ready.set()  # don't leave waiters hanging; the error propagates
@@ -179,11 +203,17 @@ class IndexerService:
                 if now >= next_cursor:
                     self._save_cursors()
                     next_cursor = now + self.cursor_interval
+                if self.watcher is not None and self.watcher.needs_catchup:
+                    self.watcher.needs_catchup = False  # inotify queue overflowed
+                    self._catch_up()
                 if not self.watching and now >= next_rescan:
                     self._catch_up()
                     next_rescan = now + self.fallback_rescan_interval
         finally:
             self._stop_watcher()
+            if self.semantic is not None and self.semantic.is_alive():
+                self.semantic.stop()
+                self.semantic.join(timeout=10)
             self.conn.close()
 
     def _on_config_change(self, old: _ConfigSig) -> _ConfigSig:
