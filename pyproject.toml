@@ -43,7 +43,7 @@ packages = ["zachary"]
 
 # sys.platform branches look unreachable on the other OS; CI type-checks both.
 [[tool.mypy.overrides]]
-module = ["zachary.core.platform.windows", "zachary.core.platform.linux"]
+module = ["zachary.core.platform", "zachary.core.platform.windows", "zachary.core.platform.linux"]
 warn_unreachable = false
 
 [[tool.mypy.overrides]]
