@@ -64,3 +64,27 @@ def test_ivf_recall_and_rebuild_policy(tmp_path) -> None:  # type: ignore[no-unt
     assert np.mean(recall) >= 0.95
     # new vectors join an existing cluster without a rebuild
     vectors.put(conn, 1, quantize(x[0]), vectors.load_centroids(conn))
+
+
+def test_memory_index_matches_and_stays_fresh(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    conn = open_db(tmp_path / "v.db")
+    x = _data(4000)
+    _fill(conn, x)
+    conn.execute("UPDATE files SET embedded_at = 1")
+    vectors.build(conn)
+    disk = vectors.VectorIndex(conn)
+    mem = vectors.MemoryVectorIndex(conn)
+    mem.REFRESH_S = 0.0
+    q = x[11]
+    assert [f for f, _ in mem.search(q, 10)] == [f for f, _ in disk.search(q, 10)]
+    # A file re-embedded with a new vector: the fresh copy wins without a full reload.
+    new_vec = x[2000]
+    vectors.put(conn, 12, quantize(new_vec), vectors.load_centroids(conn))
+    conn.execute("UPDATE files SET embedded_at = 2 WHERE id = 12")
+    got = dict(mem.search(new_vec, 5))
+    assert 12 in got and got[12] > 0.99
+    assert 12 not in dict(mem.search(x[11], 3)) or dict(mem.search(x[11], 3))[12] < 0.99
+    # A rebuild (new version) reloads everything.
+    vectors.build(conn)
+    assert dict(mem.search(new_vec, 5)).get(12, 0) > 0.99
+    assert {f for f, _ in mem.search(q, 10)} == {f for f, _ in disk.search(q, 10)}

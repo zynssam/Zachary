@@ -8,12 +8,14 @@ from pathlib import Path
 
 from zachary.core.config import Config
 from zachary.indexer.embedder import Model2VecEmbedder
-from zachary.search.vectors import SemanticSearch, VectorIndex
+from zachary.search.vectors import MemoryVectorIndex, SemanticSearch, VectorIndex
 
 log = logging.getLogger(__name__)
 
 
-def local_semantic(conn: sqlite3.Connection, config: Config) -> SemanticSearch | None:
+def local_semantic(
+    conn: sqlite3.Connection, config: Config, *, in_memory: bool = True
+) -> SemanticSearch | None:
     """Meaning search if the embedding model is already on disk. The assistant never
     downloads it (the indexer does); until then search is keyword + recency."""
     emb = Model2VecEmbedder(str(config.get_setting("embed_model")), _models_dir(conn))
@@ -24,6 +26,10 @@ def local_semantic(conn: sqlite3.Connection, config: Config) -> SemanticSearch |
     except Exception:
         log.warning("embedding model could not be loaded", exc_info=True)
         return None
+    if in_memory:
+        index = MemoryVectorIndex(conn)
+        index.warm()  # load now (engine start), not on the first keystroke
+        return SemanticSearch(emb, index)
     return SemanticSearch(emb, VectorIndex(conn))
 
 

@@ -147,7 +147,7 @@ class SemanticSearch:
     """What search needs for meaning: a query embedder and the file-vector index."""
 
     embedder: Embedder
-    index: VectorIndex
+    index: VectorIndex | MemoryVectorIndex
 
 
 class VectorIndex:
@@ -221,3 +221,166 @@ class VectorIndex:
         top = np.argsort(-sims)[:k] if len(sims) <= k else np.argpartition(-sims, k)[:k]
         top = top[np.argsort(-sims[top])]
         return [(int(rows[i][0]), float(sims[i])) for i in top if sims[i] >= min_sim]
+
+
+class MemoryVectorIndex:
+    """IVF index held in memory by the assistant: no disk reads per query.
+
+    The int8 vectors (256 bytes per file: ~51 MB for 200k files) are grouped by
+    cluster, so a query is a numpy scan of the nearest clusters. Under memory
+    pressure SQLite pages for the on-disk index got evicted and re-read (query
+    spikes of 200-900 ms on an 6 GB laptop); keeping this in RAM removes that.
+
+    Freshness: every ``REFRESH_S`` it checks the index version (a rebuild ->
+    full reload) and picks up newly embedded files incrementally. Deleted files
+    can linger until the next reload; search drops ids that no longer exist.
+    """
+
+    REFRESH_S = 5.0
+    FULL_RELOAD_S = 1800.0
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self._version = -1
+        self._loaded_at = 0.0
+        self._checked_at = 0.0
+        self._since = 0.0  # embedded_at high-water mark of what we have
+        self._centroids: FloatArray | None = None
+        self._ids = np.zeros(0, dtype=np.int64)
+        self._mat = np.zeros((0, EMBED_DIM), dtype=np.int8)
+        self._bounds: dict[int, tuple[int, int]] = {}  # cluster -> [start, end) rows
+        self._extra: dict[int, tuple[int, np.ndarray]] = {}  # file_id -> (cluster, vec)
+        self._stale: set[int] = set()  # base rows superseded by an extra
+
+    def _cursor(self) -> sqlite3.Cursor:
+        cur = self.conn.cursor()
+        cur.row_factory = None
+        return cur
+
+    def _full_load(self) -> None:
+        cur = self._cursor()
+        self._version = int(get_state(self.conn, "ivf.version", 0))
+        self._since = float(
+            cur.execute("SELECT coalesce(max(embedded_at), 0) FROM files").fetchone()[0]
+        )
+        self._centroids = load_centroids(self.conn)
+        n = int(cur.execute("SELECT count(*) FROM vec_ivf").fetchone()[0])
+        # Stream into preallocated arrays: fetching every row at once peaked at ~7x
+        # the final size (Python tuples + bytes) on a 200k index.
+        clusters = np.empty(n, dtype=np.int64)
+        ids = np.empty(n, dtype=np.int64)
+        mat = np.empty((n, EMBED_DIM), dtype=np.int8)
+        cur.execute("SELECT cluster, file_id, embedding FROM vec_ivf ORDER BY cluster")
+        i = 0
+        while i < n:
+            batch = cur.fetchmany(8192)
+            if not batch:
+                break
+            j = i + len(batch)
+            clusters[i:j] = [r[0] for r in batch]
+            ids[i:j] = [r[1] for r in batch]
+            mat[i:j] = np.frombuffer(b"".join(r[2] for r in batch), dtype=np.int8).reshape(
+                len(batch), EMBED_DIM
+            )
+            i = j
+        clusters, ids, mat = clusters[:i], ids[:i], mat[:i]
+        rows = range(i)
+        if i:
+            self._ids = ids
+            self._mat = mat
+            starts = np.flatnonzero(np.r_[True, clusters[1:] != clusters[:-1]])
+            ends = np.r_[starts[1:], len(rows)]
+            self._bounds = {
+                int(clusters[s]): (int(s), int(e)) for s, e in zip(starts, ends, strict=True)
+            }
+        else:
+            self._ids = np.zeros(0, dtype=np.int64)
+            self._mat = np.zeros((0, EMBED_DIM), dtype=np.int8)
+            self._bounds = {}
+        self._extra = {}
+        self._stale = set()
+        self._loaded_at = time.monotonic()
+
+    def _refresh(self) -> None:
+        now = time.monotonic()
+        if self._loaded_at and now - self._checked_at < self.REFRESH_S:
+            return
+        self._checked_at = now
+        if (
+            not self._loaded_at
+            or int(get_state(self.conn, "ivf.version", 0)) != self._version
+            or now - self._loaded_at > self.FULL_RELOAD_S
+        ):
+            self._full_load()
+            return
+        cur = self._cursor()
+        rows = cur.execute(
+            "SELECT f.embedded_at, v.cluster, v.file_id, v.embedding FROM files f"
+            " JOIN vec_ivf v ON v.file_id = f.id WHERE f.is_dir = 0 AND f.embedded_at > ?",
+            (self._since,),
+        ).fetchall()
+        for ts, cl, fid, blob in rows:
+            self._extra[int(fid)] = (int(cl), np.frombuffer(blob, dtype=np.int8))
+            self._stale.add(int(fid))
+            self._since = max(self._since, float(ts))
+        if len(self._extra) > max(1000, len(self._ids) // 20):
+            self._full_load()  # too many patches: rebuild the arrays
+
+    def warm(self) -> None:
+        self._refresh()
+
+    def search(
+        self, q: FloatArray, k: int = 100, *, min_sim: float = 0.0, allowed: set[int] | None = None
+    ) -> list[tuple[int, float]]:
+        self._refresh()
+        c = self._centroids
+        if c is None or not len(c):
+            probe = list(self._bounds)
+        else:
+            probe = []
+            covered = 0
+            for cl in np.argsort(-(c @ q)).tolist():
+                probe.append(int(cl))
+                s, e = self._bounds.get(int(cl), (0, 0))
+                covered += e - s
+                if len(probe) >= MIN_PROBE and covered >= TARGET_SCAN:
+                    break
+        id_parts: list[np.ndarray] = []
+        sim_parts: list[np.ndarray] = []
+        qf = q.astype(np.float32)
+        for cl in probe:
+            s, e = self._bounds.get(cl, (0, 0))
+            if e > s:
+                id_parts.append(self._ids[s:e])
+                sim_parts.append((self._mat[s:e].astype(np.float32) @ qf) / 127.0)
+        probe_set = set(probe)
+        extra = [(fid, v) for fid, (cl, v) in self._extra.items() if cl in probe_set]
+        if extra:
+            id_parts.append(np.array([f for f, _ in extra], dtype=np.int64))
+            ev = np.stack([v for _, v in extra]).astype(np.float32)
+            sim_parts.append((ev @ qf) / 127.0)
+        if not id_parts:
+            return []
+        ids = np.concatenate(id_parts)
+        sims = np.concatenate(sim_parts)
+        if self._stale:
+            # Base rows that were re-embedded since the load: the extra copy wins.
+            keep = ~np.isin(ids, np.fromiter(self._stale, dtype=np.int64))
+            n_extra = len(extra)
+            if n_extra:
+                keep[-n_extra:] = True
+            ids, sims = ids[keep], sims[keep]
+        if allowed is not None:
+            mask = np.isin(ids, np.fromiter(allowed, dtype=np.int64))
+            ids, sims = ids[mask], sims[mask]
+        if not len(ids):
+            return []
+        top = np.argsort(-sims)[:k] if len(sims) <= k else np.argpartition(-sims, k)[:k]
+        top = top[np.argsort(-sims[top])]
+        return [(int(ids[i]), float(sims[i])) for i in top if sims[i] >= min_sim]
+
+    def score_ids(
+        self, q: FloatArray, ids: set[int], *, min_sim: float = 0.0
+    ) -> list[tuple[int, float]]:
+        """Exact scores for a small set (time-range queries): read from the DB."""
+        return VectorIndex(self.conn).score_ids(q, ids, min_sim=min_sim)

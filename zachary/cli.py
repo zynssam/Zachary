@@ -54,7 +54,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     conn, cfg = _open(args)
     q = " ".join(args.query)
-    sem = None if args.keywords_only else local_semantic(conn, cfg)
+    sem = None if args.keywords_only else local_semantic(conn, cfg, in_memory=False)
     resp = search(conn, q, limit=args.limit, rules=cfg.path_rules(), semantic=sem)
     if args.json:
         print(
