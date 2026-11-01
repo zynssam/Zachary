@@ -1,6 +1,6 @@
 # Phase 3: Semantic memory (report)
 
-Status: **complete, waiting for review.** Branch `phase-3` (not merged). CI is green on Linux and Windows, Python 3.11 and 3.12.
+Status: **complete and reviewed; merged into `main`.** CI is green on Linux and Windows, Python 3.11 and 3.12.
 The Linux 3.12 job also runs the acceptance test with the real Model2Vec model.
 
 ## 1. "Done when"
@@ -103,7 +103,8 @@ pkill -f zachary.indexer; pkill -f zachary.assistant
 .venv/bin/python -m zachary.cli status        # watch "semantic: N/M files embedded"
 ```
 
-## 8. Questions for review
-1. Is **+61 MB of RAM per 200k files** in the assistant acceptable for fast meaning search (decision 2)?
-2. Keep the **looser meaning thresholds** (more recall, occasional weak tail results; decision 3)?
-3. Merge `phase-3` into `main`?
+## 8. Review outcome
+Decisions 1–3 approved ("fine as long as it doesn't affect future or previous tasks"). None of them
+change earlier phases' behaviour or later phases' plans: Phase 6 Q&A uses `vec_chunks` (sqlite-vec,
+as specified); the in-memory index only speeds up the assistant; thresholds are constants in
+`search/hybrid.py`. `phase-3` merged into `main` (fast-forward).
