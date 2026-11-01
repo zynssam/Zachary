@@ -99,20 +99,27 @@ def test_excluded_paths_ignored(watcher: Watcher, store: FileStore, home: Path) 
     assert _row(store, home / "docs" / "download.crdownload") is None
 
 
-def test_burst_is_batched(watcher: Watcher, store: FileStore, home: Path) -> None:
-    before = watcher.batches
-    for i in range(500):
-        write(home / "burst" / f"f{i:04d}.txt")
+def test_burst_is_batched(store: FileStore, home: Path) -> None:
+    """An unzip-like burst within one quiet period becomes a handful of DB batches."""
+    scan(store)
+    w = Watcher(store, debounce=1.0)  # longer than the burst takes to write
+    w.start()
+    try:
+        for i in range(500):
+            write(home / "burst" / f"f{i:04d}.txt")
 
-    def count() -> int:
-        return int(
-            store.conn.execute(
-                "SELECT count(*) FROM files WHERE path LIKE ?", (store.norm(home / "burst") + "%",)
-            ).fetchone()[0]
-        )
+        def count() -> int:
+            return int(
+                store.conn.execute(
+                    "SELECT count(*) FROM files WHERE path LIKE ?",
+                    (store.norm(home / "burst") + "%",),
+                ).fetchone()[0]
+            )
 
-    wait_until(lambda: count() == 501, timeout=15)  # folder + 500 files
-    assert watcher.batches - before < 50  # hundreds of events, few DB batches
+        wait_until(lambda: count() == 501, timeout=15)  # folder + 500 files
+        assert w.batches <= 5, w.batches
+    finally:
+        w.stop()
 
 
 def test_edit_logged_once(watcher: Watcher, store: FileStore, home: Path) -> None:

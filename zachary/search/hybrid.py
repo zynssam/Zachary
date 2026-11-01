@@ -34,10 +34,10 @@ RECENCY_WEIGHT = 0.5
 EXACT_NAME_BONUS = 0.02
 # Keyword tier bonus: all terms as whole words > all terms with the last as a prefix >
 # any term whole > any term prefix. Keeps "fees" -> "Fee Receipt" above "feedback".
-TIER_BONUS = (0.01, 0.004, 0.002, 0.0)
+TIER_BONUS = (0.01, 0.006, 0.002, 0.0)
 IN_RANGE_BONUS = 0.05
-FTS_LIMIT = 300
-RANGE_FTS_LIMIT = 5000
+FTS_LIMIT = 200
+RANGE_KW_ENOUGH = 50  # in-range keyword matches after which looser tiers are skipped
 RANGE_LIMIT = 2000
 # bm25 column weights: name, path_tokens, title, keywords
 BM25 = "bm25(files_fts, 10.0, 2.0, 6.0, 3.0)"
@@ -103,33 +103,74 @@ def fts_expression(terms: list[str], *, mode: str, prefix: bool = True) -> str:
     return (" OR " if mode == "or" else " AND ").join(parts)
 
 
-def _keyword_ids(conn: sqlite3.Connection, terms: list[str], limit: int) -> dict[int, int]:
-    """Matching file ids, best first, in tiers: whole words before as-you-type prefixes,
-    all terms (AND) before any term (OR). Within a tier, bm25 decides.
+def _raw(conn: sqlite3.Connection) -> sqlite3.Cursor:
+    """Cursor returning plain tuples (sqlite3.Row costs ~1 us per row on hot paths)."""
+    cur = conn.cursor()
+    cur.row_factory = None
+    return cur
 
-    Tiers stop it ranking "feedback" (prefix of "fee") above "Fee Receipt" for "fees".
+
+def _fts_ids(conn: sqlite3.Connection, expr: str, limit: int) -> list[int]:
+    """Best ``limit`` matches by bm25."""
+    try:
+        rows = _raw(conn).execute(
+            f"SELECT rowid FROM files_fts WHERE files_fts MATCH ? ORDER BY {BM25} LIMIT ?",
+            (expr, limit),
+        )
+        return [r[0] for r in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _fts_in(conn: sqlite3.Connection, expr: str, allowed: set[int]) -> list[int]:
+    """All matches inside ``allowed``, unranked: a sequential posting-list scan (~1 us/row).
+
+    Used for time-range queries, where the allowed set is small. Ranking every match
+    with bm25, or seeking FTS once per allowed rowid, are both far slower (measured).
+    """
+    try:
+        rows = _raw(conn).execute("SELECT rowid FROM files_fts WHERE files_fts MATCH ?", (expr,))
+        return [r[0] for r in rows if r[0] in allowed]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _keyword_ids(
+    conn: sqlite3.Connection, terms: list[str], limit: int, allowed: set[int] | None = None
+) -> dict[int, int]:
+    """Matching file ids -> tier, best first (dict order = rank when ``allowed`` is None).
+
+    Tiers (bm25 orders rows within a tier):
+      0  all terms as whole words
+      1  all terms, the last one as an as-you-type prefix
+      2  all terms but one (a word the user added that no filename has, e.g. "code")
+      3  any term: only if nothing above matched, since OR over common words can
+         touch tens of thousands of rows
+
+    Tiers also keep "fees" -> "Fee Receipt" above prefix-only "feedback". With
+    ``allowed`` (time-range queries) matches are restricted to those ids, unranked.
     """
     if not terms:
         return {}
-    out: dict[int, int] = {}  # id -> tier (insertion order = rank)
-    modes = ["and", "or"] if len(terms) > 1 else ["and"]
-    for m, mode in enumerate(modes):
-        for prefix in (False, True):
-            tier = 2 * m + int(prefix)
-            if prefix and len(terms[-1]) < 2:
-                continue
-            expr = fts_expression(terms, mode=mode, prefix=prefix)
-            try:
-                rows = conn.execute(
-                    f"SELECT rowid FROM files_fts WHERE files_fts MATCH ? ORDER BY {BM25} LIMIT ?",
-                    (expr, limit),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue
-            for (rid,) in rows:
-                out.setdefault(int(rid), tier)
-        if len(out) >= 20:
-            break
+    terms = terms[:6]
+    out: dict[int, int] = {}
+
+    def add(expr: str, tier: int) -> None:
+        ids = _fts_ids(conn, expr, limit) if allowed is None else _fts_in(conn, expr, allowed)
+        for rid in ids:
+            out.setdefault(rid, tier)
+
+    add(fts_expression(terms, mode="and", prefix=False), 0)
+    if len(terms[-1]) >= 2 and len(out) < limit:
+        add(fts_expression(terms, mode="and", prefix=True), 1)
+    if len(out) >= 20 or len(terms) == 1:
+        return out
+    if len(terms) > 2 or not out:
+        for k in range(len(terms)):
+            sub = terms[:k] + terms[k + 1 :]
+            add(fts_expression(sub, mode="and", prefix=k != len(terms) - 1), 2)
+    if not out:
+        add(fts_expression(terms, mode="or", prefix=True), 3)
     return out
 
 
@@ -150,7 +191,7 @@ def correct_terms(conn: sqlite3.Connection, terms: list[str]) -> dict[str, str]:
             r[0]
             for r in conn.execute(
                 "SELECT term FROM files_fts_vocab WHERE term >= ? AND term < ?"
-                " AND length(term) BETWEEN ? AND ? ORDER BY doc DESC LIMIT 20000",
+                " AND length(term) BETWEEN ? AND ? ORDER BY doc DESC LIMIT 4000",
                 (lo, hi, len(t) - 2, len(t) + 2),
             )
         ]
@@ -163,13 +204,13 @@ def correct_terms(conn: sqlite3.Connection, terms: list[str]) -> dict[str, str]:
 def _ids_in_range(conn: sqlite3.Connection, tr: TimeRange, limit: int) -> dict[int, str]:
     """file id -> how it relates to the range ('opened' beats 'edited')."""
     found: dict[int, str] = {}
-    for fid, source in conn.execute(
+    for fid, source in _raw(conn).execute(
         "SELECT file_id, source FROM access_log WHERE ts >= ? AND ts < ? ORDER BY ts DESC LIMIT ?",
         (tr.start, tr.end, limit),
     ):
         if fid not in found or source != "edit":
             found[int(fid)] = "edited" if source == "edit" else "opened"
-    for (fid,) in conn.execute(
+    for (fid,) in _raw(conn).execute(
         "SELECT id FROM files WHERE mtime >= ? AND mtime < ? AND is_dir = 0"
         " ORDER BY mtime DESC LIMIT ?",
         (tr.start, tr.end, limit),
@@ -183,13 +224,13 @@ def _load(conn: sqlite3.Connection, ids: list[int]) -> dict[int, SearchResult]:
     for i in range(0, len(ids), 900):
         chunk = ids[i : i + 900]
         marks = ",".join("?" * len(chunk))
-        for r in conn.execute(
+        for r in _raw(conn).execute(
             f"SELECT id, path, name, kind, is_dir, mtime FROM files WHERE id IN ({marks})", chunk
         ):
             out[int(r[0])] = SearchResult(
                 int(r[0]), str(r[1]), str(r[2]), str(r[3]), bool(r[4]), float(r[5]), None, 0.0
             )
-        for fid, ts in conn.execute(
+        for fid, ts in _raw(conn).execute(
             f"SELECT file_id, max(ts) FROM access_log WHERE file_id IN ({marks})"
             " AND source != 'edit' GROUP BY file_id",
             chunk,
@@ -211,13 +252,26 @@ def _ago(ts: float, now: float) -> str:
     return "yesterday" if days == 1 else f"{days} days ago"
 
 
+def _term_in(term: str, ws: list[str]) -> bool:
+    """Loose word match on a shared stem ("fee"/"fees", "linked"/"link"), mirroring the
+    stemmed FTS match closely enough for ranking and explanations."""
+    for w in ws:
+        k = min(4, len(w), len(term))
+        if k >= 2 and w[:k] == term[:k]:
+            return True
+    return False
+
+
+def _name_hits(name: str, terms: list[str]) -> int:
+    ws = words(name)
+    return sum(1 for t in terms if _term_in(t, ws))
+
+
 def _why_terms(r: SearchResult, terms: list[str]) -> list[str]:
     name_words = words(r.name)
     path_words = words(r.path[: -len(r.name)] if r.path.endswith(r.name) else r.path)
-    in_name = [t for t in terms if any(w.startswith(t[:4]) for w in name_words)]
-    in_path = [
-        t for t in terms if t not in in_name and any(w.startswith(t[:4]) for w in path_words)
-    ]
+    in_name = [t for t in terms if _term_in(t, name_words)]
+    in_path = [t for t in terms if t not in in_name and _term_in(t, path_words)]
     why = []
     if in_name:
         why.append("name: " + ", ".join(in_name))
@@ -243,28 +297,31 @@ def search(
     terms = query_terms(tp.rest)
     tr = tp.range
 
-    kw = _keyword_ids(conn, terms, RANGE_FTS_LIMIT if tr else FTS_LIMIT)
+    in_range: dict[int, str] = _ids_in_range(conn, tr, RANGE_LIMIT) if tr else {}
+    allowed = set(in_range)
+    range_matched = True
+    restricted = False
+
+    def lookup(ts: list[str]) -> dict[int, int]:
+        nonlocal range_matched, restricted
+        if tr is not None and allowed:
+            hit = _keyword_ids(conn, ts, RANGE_KW_ENOUGH, allowed=allowed)
+            if hit:
+                range_matched, restricted = True, True
+                return hit
+        hit = _keyword_ids(conn, ts, FTS_LIMIT)
+        restricted = False
+        range_matched = tr is None or not hit
+        return hit
+
+    kw = lookup(terms) if terms else {}
     corrected: dict[str, str] = {}
     if terms and not kw:
         corrected = correct_terms(conn, terms)
         if corrected:
             terms = [corrected.get(t, t) for t in terms]
-            kw = _keyword_ids(conn, terms, RANGE_FTS_LIMIT if tr else FTS_LIMIT)
-
-    in_range: dict[int, str] = _ids_in_range(conn, tr, RANGE_LIMIT) if tr else {}
-    range_matched = True
-    kw_ids = list(kw)
-    if tr is not None:
-        if terms:
-            filtered = [i for i in kw_ids if i in in_range]
-            if filtered:
-                candidates = filtered
-            else:
-                candidates, range_matched = kw_ids[:FTS_LIMIT], False
-        else:
-            candidates = list(in_range)
-    else:
-        candidates = kw_ids
+            kw = lookup(terms)
+    candidates = list(kw) if terms else list(in_range)
 
     rows = _load(conn, candidates)
     if exclude is not None:
@@ -272,34 +329,51 @@ def search(
     if not include_dirs:
         rows = {k: v for k, v in rows.items() if not v.is_dir}
 
-    kw_rank = {fid: i for i, fid in enumerate(i for i in candidates if i in rows)} if terms else {}
+    if restricted:
+        # Unranked matches inside the range: tier, then how many terms hit the *name*
+        # (not just a folder), then most recent first.
+        order = sorted(
+            rows, key=lambda i: (kw[i], -_name_hits(rows[i].name, terms), -rows[i].last_seen)
+        )
+    else:
+        order = [i for i in candidates if i in rows]
+    kw_rank = {fid: i for i, fid in enumerate(order)} if terms else {}
     # Dense rank by recency (to the minute): equal times share a rank, so ties don't
     # get an arbitrary order that could outweigh keyword quality.
     minutes = sorted({int(r.last_seen // 60) for r in rows.values()}, reverse=True)
     dense = {m: i for i, m in enumerate(minutes)}
     rec_rank = {r.file_id: dense[int(r.last_seen // 60)] for r in rows.values()}
     phrase = " ".join(terms)
+    exact: set[int] = set()
     for r in rows.values():
         s = RECENCY_WEIGHT / (RRF_K + rec_rank[r.file_id])
         if r.file_id in kw_rank:
             s += KW_WEIGHT / (RRF_K + kw_rank[r.file_id]) + TIER_BONUS[kw[r.file_id]]
-        stem = r.name.rsplit(".", 1)[0] if not r.is_dir else r.name
-        if phrase and " ".join(words(stem)) == phrase:
-            s += EXACT_NAME_BONUS
+        if phrase:
+            stem = r.name if r.is_dir else r.name.rsplit(".", 1)[0]
+            if " ".join(words(stem)) == phrase:
+                s += EXACT_NAME_BONUS
+                exact.add(r.file_id)
+        if range_matched and r.file_id in in_range:
+            # A file the user opened in the range is a stronger signal than an mtime.
+            s += IN_RANGE_BONUS if in_range[r.file_id] == "opened" else IN_RANGE_BONUS / 2
+        r.score = s
+
+    results = sorted(rows.values(), key=lambda r: (-r.score, -r.last_seen))[:limit]
+    # Explanations only for what is shown.
+    for r in results:
+        if r.file_id in exact:
             r.why.append("exact name")
-        if r.file_id in in_range and range_matched:
-            s += IN_RANGE_BONUS
+        in_r = range_matched and r.file_id in in_range
+        if in_r:
             assert tr is not None
             r.why.append(f"{in_range[r.file_id]} {tr.label}")
         r.why.extend(_why_terms(r, terms))
-        if not (r.file_id in in_range and range_matched):
+        if not in_r:
             if r.last_access and r.last_access >= r.mtime:
                 r.why.append(f"opened {_ago(r.last_access, now_ts)}")
             else:
                 r.why.append(f"modified {_ago(r.mtime, now_ts)}")
-        r.score = s
-
-    results = sorted(rows.values(), key=lambda r: (-r.score, -r.last_seen))[:limit]
     return SearchResponse(
         query=query,
         terms=terms,

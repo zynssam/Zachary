@@ -132,6 +132,8 @@ def _row(r: Any) -> Row:
 
 
 _ROW_COLS = "id, path, is_dir, size, mtime, inode, dev"
+# Snapshot row: (id, is_dir, size, mtime, inode, dev)
+SnapRow = tuple[int, int, int, float, int | None, int | None]
 
 
 class FileStore:
@@ -144,6 +146,7 @@ class FileStore:
         self.sep = os.sep
         self.roots: list[str] = []
         self.matcher: ExcludeMatcher
+        self._ptok: dict[tuple[str, str | None], str] = {}
         self.reload()
 
     # -- configuration -------------------------------------------------------
@@ -152,6 +155,7 @@ class FileStore:
         with self.lock:
             self.roots = [str(r) for r in self.config.index_roots()]
             self.matcher = self.config.exclude_matcher(self.roots)
+            self._ptok = {}
 
     def norm(self, path: str | os.PathLike[str]) -> str:
         """Canonical stored form of a path (see :func:`canonical_path`)."""
@@ -195,14 +199,19 @@ class FileStore:
         base = path.rstrip(self.sep)
         return base + self.sep, base + chr(ord(self.sep) + 1)
 
-    def snapshot(self, root: str) -> dict[str, Row]:
-        """Every row at or under ``root``, keyed by path."""
+    def snapshot(self, root: str) -> dict[str, SnapRow]:
+        """Every row at or under ``root``: path -> (id, is_dir, size, mtime, inode, dev).
+
+        Plain tuples: this loads one entry per indexed file, so it must be cheap.
+        """
         lo, hi = self.descendant_range(root)
         cur = self.conn.execute(
-            f"SELECT {_ROW_COLS} FROM files WHERE path = ? OR (path > ? AND path < ?)",
+            "SELECT path, id, is_dir, size, mtime, inode, dev FROM files"
+            " WHERE path = ? OR (path > ? AND path < ?)",
             (root, lo, hi),
         )
-        return {r[1]: _row(r) for r in cur}
+        cur.row_factory = None
+        return {r[0]: r[1:] for r in cur}
 
     # -- write helpers (caller holds the lock and an open transaction) ---------
     @contextmanager
@@ -211,12 +220,57 @@ class FileStore:
         with self.lock, transaction(self.conn):
             yield
 
-    def _fts_put(self, file_id: int, path: str, name: str, root: str | None) -> None:
-        self.conn.execute("DELETE FROM files_fts WHERE rowid = ?", (file_id,))
+    def path_tokens(self, path: str, root: str | None) -> str:
+        """FTS folder words for ``path``, cached per parent folder."""
+        parent = os.path.dirname(path)
+        key = (parent, root)
+        hit = self._ptok.get(key)
+        if hit is None:
+            if len(self._ptok) > 50_000:
+                self._ptok.clear()
+            hit = self._ptok[key] = path_text(path, root)
+        return hit
+
+    def _fts_put(
+        self, file_id: int, path: str, name: str, root: str | None, *, fresh: bool = False
+    ) -> None:
+        if not fresh:
+            self.conn.execute("DELETE FROM files_fts WHERE rowid = ?", (file_id,))
         self.conn.execute(
             "INSERT INTO files_fts(rowid, name, path_tokens) VALUES (?, ?, ?)",
-            (file_id, name_text(name), path_text(path, root)),
+            (file_id, name_text(name), self.path_tokens(path, root)),
         )
+
+    def insert_many(self, entries: list[Entry], parent_id: int | None, root: str) -> list[int]:
+        """Insert new entries of one folder with two ``executemany`` calls.
+
+        Ids are assigned here, inside the caller's write transaction (which holds
+        SQLite's write lock), so they can't collide with another writer.
+        """
+        if not entries:
+            return []
+        start = int(self.conn.execute("SELECT coalesce(max(id), 0) + 1 FROM files").fetchone()[0])
+        now = time.time()
+        rows = []
+        fts = []
+        ptok = self.path_tokens(entries[0].path, root)
+        for i, e in enumerate(entries):
+            ext, kind = classify(e.name, e.is_dir)
+            fid = start + i
+            rows.append(
+                (fid, e.path, parent_id, e.name, ext, e.size, e.mtime, e.ctime, e.inode, e.dev,
+                 kind, int(e.is_dir), now)
+            )  # fmt: skip
+            fts.append((fid, name_text(e.name), ptok))
+        self.conn.executemany(
+            "INSERT INTO files(id, path, parent_id, name, ext, size, mtime, ctime, inode, dev,"
+            " kind, is_dir, indexed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        self.conn.executemany(
+            "INSERT INTO files_fts(rowid, name, path_tokens) VALUES (?, ?, ?)", fts
+        )
+        return [start + i for i in range(len(entries))]
 
     def insert(self, e: Entry, parent_id: int | None, root: str | None = None) -> int:
         ext, kind = classify(e.name, e.is_dir)
@@ -239,7 +293,7 @@ class FileStore:
             ),
         )
         file_id = int(cur.fetchone()[0])
-        self._fts_put(file_id, e.path, e.name, root or self.root_for(e.path))
+        self._fts_put(file_id, e.path, e.name, root or self.root_for(e.path), fresh=True)
         return file_id
 
     def update(self, row_id: int, e: Entry) -> None:
@@ -417,7 +471,7 @@ class FileStore:
             for fid, path, name in rows:
                 self.conn.execute(
                     "INSERT INTO files_fts(rowid, name, path_tokens) VALUES (?, ?, ?)",
-                    (fid, name_text(name), path_text(path, self.root_for(path))),
+                    (fid, name_text(name), self.path_tokens(path, self.root_for(path))),
                 )
         return len(rows)
 

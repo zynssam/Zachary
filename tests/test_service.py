@@ -50,6 +50,7 @@ def test_service_catchup_watch_forget_pause_resume(
     # forget from another process -> indexer purges
     cfg.add_exclude(home / "private")
     wait_until(lambda: not _has(cfg, home / "private" / "diary.txt"))
+    wait_until(lambda: svc.watching)  # reconfigure (purge + catch-up + restart) finished
     # pause stops watching; changes while paused are found on resume
     cfg.set_setting("indexing_paused", True)
     wait_until(lambda: not svc.watching)
