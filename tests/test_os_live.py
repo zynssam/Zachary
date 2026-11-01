@@ -125,5 +125,6 @@ def test_usn_diagnostics(home: Path) -> None:
             [(r.name, hex(r.reason)) for r in recs if r.name.startswith("diag_")],
             [r.name for r in recs][:12],
         )
-    ok = [k for k, v in report.items() if isinstance(v, tuple) and v[2]]
-    assert ok, f"cursor={cur} home={home} report={report}"
+    # Each read method must see our own create + rename, or catch-up silently misses changes.
+    for label, v in report.items():
+        assert isinstance(v, tuple) and v[2], f"{label}: cursor={cur} report={report}"

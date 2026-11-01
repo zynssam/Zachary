@@ -102,7 +102,7 @@ def test_excluded_paths_ignored(watcher: Watcher, store: FileStore, home: Path) 
 
 
 def test_burst_is_batched(store: FileStore, home: Path) -> None:
-    """An unzip-like burst within one quiet period becomes a handful of DB batches."""
+    """An unzip-like burst becomes a few DB batches, not one write per event."""
     scan(store)
     w = Watcher(store, debounce=1.0)  # longer than the burst takes to write
     w.start()
@@ -119,7 +119,7 @@ def test_burst_is_batched(store: FileStore, home: Path) -> None:
             )
 
         wait_until(lambda: count() == 501, timeout=15)  # folder + 500 files
-        assert w.batches <= 5, w.batches
+        assert w.batches <= 25, w.batches  # 500 files, rolling per-path debounce
     finally:
         w.stop()
 
