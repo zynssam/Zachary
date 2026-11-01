@@ -169,6 +169,41 @@ def _fts_ids(conn: sqlite3.Connection, expr: str, limit: int) -> list[tuple[int,
         return []
 
 
+DENSE_PREFIX_DOCS = 20_000  # prefixes matching more files than this skip bm25
+SHORT_PREFIX_SCAN = 5000
+
+
+def prefix_doc_estimate(conn: sqlite3.Connection, prefix: str) -> int:
+    """Roughly how many files an as-you-type prefix matches (vocab lookup, ~1 ms)."""
+    if not prefix:
+        return 0
+    hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+    row = (
+        _raw(conn)
+        .execute(
+            "SELECT coalesce(sum(doc), 0) FROM files_fts_vocab WHERE term >= ? AND term < ?",
+            (prefix, hi),
+        )
+        .fetchone()
+    )
+    return int(row[0])
+
+
+def _fts_recent(conn: sqlite3.Connection, expr: str, limit: int) -> list[tuple[int, float]]:
+    """Most recently modified matches, unranked: for dense prefixes ("re*", "proj*") that
+    match a large part of the index, where bm25-sorting everything costs ~100 ms and
+    adds little while the user is still typing."""
+    try:
+        rows = _raw(conn).execute(
+            "SELECT f.id FROM files f WHERE f.id IN (SELECT rowid FROM files_fts"
+            " WHERE files_fts MATCH ? LIMIT ?) ORDER BY f.mtime DESC LIMIT ?",
+            (expr, SHORT_PREFIX_SCAN, limit),
+        )
+        return [(r[0], 0.0) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
 def _fts_in(conn: sqlite3.Connection, expr: str, allowed: set[int]) -> list[int]:
     """All matches inside ``allowed``, unranked: a sequential posting-list scan (~1 us/row).
 
@@ -206,12 +241,13 @@ def _keyword_ids(
     terms = terms[:6]
     out: dict[int, int] = {}
 
-    def add(expr: str, tier: int) -> None:
+    def add(expr: str, tier: int, short_prefix: bool = False) -> None:
         if allowed is not None:
             for rid in _fts_in(conn, expr, allowed):
                 out.setdefault(rid, tier)
             return
-        for rid, bm in _fts_ids(conn, expr, limit):
+        found = _fts_recent(conn, expr, limit) if short_prefix else _fts_ids(conn, expr, limit)
+        for rid, bm in found:
             if rid not in out:
                 out[rid] = tier
                 if scores is not None:
@@ -219,7 +255,8 @@ def _keyword_ids(
 
     add(fts_expression(terms, mode="and", prefix=False), 0)
     if len(terms[-1]) >= 2 and len(out) < limit:
-        add(fts_expression(terms, mode="and", prefix=True), 1)
+        dense = prefix_doc_estimate(conn, terms[-1]) > DENSE_PREFIX_DOCS
+        add(fts_expression(terms, mode="and", prefix=True), 1, dense)
     if len(out) >= 20 or len(terms) == 1:
         return out
     if len(terms) > 2 or not out:
