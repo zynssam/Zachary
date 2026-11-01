@@ -16,6 +16,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from zachary.brain.timeparse import parse_time
 from zachary.core.config import Config, ExcludeKind, default_db_path
@@ -203,6 +204,139 @@ def cmd_related(args: argparse.Namespace) -> int:
     return 0 if rels else 1
 
 
+def cmd_voice(args: argparse.Namespace) -> int:
+    """Voice tools. Calls that use the paid Gnani API say so and are logged in the ledger."""
+    from zachary.voice.audio import resample, seconds, wav_to_pcm
+    from zachary.voice.factory import build_voice
+    from zachary.voice.types import VoiceError
+
+    conn, cfg = _open(args)
+    data_dir = Path(args.db or default_db_path()).parent
+    kit = build_voice(cfg, data_dir)
+    if args.action == "usage":
+        summary = kit.ledger.summary()
+        if not summary:
+            print(f"no Gnani calls recorded ({kit.ledger.path})")
+            return 0
+        print(f"Gnani calls ({kit.ledger.path}):")
+        for ep, d in sorted(summary.items()):
+            extra = f"{d['audio_s']:.1f}s audio" if d["audio_s"] else f"{int(d['chars'])} chars"
+            print(f"  {ep:<11} {int(d['calls']):>4} calls  {extra:>14}  {int(d['errors'])} failed")
+        return 0
+    if args.action == "setup":
+        print(f"Gnani key: {'found' if kit.has_key else 'missing (set GNANI_API_KEY or .env)'}")
+        t = time.perf_counter()
+        kit.offline_stt.transcribe(b"\0\0" * 16000)  # downloads the model once
+        print(f"local speech model ready ({time.perf_counter() - t:.1f}s)")
+        try:
+            import sounddevice as sd
+
+            print(f"microphone: {sd.query_devices(kind='input')['name']}")
+        except Exception as e:
+            print(f"microphone: unavailable ({e})")
+        return 0
+    if args.action == "transcribe":
+        pcm, sr = wav_to_pcm(Path(args.text).read_bytes())
+        pcm = resample(pcm, sr)
+        stt = kit.offline_stt if args.offline or kit.rest_stt is None else kit.rest_stt
+        if stt is not kit.offline_stt:
+            print(f"(uses 1 Gnani STT call, {seconds(pcm):.1f}s of audio)")
+        try:
+            tr = stt.transcribe(pcm)
+        except VoiceError as e:
+            print(f"error ({e.kind}): {e}")
+            return 1
+        print(f"[{tr.provider}, {tr.latency_ms:.0f} ms] {tr.text}")
+        return 0
+    if args.action == "say":
+        if kit.tts is None:
+            print("no Gnani key: nothing to speak with")
+            return 1
+        from zachary.voice.audio import Player
+
+        print("(uses 1 Gnani TTS call)")
+        player = Player()
+        t0 = time.perf_counter()
+        first = None
+        try:
+            for chunk in kit.tts.stream(args.text):
+                first = first or time.perf_counter()
+                player.play(chunk.pcm, chunk.sample_rate)
+        except VoiceError as e:
+            print(f"error ({e.kind}): {e}")
+            return 1
+        player.end()
+        player.wait()
+        if first:
+            print(f"first audio after {(first - t0) * 1e3:.0f} ms")
+        return 0
+    if args.action == "listen":
+        return _voice_listen(args, kit, conn, cfg)
+    return 1
+
+
+def _voice_listen(args: argparse.Namespace, kit: Any, conn: Any, cfg: Config) -> int:
+    """One spoken command: press Enter, speak, pause. Then search/open like the bar."""
+    import threading
+
+    from zachary.actions.safe_actions import SafeActions
+    from zachary.brain.handler import Handler
+    from zachary.search.semantic import local_semantic
+    from zachary.voice.pipeline import Heard, MicSource, VoiceListener
+
+    done = threading.Event()
+    result: list[Heard] = []
+
+    def got(h: Heard) -> None:
+        result.append(h)
+        done.set()
+
+    listener = VoiceListener(
+        MicSource(),
+        on_heard=got,
+        on_state=lambda st: print(f"  [{st}]") if st != "idle" else None,
+        rest_stt=None if args.offline else kit.rest_stt,
+        stream_stt=None if args.offline else kit.stream_stt,
+        offline_stt=kit.offline_stt,
+        spotter=kit.spotter,
+        wake_word=False,
+    )
+    listener.start()
+    input("Press Enter, then speak your command (it stops when you pause)… ")
+    listener.push_to_talk()
+    done.wait(30)
+    listener.stop()
+    if not result or not result[0].text:
+        print(f"nothing heard ({result[0].error if result and result[0].error else 'timeout'})")
+        return 1
+    h = result[0]
+    print(f"heard ({h.transcript.provider if h.transcript else '?'}): {h.text!r}")
+    handler = Handler(conn, SafeActions(conn, cfg.platform), cfg, lambda: local_semantic(conn, cfg))
+    reply = handler.submit(h.text)
+    h.timeline.mark("intent_search")
+    print(f"zach: {reply.say}")
+    for i, it in enumerate(reply.items[:5], 1):
+        print(f"  {i}. {it.name}  ({_short(os.path.dirname(it.path))})")
+    if kit.tts is not None and not args.no_speak and reply.say:
+        from zachary.voice.audio import Player
+
+        player = Player()
+        first = True
+        for chunk in kit.tts.stream(reply.say):
+            if first:
+                h.timeline.mark("tts_first_audio")
+                first = False
+            player.play(chunk.pcm, chunk.sample_rate)
+        player.end()
+        player.wait()
+        h.timeline.mark("tts_done")
+    rec = h.timeline.finish(str(Path(args.db or default_db_path()).parent / "latency.jsonl"))
+    stages = h.timeline.durations()
+    print("latency: " + "  ".join(f"{k} {v:.0f} ms" for k, v in stages.items()))
+    del rec
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     conn, cfg = _open(args)
     files, dirs = conn.execute("SELECT count(*), coalesce(sum(is_dir), 0) FROM files").fetchone()
@@ -353,6 +487,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("related", help="files related to a file")
     s.add_argument("path")
     s.set_defaults(fn=cmd_related)
+
+    s = sub.add_parser("voice", help="voice: usage | setup | transcribe WAV | say TEXT | listen")
+    s.add_argument("action", choices=["usage", "setup", "transcribe", "say", "listen"])
+    s.add_argument("text", nargs="?", default="", help="WAV path (transcribe) or text (say)")
+    s.add_argument("--offline", action="store_true", help="local speech recognition only")
+    s.add_argument("--no-speak", action="store_true", help="don't speak the reply (listen)")
+    s.set_defaults(fn=cmd_voice)
 
     s = sub.add_parser("status", help="index and indexer status")
     s.set_defaults(fn=cmd_status)

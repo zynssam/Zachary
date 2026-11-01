@@ -42,7 +42,14 @@ class PortalHotkey:
 
     name = "xdg-portal"
 
-    def __init__(self, hotkey: Hotkey, callback: HotkeyCallback, description: str) -> None:
+    def __init__(
+        self,
+        hotkey: Hotkey,
+        callback: HotkeyCallback,
+        description: str,
+        shortcut_id: str = SHORTCUT_ID,
+    ) -> None:
+        self.shortcut_id = shortcut_id
         self.hotkey = hotkey
         self.callback = callback
         self.description = description
@@ -118,7 +125,7 @@ class PortalHotkey:
             session = res["session_handle"][1]
             shortcuts = [
                 (
-                    SHORTCUT_ID,
+                    self.shortcut_id,
                     {
                         "description": ("s", self.description),
                         "preferred_trigger": ("s", self.hotkey.portal_trigger()),
@@ -129,7 +136,7 @@ class PortalHotkey:
                 conn, "BindShortcuts", "oa(sa{sv})sa{sv}", (session, shortcuts, "", {})
             )
             for sid, props in res.get("shortcuts", ("", []))[1]:
-                if sid == SHORTCUT_ID:
+                if sid == self.shortcut_id:
                     self.bound_trigger = props.get("trigger_description", ("s", ""))[1] or None
             log.info("portal shortcut bound: %s", self.bound_trigger or "(set in system settings)")
             self.ready.set()
@@ -143,7 +150,7 @@ class PortalHotkey:
                 while not self._stopping:
                     msg = conn.recv_until_filtered(queue)
                     _session, sid, _ts, opts = msg.body
-                    if sid == SHORTCUT_ID:
+                    if sid == self.shortcut_id:
                         token = opts.get("activation_token", ("s", None))[1]
                         self.callback(token or None)
         except Exception as e:  # report, never crash the app

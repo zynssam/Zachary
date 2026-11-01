@@ -1,0 +1,290 @@
+"""The voice listener: microphone -> wake word or push-to-talk -> command -> text.
+
+Runs on its own thread. Privacy: while waiting, audio stays on the machine (the
+local VAD and wake spotter only). Gnani receives audio only for a command, i.e.
+after "Hey Zach" or a push-to-talk press, and never more than one utterance.
+
+Which STT is used for a command:
+- it starts live (push-to-talk, or "Hey Zach" then a pause) and streaming is on:
+  Gnani streaming, so the text is ready right after you stop talking;
+- "Hey Zach, <command>" in one breath (audio already captured): Gnani REST;
+- Gnani fails (network down, credits used up, rate limited...): local whisper.cpp
+  on the same audio, and the reason is reported. Gnani calls are never retried.
+"""
+
+from __future__ import annotations
+
+import collections
+import logging
+import queue
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Protocol
+
+from zachary.telemetry.latency import Timeline
+from zachary.voice.audio import FRAME_BYTES, EnergyVAD, MicStream, seconds
+from zachary.voice.types import SAMPLE_RATE, STT, StreamingSTT, Transcript, VoiceError
+from zachary.voice.wakeword import SPOT_SECONDS, WakeSpotter
+
+log = logging.getLogger(__name__)
+
+PREROLL_S = 0.4  # audio kept from before speech starts, so the first word isn't clipped
+COMMAND_WAIT_S = 5.0  # after a bare "Hey Zach", how long to wait for the command
+MAX_COMMAND_S = 12.0
+MIN_COMMAND_S = 0.35
+
+
+@dataclass(slots=True)
+class Heard:
+    text: str
+    transcript: Transcript | None
+    timeline: Timeline
+    error: VoiceError | None = None
+    audio_s: float = 0.0
+    via: str = ""  # wake | ptt
+    extra: dict[str, object] = field(default_factory=dict)
+
+
+class FrameSource(Protocol):
+    """Anything that yields 1,024-byte frames (the mic, or a file in tests)."""
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def get(self, timeout: float) -> bytes | None: ...
+
+
+class MicSource:
+    def __init__(self, mic: MicStream | None = None) -> None:
+        self.mic = mic or MicStream()
+
+    def start(self) -> None:
+        self.mic.start()
+
+    def stop(self) -> None:
+        self.mic.stop()
+
+    def get(self, timeout: float) -> bytes | None:
+        try:
+            return self.mic.frames.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+class VoiceListener(threading.Thread):
+    def __init__(
+        self,
+        source: FrameSource,
+        *,
+        on_heard: Callable[[Heard], None],
+        on_state: Callable[[str], None] = lambda _s: None,
+        rest_stt: STT | None,
+        stream_stt: Callable[[], StreamingSTT] | None,
+        offline_stt: STT | None,
+        spotter: WakeSpotter | None,
+        wake_word: bool = True,
+        vad: EnergyVAD | None = None,
+    ) -> None:
+        super().__init__(name="zach-voice", daemon=True)
+        self.source = source
+        self.on_heard = on_heard
+        self.on_state = on_state
+        self.rest_stt = rest_stt
+        self.stream_stt = stream_stt
+        self.offline_stt = offline_stt
+        self.spotter = spotter
+        self.wake_word = wake_word and spotter is not None
+        self.vad = vad or EnergyVAD()
+        self._stop_ev = threading.Event()
+        self._ptt = threading.Event()
+
+    # -- control (any thread) -------------------------------------------------------
+    def stop(self) -> None:
+        self._stop_ev.set()
+
+    def push_to_talk(self) -> None:
+        """Start a command now (no wake word needed)."""
+        self._ptt.set()
+
+    # -- thread ------------------------------------------------------------------------
+    def run(self) -> None:
+        try:
+            self.source.start()
+        except Exception as e:
+            self.on_state(f"error: microphone unavailable ({e})")
+            return
+        try:
+            self._loop()
+        finally:
+            self.source.stop()
+
+    def _frame(self, timeout: float = 0.1) -> bytes | None:
+        return self.source.get(timeout)
+
+    def _loop(self) -> None:
+        preroll: collections.deque[bytes] = collections.deque(
+            maxlen=max(1, int(PREROLL_S * SAMPLE_RATE * 2 / FRAME_BYTES))
+        )
+        self.on_state("idle")
+        while not self._stop_ev.is_set():
+            if self._ptt.is_set():
+                self._ptt.clear()
+                self._command(Timeline("voice"), via="ptt", buffered=b"", live=True)
+                preroll.clear()
+                self.vad.reset()
+                continue
+            frame = self._frame()
+            if frame is None:
+                continue
+            ev = self.vad.push(frame)
+            if not self.wake_word:
+                preroll.append(frame)
+                continue
+            if ev is not None and ev.kind == "start":
+                self._utterance(b"".join(preroll) + frame)
+                preroll.clear()
+                self.vad.reset()
+            else:
+                preroll.append(frame)
+
+    def _utterance(self, head: bytes) -> None:
+        """Speech started: collect ~1.6 s, check locally for "Hey Zach"."""
+        assert self.spotter is not None
+        tl = Timeline("voice")
+        buf = bytearray(head)
+        need = int(SPOT_SECONDS * SAMPLE_RATE * 2)
+        ended = False
+        while len(buf) < need and not self._stop_ev.is_set():
+            f = self._frame(0.5)
+            if f is None:
+                continue
+            buf += f
+            ev = self.vad.push(f)
+            if ev is not None and ev.kind == "end":
+                ended = True
+                break
+        wake = self.spotter.check(bytes(buf))
+        if not wake.found:
+            if not ended:
+                self._skip_until_silence()  # someone talking, not to us
+            return
+        tl.mark("wake")
+        tl.info["wake_heard"] = wake.heard
+        rest = bytes(buf[int(wake.cut_s * SAMPLE_RATE) * 2 :])
+        if ended and seconds(rest) < MIN_COMMAND_S:
+            # Just "Hey Zach": listen for the command as a fresh utterance.
+            self._command(tl, via="wake", buffered=b"", live=True)
+        else:
+            self._command(tl, via="wake", buffered=rest, live=False, already_ended=ended)
+
+    def _skip_until_silence(self) -> None:
+        deadline = time.monotonic() + 30
+        while not self._stop_ev.is_set() and time.monotonic() < deadline:
+            f = self._frame(0.5)
+            if f is None:
+                continue
+            ev = self.vad.push(f)
+            if ev is not None and ev.kind == "end":
+                return
+
+    def _command(
+        self,
+        tl: Timeline,
+        *,
+        via: str,
+        buffered: bytes,
+        live: bool,
+        already_ended: bool = False,
+    ) -> None:
+        self.on_state("listening")
+        audio = bytearray(buffered)
+        stream: StreamingSTT | None = None
+        stream_error: VoiceError | None = None
+        if live and self.stream_stt is not None:
+            try:
+                stream = self.stream_stt()
+                stream.open()
+            except VoiceError as e:
+                stream, stream_error = None, e
+        self.vad.reset()
+        started = bool(buffered)
+        start_deadline = time.monotonic() + COMMAND_WAIT_S
+        max_bytes = int(MAX_COMMAND_S * SAMPLE_RATE * 2)
+        ended = already_ended
+        while not ended and not self._stop_ev.is_set():
+            if self._ptt.is_set():  # pressed again: stop listening now
+                self._ptt.clear()
+                break
+            f = self._frame(0.2)
+            if f is None:
+                if not started and time.monotonic() > start_deadline:
+                    break
+                continue
+            ev = self.vad.push(f)
+            if ev is not None and ev.kind == "start":
+                started = True
+            if not started and not self.vad.in_speech:
+                if time.monotonic() > start_deadline:
+                    break
+                continue
+            audio += f
+            if stream is not None:
+                try:
+                    stream.feed(f)
+                except Exception as e:
+                    stream_error = VoiceError("network", f"stream broke: {type(e).__name__}")
+                    stream.abort()
+                    stream = None
+            if ev is not None and ev.kind == "end":
+                ended = True
+            if len(audio) >= max_bytes:
+                break
+        tl.mark("speech_end")
+        pcm = bytes(audio)
+        self.on_state("thinking")
+        heard = self._transcribe(pcm, stream, stream_error, tl)
+        heard.via = via
+        heard.audio_s = round(seconds(pcm), 2)
+        self.on_heard(heard)
+        self.vad.reset()
+        self.on_state("idle")
+
+    def _transcribe(
+        self,
+        pcm: bytes,
+        stream: StreamingSTT | None,
+        stream_error: VoiceError | None,
+        tl: Timeline,
+    ) -> Heard:
+        if seconds(pcm) < MIN_COMMAND_S:
+            if stream is not None:
+                stream.abort()
+            tl.mark("stt")
+            return Heard("", None, tl, VoiceError("bad_request", "I didn't hear a command"))
+        err: VoiceError | None = stream_error
+        if stream is not None:
+            try:
+                t = stream.finish()
+                tl.mark("stt")
+                return Heard(t.text, t, tl)
+            except VoiceError as e:
+                err = e
+        if self.rest_stt is not None and (err is None or err.offline):
+            try:
+                t = self.rest_stt.transcribe(pcm)
+                tl.mark("stt")
+                return Heard(t.text, t, tl)
+            except VoiceError as e:
+                err = e
+        # Any online failure (network, credits used up, rate limit...) -> local whisper:
+        # free, private, and the user still gets an answer (the reason is reported).
+        if self.offline_stt is not None:
+            t = self.offline_stt.transcribe(pcm)
+            tl.mark("stt")
+            t.extra["fallback_reason"] = err.kind if err else "no online STT"
+            return Heard(t.text, t, tl, extra={"offline": True})
+        tl.mark("stt")
+        return Heard("", None, tl, err or VoiceError("config", "no speech recognizer"))

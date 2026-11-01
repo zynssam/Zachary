@@ -498,7 +498,11 @@ class WindowsPlatform:
         """Nothing needed for hotkeys on Windows (Start-menu entry comes with packaging)."""
 
     def global_hotkey(
-        self, hotkey: Hotkey, callback: HotkeyCallback, description: str
+        self,
+        hotkey: Hotkey,
+        callback: HotkeyCallback,
+        description: str,
+        shortcut_id: str = "toggle",
     ) -> HotkeyBackend:
         return WindowsHotkey(hotkey, callback)
 

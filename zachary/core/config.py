@@ -144,6 +144,18 @@ class Settings:
     # Semantic memory (Phase 3). The model is downloaded once into the data dir.
     embed_model: str = "minishlab/potion-base-8M"
     embed_on_battery: bool = False
+    # Voice (Phase 4). Off until enabled: the microphone is only opened when on.
+    voice_enabled: bool = False
+    wake_word: bool = True  # local "Hey Zach" spotting while voice is enabled
+    voice_hotkey: str = "super+alt+space"  # push-to-talk (press, speak, pause)
+    stt_language: str = "en-IN"  # Gnani: en-IN also handles English+Hindi mixing
+    stt_model: str = "prisma-v3.0"
+    stt_streaming: bool = True
+    tts_voice: str = "Shivani"
+    tts_model: str = "timbre-v3.0"
+    tts_language: str = "en-IN"
+    speak_replies: bool = True
+    offline_stt_model: str = "tiny"
 
 
 _SETTING_KEYS: tuple[str, ...] = tuple(Settings.__dataclass_fields__)

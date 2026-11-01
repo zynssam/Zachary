@@ -50,6 +50,9 @@ VEC_K = 30  # nearest neighbours taken from the vector index
 # fraction of the best match for this query.
 VEC_MIN_SIM = 0.15
 VEC_REL_SIM = 0.25
+# Meaning alone is strong enough to act on (open without asking) from this cosine.
+# Measured on a real 9.5k-file index: right answers 0.44-0.61, wrong picks 0.18-0.27.
+STRONG_SIM = 0.40
 VEC_WEIGHT = 0.9
 RANGE_KW_ENOUGH = 50  # in-range keyword matches after which looser tiers are skipped
 RANGE_LIMIT = 1000
@@ -87,6 +90,9 @@ class SearchResult:
     score: float
     why: list[str] = field(default_factory=list)
     versions: list[int] = field(default_factory=list)  # older versions (file ids), newest first
+    # A keyword/name hit, an exact name, or a close meaning: safe to act on without
+    # asking. Time or recency alone never is.
+    strong: bool = False
 
     @property
     def last_seen(self) -> float:
@@ -523,6 +529,12 @@ def search(
     results = _collapse_versions(conn, ranked, rows, limit)
     # Explanations only for what is shown.
     for r in results:
+        r.strong = (
+            not terms  # "what I opened yesterday": time/kind is the whole question
+            or r.file_id in kw
+            or r.file_id in exact
+            or vec.get(r.file_id, 0.0) >= STRONG_SIM
+        )
         if r.file_id in exact:
             r.why.append("exact name")
         in_r = range_matched and r.file_id in in_range

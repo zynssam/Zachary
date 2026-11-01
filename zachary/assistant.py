@@ -130,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-hotkey", action="store_true")
     ap.add_argument("--no-indexer", action="store_true", help="don't start the indexer")
     ap.add_argument("--show", action="store_true", help="show the quick bar at start")
+    ap.add_argument("--no-voice", action="store_true", help="don't open the microphone")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     args = ap.parse_args(argv)
     logging.basicConfig(
@@ -207,12 +208,50 @@ def main(argv: list[str] | None = None) -> int:
 
         QTimer.singleShot(4000, check_hotkey)
 
+    voice = None
+    voice_backend = None
+    if settings.voice_enabled and not args.no_voice:
+        from zachary.ui.voice import VoiceController
+        from zachary.voice.factory import build_voice
+
+        data_dir = db_path.parent
+        kit = build_voice(Config(open_db(db_path), platform), data_dir)
+        if not kit.has_key:
+            log.warning("GNANI_API_KEY not set: voice uses local speech recognition only")
+        voice = VoiceController(
+            engine,
+            bar,
+            kit,
+            speak=settings.speak_replies,
+            wake_word=settings.wake_word,
+            latency_path=data_dir / "latency.jsonl",
+        )
+        voice.start()
+        bar.talk.connect(voice.push_to_talk)
+        vbridge = _HotkeyBridge()
+        vbridge.pressed.connect(lambda _tok, _t0: voice.push_to_talk())
+        if not args.no_hotkey:
+            try:
+                voice_backend = platform.global_hotkey(
+                    parse_hotkey(settings.voice_hotkey),
+                    lambda tok: vbridge.pressed.emit(tok, time.perf_counter()),
+                    "Talk to Zachary",
+                    "voice",
+                )
+                voice_backend.start()
+            except HotkeyError as e:
+                log.error("bad voice hotkey setting: %s", e)
+
     if args.show or args.toggle:
         QTimer.singleShot(0, bar.show_bar)
     # Warm the engine's DB connection and the cached list so the first open is fast.
     QTimer.singleShot(0, lambda: engine.ask("preview", ""))
 
     code = app.exec()
+    if voice is not None:
+        voice.stop()
+    if voice_backend is not None:
+        voice_backend.stop()
     if backend is not None:
         backend.stop()
     engine.stop()

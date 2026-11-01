@@ -6,7 +6,8 @@ on screen" doesn't wait for a query. All queries go to the Engine thread.
 
 Keys: type to search; Enter = do what the text says (open / follow-up) or open
 the row you moved to with the arrows; Ctrl+Enter = show in folder; Ctrl+R =
-related files; Ctrl+1..9 = open that row; Up/Down = move; Esc = hide.
+related files; Ctrl+M = talk (voice); Ctrl+1..9 = open that row; Up/Down = move;
+Esc = hide.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ MAX_ROWS = 8
 
 class QuickBar(QWidget):
     opened = Signal(float)  # ms from hotkey to first results painted
+    talk = Signal()  # Ctrl+M: push-to-talk
     reply_applied = Signal(object)
 
     def __init__(self, engine: Engine) -> None:
@@ -158,6 +160,9 @@ class QuickBar(QWidget):
             else:
                 self._debounce.stop()
                 self.engine.ask("submit", self.edit.text())
+            return True
+        if ctrl and key == Qt.Key.Key_M:
+            self.talk.emit()
             return True
         if ctrl and key == Qt.Key.Key_R:
             row = self.list.selected_row()
