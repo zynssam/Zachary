@@ -160,7 +160,11 @@ class SemanticIndexer:
     def _name_only(self, job: _Job, name_only_dirs: tuple[str, ...]) -> bool:
         if not extractable(job.ext, job.kind):
             return True
-        return any(is_under(job.path, d) for d in name_only_dirs)
+        if not name_only_dirs:
+            return False
+        # Rule paths are stored case-folded on Windows; compare like with like.
+        p = self.config.normalize(job.path)
+        return any(is_under(p, d) for d in name_only_dirs)
 
     def _name_only_dirs(self) -> tuple[str, ...]:
         """Folders with the ``name_only`` rule (loaded once per batch, not per file)."""
