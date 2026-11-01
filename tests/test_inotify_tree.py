@@ -74,7 +74,7 @@ def test_events_new_folders_and_renames(tree_and_events) -> None:  # type: ignor
 
 
 def test_folder_moved_out_drops_watches(tree_and_events, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
-    t, events, home = tree_and_events
+    t, _events, home = tree_and_events
     (home / "out" / "sub").mkdir(parents=True)
     t.add_tree(str(home))
     t.start()
