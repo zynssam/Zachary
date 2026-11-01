@@ -89,7 +89,7 @@ _U64 = (1 << 64) - 1
 
 
 def inode_key(v: int | None) -> int | None:
-    """Fold an inode / file id into SQLite's signed 64-bit INTEGER.
+    """Fold an inode / file id / device id into SQLite's signed 64-bit INTEGER.
 
     Windows ``st_ino`` can be a 128-bit file id (Python >= 3.12), and NTFS file
     reference numbers use the top bits for a sequence number, so values >= 2**63
@@ -121,7 +121,7 @@ def entry_from_stat(
         mtime=st.st_mtime,
         ctime=st.st_ctime,
         inode=inode_key(inode if inode is not None else st.st_ino),
-        dev=dev if dev is not None else (st.st_dev or None),
+        dev=inode_key(dev if dev is not None else st.st_dev),  # 64-bit volume serial on Win
     )
 
 

@@ -42,7 +42,7 @@ class CatchupStats:
 def journal_dirty_paths(store: FileStore, root: str, records: list[JournalRecord]) -> set[str]:
     """Map journal records (file ids + names) to paths that need re-checking."""
     try:
-        dev: int | None = os.stat(root).st_dev or None
+        dev: int | None = inode_key(os.stat(root).st_dev)
     except OSError:
         return set()
     by_inode: dict[int, list[str]] = {}
