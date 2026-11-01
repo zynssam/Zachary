@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable, Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from zachary.core.platform import RecentItem, WatchLimit
 
@@ -49,7 +49,7 @@ def _unescape_mount(field: str) -> str:
 
 def parse_mounts(text: str, home: Path) -> list[Path]:
     """Mount points (from /proc/self/mounts text) that should be indexed as roots."""
-    home_s = str(home)
+    home_s = home.as_posix()  # POSIX semantics on any OS (tests run on Windows too)
     out: list[Path] = []
     seen: set[str] = set()
     for line in text.splitlines():
@@ -77,10 +77,11 @@ def parse_user_dirs(text: str, home: Path, keys: Iterable[str] = _USER_DIR_KEYS)
         m = _USER_DIR_RE.match(line)
         if not m or m.group(1) not in wanted:
             continue
-        value = m.group(2).replace("$HOME", str(home))
-        p = Path(value)
-        if p.is_absolute() and p != home:  # XDG uses $HOME itself to mean "disabled"
-            found[m.group(1)] = p
+        value = m.group(2).replace("$HOME", home.as_posix())
+        p = PurePosixPath(value)
+        # XDG uses $HOME itself to mean "disabled".
+        if p.is_absolute() and p != PurePosixPath(home.as_posix()):
+            found[m.group(1)] = Path(p)
     return [found[k] for k in keys if k in found]
 
 
