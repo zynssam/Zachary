@@ -1,7 +1,7 @@
 # Running and testing Zachary
 
 How to set up, run every part (indexer, CLI, quick bar), run all automated
-checks and benchmarks, and test everything by hand. Covers Phases 0–2.
+checks and benchmarks, and test everything by hand. Covers Phases 0–3.
 
 All commands run from the repo root: `~/Documents/PROJECTS/Zachary`.
 Windows equivalents are shown where they differ.
@@ -71,6 +71,9 @@ python -m zachary.cli exclude add ~/Private   # exclude a folder (or a glob like
 python -m zachary.cli exclude remove build    # disable a default rule
 python -m zachary.cli forget ~/Private/diary.txt   # hide now; indexer purges all derived data
 python -m zachary.cli pause                   # pause indexing (resume with: resume)
+python -m zachary.cli embed                   # index file *contents* now (downloads the model once)
+python -m zachary.cli search notes on data structures   # finds by meaning once embedded
+python -m zachary.cli related ~/Documents/notes.pdf     # files related to a file
 python -m zachary.cli set                     # show settings
 python -m zachary.cli set index_hidden_folders true   # also index hidden folders
 python -m zachary.cli set quickbar_hotkey ctrl+alt+space   # default is super+space
@@ -115,8 +118,9 @@ On Windows, Win+Space is reserved by the OS; use e.g. `--hotkey ctrl+alt+space` 
 | Enter | do what you typed ("open fee receipt", "open the second one"); after ↑/↓, opens the highlighted row |
 | ↑ / ↓ | move the highlight |
 | Ctrl+Enter | show the highlighted item in its folder |
+| Ctrl+R | files related to the highlighted item |
 | Ctrl+1 … Ctrl+9 | open result N |
-| click | open (projects open their folder); right-click: Open / Show in folder / Copy path |
+| click | open (projects open their folder); right-click: Open / Show in folder / Related files / Copy path |
 | Esc | hide |
 
 ---
@@ -129,9 +133,15 @@ ruff check .
 ruff format --check .
 mypy zachary tests
 mypy --platform win32 zachary tests        # type-check the Windows code from Linux
-pytest                                     # ~280 tests, ~15 s
+pytest                                     # ~330 tests, ~20 s
 ```
-Expected: no lint/type issues; on Linux `271 passed, 6 skipped` (skips are Windows-only tests).
+Expected: no lint/type issues; on Linux about `320 passed, 7 skipped` (skips are Windows-only tests
+and the real-model test).
+
+Real-model test (downloads the 30 MB model once):
+```bash
+ZACHARY_TEST_MODEL=1 pytest tests/test_semantic_search.py
+```
 
 Useful variants:
 ```bash
@@ -152,6 +162,7 @@ QT_QPA_PLATFORM=wayland pytest tests/test_ui.py   # UI tests on the real display
 | `test_platform_parsers`, `test_os_live` | OS data parsers (xbel, .lnk, USN) and live OS calls |
 | `test_intents`, `test_context`, `test_handler` | Phase 2 brain: intents, follow-ups, confidence rule, safe actions |
 | `test_ui`, `test_hotkeys`, `test_assistant` | Phase 2 Qt UI, global hotkeys, single instance |
+| `test_extract`, `test_semantic`, `test_vectors`, `test_versions`, `test_relations`, `test_semantic_search`, `test_inotify_tree` | Phase 3: extraction, embeddings, vector index, versions, related files, meaning search, exclude-aware watcher |
 
 **CI:** every push runs the checks on Ubuntu + Windows, Python 3.11 + 3.12:
 ```bash
@@ -182,6 +193,14 @@ QT_QPA_PLATFORM=wayland python bench/bench_phase2.py --db ~/.cache/zachary-bench
 | First metadata index: minutes | `bench_phase1` → `[scan]` | 27.2 s / 200k files |
 | Quick bar open → results < 150 ms | `bench_phase2` → `[open]` | p95 23.3 ms (Wayland) |
 | UI never blocks | `bench_phase2` → `[ui]` | longest stall 26–65 ms |
+| Search with meaning < 50 ms p95 | `bench_phase3` → B `[search]` | p95 28–36 ms (assistant, in-memory index) |
+| "Related files" < 10 ms | `bench_phase3` → `[related]` | p95 0.5 ms |
+
+```bash
+# 5. Phase 3: content corpus + semantic memory on 200k (~15 min)
+python bench/make_corpus.py ~/.cache/zachary-bench/corpus --files 2000
+python bench/bench_phase3.py --corpus ~/.cache/zachary-bench/corpus --big-db ~/.cache/zachary-bench/bench.db
+```
 
 Clean up afterwards: `rm -rf ~/.cache/zachary-bench`.
 
@@ -221,6 +240,18 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 | 11 | run `python -m zachary.assistant --toggle` in a terminal | the running bar toggles; no second app starts |
 | 12 | Hinglish/typos in the bar: `mere projects dikhao`, `doosra wala kholo`, `opne fees` | same as English |
 
+### Phase 3: semantic memory
+| # | Do | Expect |
+|---|---|---|
+| 1 | `python -m zachary.cli embed` (or let the indexer do it in the background) | "embedded N files … with text", vector index, related links |
+| 2 | `python -m zachary.cli status` | `semantic: N/M files embedded, … passages` |
+| 3 | `python -m zachary.cli search "notes about <a topic you study>"` | files about that topic even when the name doesn't say so; `about: "…passage…"` lines |
+| 4 | `python -m zachary.cli search <a word only inside a document>` | that document (content keywords) |
+| 5 | `python -m zachary.cli related <path to a notes file>` | similar notes / same folder / opened together, in ~1 ms |
+| 6 | Save a document again without changing it, wait, `status` | it is not re-embedded (no new passages) |
+| 7 | In the bar: search, highlight a result, **Ctrl+R** | related files list; then "open the first one" |
+| 8 | Have `report.docx`, `report_final.docx`, `report_final_v2.docx`; search `report` | one entry "latest of 3 versions"; "the older one" opens the previous version |
+
 ---
 
 ## 7. Troubleshooting
@@ -235,4 +266,6 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 | Search shows nothing | `python -m zachary.cli status`: is anything indexed? run `cli scan`; check `cli roots` and `cli exclude` |
 | A folder is missing | hidden folders and app data are skipped by default (`cli set index_hidden_folders true` to include) |
 | Indexer won't start ("already running") | another indexer holds the lock: `pkill -f zachary.indexer` |
+| Meaning search not working | `cli status` shows "semantic: 0/…" or an error: the model downloads on first `cli embed` / indexer run (needs internet once); check `semantic.error` in status |
+| Other apps complain about file watching (Linux) | an old indexer (before Phase 3) watched excluded folders too: `pkill -f zachary.indexer` and restart the assistant |
 | Start completely fresh | stop everything, then delete the DB (`rm ~/.local/share/zachary/zachary.db*`) and run `cli scan` |
