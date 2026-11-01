@@ -7,7 +7,7 @@ Everything outside ``zachary.core.platform`` talks to the OS through the
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -50,6 +50,22 @@ class JournalRecord:
     parent_frn: int
     name: str
     reason: int
+
+
+class TreeWatcher(Protocol):
+    """An exclude-aware recursive file-system watcher (see linux_inotify.py)."""
+
+    name: str
+    limit_hit: bool
+
+    @property
+    def watch_count(self) -> int: ...
+
+    def add_tree(self, top: str, *, report_existing: bool = False) -> list[str]: ...
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
 
 
 class Platform(Protocol):
@@ -110,6 +126,23 @@ class Platform(Protocol):
         """How to bind the hotkey manually if the automatic way fails."""
         ...
 
+    def tree_watcher(
+        self,
+        is_excluded: Callable[[str, bool], bool],
+        on_paths: Callable[[list[str]], None],
+        on_overflow: Callable[[], None],
+    ) -> TreeWatcher | None:
+        """A native watcher that skips excluded folders, or None to use watchdog."""
+        ...
+
+    def on_battery(self) -> bool:
+        """Running on battery power (heavy background work waits for AC)."""
+        ...
+
+    def system_busy(self) -> bool:
+        """The machine is busy right now (background work waits)."""
+        ...
+
     def journal_cursor(self, root: Path) -> JournalCursor | None:
         """Current change-journal position for the volume holding ``root``.
 
@@ -141,6 +174,7 @@ __all__ = [
     "JournalRecord",
     "Platform",
     "RecentItem",
+    "TreeWatcher",
     "WatchLimit",
     "get_platform",
 ]

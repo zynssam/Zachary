@@ -23,10 +23,16 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from zachary.brain.timeparse import TimeRange, parse_time
 from zachary.core.config import PathRules
+from zachary.search.explain import ago, best_passage, name_hits, why_terms
 from zachary.search.tokens import words
+from zachary.search.vectors import SemanticSearch
+
+if TYPE_CHECKING:
+    from zachary.indexer.embedder import FloatArray
 
 RRF_K = 60
 KW_WEIGHT = 1.0
@@ -37,6 +43,9 @@ EXACT_NAME_BONUS = 0.02
 TIER_BONUS = (0.01, 0.006, 0.002, 0.0)
 IN_RANGE_BONUS = 0.05
 FTS_LIMIT = 200
+VEC_K = 100  # nearest neighbours taken from the vector index
+VEC_MIN_SIM = 0.3  # below this, a meaning match is noise (Model2Vec cosine)
+VEC_WEIGHT = 0.9
 RANGE_KW_ENOUGH = 50  # in-range keyword matches after which looser tiers are skipped
 RANGE_LIMIT = 2000
 # bm25 column weights: name, path_tokens, title, keywords
@@ -71,6 +80,7 @@ class SearchResult:
     last_access: float | None
     score: float
     why: list[str] = field(default_factory=list)
+    versions: list[int] = field(default_factory=list)  # older versions (file ids), newest first
 
     @property
     def last_seen(self) -> float:
@@ -334,44 +344,44 @@ def _load(conn: sqlite3.Connection, ids: list[int]) -> dict[int, SearchResult]:
     return out
 
 
-def _ago(ts: float, now: float) -> str:
-    d = max(0.0, now - ts)
-    if d < 90:
-        return "just now"
-    if d < 3600:
-        return f"{int(d // 60)} min ago"
-    if d < 86400:
-        return f"{int(d // 3600)} h ago"
-    days = int(d // 86400)
-    return "yesterday" if days == 1 else f"{days} days ago"
+def _collapse_versions(
+    conn: sqlite3.Connection,
+    ranked: list[SearchResult],
+    rows: dict[int, SearchResult],
+    limit: int,
+) -> list[SearchResult]:
+    """Show one entry per version group: its latest version, carrying the best score."""
+    from zachary.indexer.versions import versions_of
 
-
-def _term_in(term: str, ws: list[str]) -> bool:
-    """Loose word match on a shared stem ("fee"/"fees", "linked"/"link"), mirroring the
-    stemmed FTS match closely enough for ranking and explanations."""
-    for w in ws:
-        k = min(4, len(w), len(term))
-        if k >= 2 and w[:k] == term[:k]:
-            return True
-    return False
-
-
-def _name_hits(name: str, terms: list[str]) -> int:
-    ws = words(name)
-    return sum(1 for t in terms if _term_in(t, ws))
-
-
-def _why_terms(r: SearchResult, terms: list[str]) -> list[str]:
-    name_words = words(r.name)
-    path_words = words(r.path[: -len(r.name)] if r.path.endswith(r.name) else r.path)
-    in_name = [t for t in terms if _term_in(t, name_words)]
-    in_path = [t for t in terms if t not in in_name and _term_in(t, path_words)]
-    why = []
-    if in_name:
-        why.append("name: " + ", ".join(in_name))
-    if in_path:
-        why.append("folder: " + ", ".join(in_path))
-    return why
+    head = ranked[: limit * 3]
+    groups = versions_of(conn, [r.file_id for r in head])
+    if not groups:
+        return ranked[:limit]
+    need = [m[0] for m in groups.values() if m[0] not in rows]
+    extra = _load(conn, need) if need else {}
+    out: list[SearchResult] = []
+    seen: set[int] = set()
+    for r in ranked:
+        members = groups.get(r.file_id)
+        if members:
+            latest_id = members[0]
+            if latest_id in seen:
+                continue
+            seen.add(latest_id)
+            latest = rows.get(latest_id) or extra.get(latest_id)
+            if latest is None:
+                latest = r
+            latest.score = max(latest.score, r.score)
+            latest.versions = [m for m in members if m != latest.file_id]
+            r = latest
+        elif r.file_id in seen:
+            continue
+        else:
+            seen.add(r.file_id)
+        out.append(r)
+        if len(out) == limit:
+            break
+    return out
 
 
 def search(
@@ -382,8 +392,14 @@ def search(
     now: datetime | None = None,
     include_dirs: bool = True,
     rules: PathRules | None = None,
+    semantic: SemanticSearch | None = None,
 ) -> SearchResponse:
-    """Search the index. ``rules`` hides rows newly excluded but not yet purged."""
+    """Search the index.
+
+    ``rules`` hides rows newly excluded but not yet purged. ``semantic`` (an
+    embedder + vector index) adds matches by meaning; without it search is
+    keyword + recency only.
+    """
     t0 = time.perf_counter()
     now_dt = now or datetime.now().astimezone()
     now_ts = now_dt.timestamp()
@@ -416,8 +432,22 @@ def search(
         if corrected:
             terms = [corrected.get(t, t) for t in terms]
             kw = lookup(terms)
+    # Meaning: nearest file vectors to the query words (inside the time range, if any).
+    vec: dict[int, float] = {}
+    qvec: FloatArray | None = None
+    if semantic is not None and terms:
+        qvec = semantic.embedder.encode([" ".join(terms)])[0]
+        if tr is not None and allowed:
+            hits = semantic.index.score_ids(qvec, allowed, min_sim=VEC_MIN_SIM)
+        else:
+            hits = semantic.index.search(qvec, VEC_K, min_sim=VEC_MIN_SIM)
+        vec = dict(hits[:VEC_K])
+        if tr is not None and vec and not restricted:
+            # Nothing in range by keyword, but something in range by meaning.
+            kw = {k: v for k, v in kw.items() if k in allowed}
+            restricted, range_matched = True, True
     if terms:
-        candidates = list(kw)
+        candidates = list(kw) + [i for i in vec if i not in kw]
     elif kinds and in_range:  # "photos last month": time + kind only
         kind_of = _kinds_of(conn, list(in_range))
         candidates = [i for i in in_range if kind_of.get(i) in kinds] or list(in_range)
@@ -434,16 +464,16 @@ def search(
         # Unranked matches inside the range: tier, then how many terms hit the *name*
         # (not just a folder), then most recent first.
         order = sorted(
-            rows,
+            (i for i in rows if i in kw),
             key=lambda i: (
                 kw[i],
-                -_name_hits(rows[i].name, terms),
+                -name_hits(rows[i].name, terms),
                 -_kind_score(rows[i], kinds),
                 -rows[i].last_seen,
             ),
         )
     else:
-        order = [i for i in candidates if i in rows]
+        order = [i for i in candidates if i in rows and i in kw]
     if terms and not restricted:
         # Dense rank by (tier, bm25): files that match equally well share a rank, so
         # recency decides between them instead of row-id order (which depends on the
@@ -458,6 +488,7 @@ def search(
     minutes = sorted({int(r.last_seen // 60) for r in rows.values()}, reverse=True)
     dense = {m: i for i, m in enumerate(minutes)}
     rec_rank = {r.file_id: dense[int(r.last_seen // 60)] for r in rows.values()}
+    vec_rank = {fid: n for n, fid in enumerate(sorted(vec, key=lambda f: -vec[f]))}
     phrase = " ".join(terms)
     exact: set[int] = set()
     for r in rows.values():
@@ -472,10 +503,14 @@ def search(
         if range_matched and r.file_id in in_range:
             # A file the user opened in the range is a stronger signal than an mtime.
             s += IN_RANGE_BONUS if in_range[r.file_id] == "opened" else IN_RANGE_BONUS / 2
+        if r.file_id in vec_rank:
+            strength = min(1.0, vec[r.file_id] / 0.5)  # scale by how close the meaning is
+            s += VEC_WEIGHT * strength / (RRF_K + vec_rank[r.file_id])
         s += _kind_score(r, kinds)
         r.score = s
 
-    results = sorted(rows.values(), key=lambda r: (-r.score, -r.last_seen))[:limit]
+    ranked = sorted(rows.values(), key=lambda r: (-r.score, -r.last_seen))
+    results = _collapse_versions(conn, ranked, rows, limit)
     # Explanations only for what is shown.
     for r in results:
         if r.file_id in exact:
@@ -484,12 +519,20 @@ def search(
         if in_r:
             assert tr is not None
             r.why.append(f"{in_range[r.file_id]} {tr.label}")
-        r.why.extend(_why_terms(r, terms))
+        r.why.extend(why_terms(r, terms))
+        if r.file_id in vec and qvec is not None:
+            p = best_passage(conn, r.file_id, qvec)
+            if p is not None and p[1] >= VEC_MIN_SIM:
+                r.why.append(f"about: “{p[0]}”")
+            elif not r.why or r.why == ["exact name"]:
+                r.why.append("similar meaning")
+        if r.versions:
+            r.why.append(f"latest of {len(r.versions) + 1} versions")
         if not in_r:
             if r.last_access and r.last_access >= r.mtime:
-                r.why.append(f"opened {_ago(r.last_access, now_ts)}")
+                r.why.append(f"opened {ago(r.last_access, now_ts)}")
             else:
-                r.why.append(f"modified {_ago(r.mtime, now_ts)}")
+                r.why.append(f"modified {ago(r.mtime, now_ts)}")
     return SearchResponse(
         query=query,
         terms=terms,

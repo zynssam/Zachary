@@ -16,13 +16,19 @@ import subprocess
 import sys
 import threading
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 
 from zachary.core.hotkeys import Hotkey, HotkeyBackend, HotkeyCallback
-from zachary.core.platform import JournalCursor, JournalRecord, RecentItem, WatchLimit
+from zachary.core.platform import (
+    JournalCursor,
+    JournalRecord,
+    RecentItem,
+    TreeWatcher,
+    WatchLimit,
+)
 
 log = logging.getLogger(__name__)
 
@@ -369,6 +375,50 @@ class LinuxPlatform:
             libc.syscall(nr, _IOPRIO_WHO_PROCESS, 0, prio)
         except (OSError, AttributeError):
             pass
+
+    def tree_watcher(
+        self,
+        is_excluded: Callable[[str, bool], bool],
+        on_paths: Callable[[list[str]], None],
+        on_overflow: Callable[[], None],
+    ) -> TreeWatcher | None:
+        from zachary.core.platform.linux_inotify import InotifyTree
+
+        try:
+            return InotifyTree(is_excluded, on_paths, on_overflow)
+        except OSError as e:  # e.g. too many inotify instances
+            log.warning("native inotify unavailable (%s); using watchdog", e)
+            return None
+
+    def on_battery(self) -> bool:
+        """True when a battery is discharging and no AC adapter is online."""
+        base = Path("/sys/class/power_supply")
+        try:
+            supplies = list(base.iterdir())
+        except OSError:
+            return False
+        ac_online = False
+        discharging = False
+        for d in supplies:
+            try:
+                kind = (d / "type").read_text().strip()
+                if kind == "Mains" and (d / "online").read_text().strip() == "1":
+                    ac_online = True
+                if kind == "Battery" and (d / "status").read_text().strip() == "Discharging":
+                    discharging = True
+            except OSError:
+                continue
+        return discharging and not ac_online
+
+    def system_busy(self) -> bool:
+        """1-minute load average above 70% of the CPUs."""
+        if sys.platform == "win32":  # keeps type-checking on Windows CI happy
+            return False
+        try:
+            load = float(os.getloadavg()[0])
+        except OSError:
+            return False
+        return bool(load > 0.7 * (os.cpu_count() or 1))
 
     def journal_cursor(self, root: Path) -> JournalCursor | None:
         return None  # no change journal: catch-up diffs mtimes by re-scanning

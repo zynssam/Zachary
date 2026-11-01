@@ -13,12 +13,18 @@ import struct
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 from zachary.core.hotkeys import Hotkey, HotkeyBackend, HotkeyCallback
-from zachary.core.platform import JournalCursor, JournalRecord, RecentItem, WatchLimit
+from zachary.core.platform import (
+    JournalCursor,
+    JournalRecord,
+    RecentItem,
+    TreeWatcher,
+    WatchLimit,
+)
 
 log = logging.getLogger(__name__)
 
@@ -512,6 +518,60 @@ class WindowsPlatform:
         process_mode_background_begin = 0x00100000
         k32 = ctypes.windll.kernel32
         k32.SetPriorityClass(k32.GetCurrentProcess(), process_mode_background_begin)
+
+    def tree_watcher(
+        self,
+        is_excluded: Callable[[str, bool], bool],
+        on_paths: Callable[[list[str]], None],
+        on_overflow: Callable[[], None],
+    ) -> TreeWatcher | None:
+        return None  # watchdog: ReadDirectoryChangesW is one handle per root
+
+    def on_battery(self) -> bool:
+        if sys.platform != "win32":
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        class SYSTEM_POWER_STATUS(ctypes.Structure):
+            _fields_ = [
+                ("ACLineStatus", wintypes.BYTE),
+                ("BatteryFlag", wintypes.BYTE),
+                ("BatteryLifePercent", wintypes.BYTE),
+                ("SystemStatusFlag", wintypes.BYTE),
+                ("BatteryLifeTime", wintypes.DWORD),
+                ("BatteryFullLifeTime", wintypes.DWORD),
+            ]
+
+        st = SYSTEM_POWER_STATUS()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st)):
+            return False
+        return bool(st.ACLineStatus == 0)  # 0 = offline (battery), 1 = AC, 255 = unknown
+
+    def system_busy(self) -> bool:
+        """CPU usage over a 200 ms sample above 70%."""
+        if sys.platform != "win32":
+            return False
+        import ctypes
+        import time
+        from ctypes import wintypes
+
+        def sample() -> tuple[int, int]:
+            idle, kernel, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+            ctypes.windll.kernel32.GetSystemTimes(
+                ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+            )
+
+            def v(ft: wintypes.FILETIME) -> int:
+                return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+            return v(idle), v(kernel) + v(user)  # kernel time includes idle time
+
+        i1, t1 = sample()
+        time.sleep(0.2)
+        i2, t2 = sample()
+        total = t2 - t1
+        return total > 0 and 1 - (i2 - i1) / total > 0.7
 
     def journal_cursor(self, root: Path) -> JournalCursor | None:
         return _usn_cursor(root)

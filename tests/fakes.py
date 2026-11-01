@@ -9,7 +9,13 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from zachary.core.hotkeys import Hotkey, HotkeyBackend, HotkeyCallback
-from zachary.core.platform import JournalCursor, JournalRecord, RecentItem, WatchLimit
+from zachary.core.platform import (
+    JournalCursor,
+    JournalRecord,
+    RecentItem,
+    TreeWatcher,
+    WatchLimit,
+)
 
 
 class FakeHotkey:
@@ -42,6 +48,9 @@ class FakePlatform:
         self.opened: list[Path] = []
         self.revealed: list[Path] = []
         self.spawned: list[list[str]] = []
+        self.native_watcher = True
+        self.battery = False
+        self.busy = False
 
     def data_dir(self) -> Path:
         return self.root / "data"
@@ -73,6 +82,25 @@ class FakePlatform:
         self, hotkey: Hotkey, callback: HotkeyCallback, description: str
     ) -> HotkeyBackend:
         return FakeHotkey(callback)
+
+    def tree_watcher(
+        self,
+        is_excluded: Callable[[str, bool], bool],
+        on_paths: Callable[[list[str]], None],
+        on_overflow: Callable[[], None],
+    ) -> TreeWatcher | None:
+        """Use the real native watcher where there is one (Linux), like production."""
+        if self.native_watcher and sys.platform.startswith("linux"):
+            from zachary.core.platform.linux_inotify import InotifyTree
+
+            return InotifyTree(is_excluded, on_paths, on_overflow)
+        return None
+
+    def on_battery(self) -> bool:
+        return self.battery
+
+    def system_busy(self) -> bool:
+        return self.busy
 
     def hotkey_hint(self, toggle_cmd: list[str]) -> str:
         return "bind " + " ".join(toggle_cmd)

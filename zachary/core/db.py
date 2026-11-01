@@ -218,7 +218,33 @@ CREATE TABLE state (
 ) WITHOUT ROWID;
 """
 
-MIGRATIONS: tuple[str, ...] = (_MIGRATION_1, _MIGRATION_2)
+# Migration #3 (Phase 3, semantic memory):
+# - files.title: document title from extraction (also indexed in files_fts.title).
+# - files.embed_path: the path the file vector was built with; a rename/move only
+#   refreshes the name/path part of the vector (content is not re-embedded).
+# - vec_ivf + ivf_centroids: an IVF (inverted file) index over the file vectors.
+#   sqlite-vec 0.1 only does brute-force kNN (measured 169 ms on 200k vectors); the
+#   IVF lets a query read only the nearest clusters. vec_files stays the canonical
+#   sqlite-vec store; vec_ivf holds a copy of each int8 vector plus its cluster.
+_MIGRATION_3 = """
+ALTER TABLE files ADD COLUMN title TEXT;
+ALTER TABLE files ADD COLUMN embed_path TEXT;
+-- Clustered storage: a cluster's vectors sit on neighbouring pages, so a query reads
+-- a few contiguous ranges instead of thousands of scattered rows.
+CREATE TABLE vec_ivf (
+    cluster    INTEGER NOT NULL,
+    file_id    INTEGER NOT NULL UNIQUE REFERENCES files(id) ON DELETE CASCADE,
+    embedding  BLOB    NOT NULL,       -- int8[EMBED_DIM]
+    PRIMARY KEY (cluster, file_id)
+) WITHOUT ROWID;
+CREATE TABLE ivf_centroids (
+    id         INTEGER PRIMARY KEY,
+    embedding  BLOB NOT NULL           -- float32[EMBED_DIM], L2-normalized
+);
+CREATE INDEX idx_relations_src_score ON relations(src_id, score DESC);
+"""
+
+MIGRATIONS: tuple[str, ...] = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 

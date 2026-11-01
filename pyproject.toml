@@ -10,6 +10,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "sqlite-vec>=0.1.6",
+    "numpy>=1.26",
+    "model2vec>=0.4",  # static embeddings, CPU, no PyTorch
+    "pymupdf>=1.24",
+    "python-docx>=1.1",
+    "python-pptx>=1.0",
+    "openpyxl>=3.1",
     "watchdog>=4.0",
     "PySide6-Essentials>=6.6",
     "jeepney>=0.8; sys_platform == 'linux'",  # D-Bus: hotkey portal, file-manager reveal
@@ -62,8 +68,14 @@ warn_unreachable = false
 module = ["tests.test_ui"]
 disallow_untyped_calls = false
 
+# Third-party parsers without type stubs (document extraction).
 [[tool.mypy.overrides]]
-module = ["sqlite_vec", "jeepney", "jeepney.*"]
+module = ["zachary.indexer.extract"]
+disallow_untyped_calls = false
+
+[[tool.mypy.overrides]]
+module = ["sqlite_vec", "jeepney", "jeepney.*", "openpyxl", "openpyxl.*", "pptx", "pptx.*",
+          "docx", "docx.*", "pymupdf", "model2vec", "model2vec.*", "huggingface_hub"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

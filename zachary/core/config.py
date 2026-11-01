@@ -141,6 +141,9 @@ class Settings:
     # Hidden folders (~/.config, ~/.vscode, ~/.local, ...) hold app data, not user
     # files. Project markers such as .git are still seen.
     index_hidden_folders: bool = False
+    # Semantic memory (Phase 3). The model is downloaded once into the data dir.
+    embed_model: str = "minishlab/potion-base-8M"
+    embed_on_battery: bool = False
 
 
 _SETTING_KEYS: tuple[str, ...] = tuple(Settings.__dataclass_fields__)

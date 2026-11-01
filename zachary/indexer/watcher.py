@@ -29,6 +29,7 @@ from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
 from zachary.core.config import is_under
+from zachary.core.platform import TreeWatcher
 from zachary.indexer import projects
 from zachary.indexer.store import FileStore, ReconcileResult
 
@@ -96,6 +97,9 @@ class Watcher:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._observer: BaseObserver | None = None
+        self._tree: TreeWatcher | None = None
+        self.backend = ""
+        self.needs_catchup = False
         self._thread: threading.Thread | None = None
         self.batches = 0
 
@@ -118,21 +122,51 @@ class Watcher:
 
     # -- lifecycle -------------------------------------------------------------
     def start(self) -> None:
+        """Start watching. Linux: exclude-aware inotify (only indexed folders get a
+        watch). Elsewhere: watchdog (Windows' ReadDirectoryChangesW is one handle per
+        root, so recursion costs nothing extra)."""
         self._stop.clear()
-        observer = Observer()
-        handler = _Handler(self)
-        for root in self.store.roots:
-            if os.path.isdir(root):
-                observer.schedule(handler, root, recursive=True)
-        observer.daemon = True
-        observer.start()
-        self._observer = observer
+        self.needs_catchup = False
+        tree = self.store.config.platform.tree_watcher(
+            self.store.is_excluded, self.mark, self._overflow
+        )
+        if tree is not None:
+            for root in self.store.roots:
+                if os.path.isdir(root):
+                    tree.add_tree(root)
+            tree.start()
+            self._tree = tree
+            self.backend = tree.name
+        else:
+            observer = Observer()
+            handler = _Handler(self)
+            for root in self.store.roots:
+                if os.path.isdir(root):
+                    observer.schedule(handler, root, recursive=True)
+            observer.daemon = True
+            observer.start()
+            self._observer = observer
+            self.backend = "watchdog"
         self._thread = threading.Thread(target=self._run, name="zach-watch", daemon=True)
         self._thread.start()
+
+    def _overflow(self) -> None:
+        self.needs_catchup = True  # the service runs a catch-up scan
+
+    @property
+    def watch_count(self) -> int | None:
+        return self._tree.watch_count if self._tree is not None else None
+
+    @property
+    def limit_hit(self) -> bool:
+        return bool(self._tree is not None and self._tree.limit_hit)
 
     def stop(self) -> None:
         self._stop.set()
         self._wake.set()
+        if self._tree is not None:
+            self._tree.stop()
+            self._tree = None
         if self._observer is not None:
             self._observer.stop()
             self._observer.join(timeout=5)
