@@ -21,9 +21,11 @@ from PySide6.QtGui import (
     QFont,
     QGuiApplication,
     QKeyEvent,
+    QKeySequence,
     QPainter,
     QPaintEvent,
     QScreen,
+    QShortcut,
 )
 from PySide6.QtWidgets import QLabel, QLineEdit, QVBoxLayout, QWidget
 
@@ -80,6 +82,10 @@ class QuickBar(QWidget):
         self._debounce.timeout.connect(self._send_preview)
         self.edit.textChanged.connect(lambda _t: self._debounce.start())
         self.edit.installEventFilter(self)
+        # Ctrl+M talks wherever the focus is inside the bar (edit, results list...).
+        talk = QShortcut(QKeySequence("Ctrl+M"), self)
+        talk.setContext(Qt.ShortcutContext.WindowShortcut)
+        talk.activated.connect(self.talk.emit)
         self.list.chosen.connect(self._choose)
         self.list.painted.connect(self._on_painted)
         engine.replied.connect(self._on_reply)
@@ -160,9 +166,6 @@ class QuickBar(QWidget):
             else:
                 self._debounce.stop()
                 self.engine.ask("submit", self.edit.text())
-            return True
-        if ctrl and key == Qt.Key.Key_M:
-            self.talk.emit()
             return True
         if ctrl and key == Qt.Key.Key_R:
             row = self.list.selected_row()

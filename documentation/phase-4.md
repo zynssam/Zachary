@@ -1,6 +1,42 @@
 # Phase 4: Voice (report)
 
-Status: **built and tested; waiting for review.** Branch `phase-4`.
+Status: **redone after real-use testing (section 0); waiting for review.** Branch `phase-4`.
+
+## 0. Redo after real use (2 Nov 2026)
+
+Using it on the laptop (Bluetooth earbuds; the built-in AMD mic has no Linux driver) showed:
+replies arriving very late, voice not activating a second time, "didn't hear anything", and the PC
+swapping to a halt. Causes and fixes:
+
+| Problem | Cause | Fix |
+|---|---|---|
+| Reply heard late / with the *next* command | `Player.stop()` (called on every press) left an end marker in the queue; the next reply's playback quit immediately and its audio played during the following command | Player rewritten: one long-lived thread and output stream, generation numbers, `stop()` clears everything |
+| Playback misrouted | the mic set `PIPEWIRE_NODE` for the whole process; the speaker stream then targeted the *mic* node | routing env vars are set only while the input stream opens, then restored |
+| Super+Alt+Space often did nothing | two portal sessions under one app id; GNOME bound only one, randomly | **one** portal session binds both shortcuts |
+| Voice dead after one command | any exception killed the listener thread | every command is guarded; push-to-talk restarts a dead listener |
+| "Didn't hear anything" | our energy VAD gated what was sent; quiet earbud mic | **Gnani's server VAD** decides start/end (`x-vad-threshold 0.5`, `x-min-silence-ms 450`); every frame from the press is streamed |
+| Slow / crash | local whisper wake-word check on a 6 GB machine (34 s cold, while swapping) | **push-to-talk by default**; the mic opens only while you talk; whisper loads only if Gnani fails |
+| Music sounds like a call | earbuds kept in headset mode | headset mode only while talking, restored 8 s after the last command |
+| Ctrl+M only worked in the text box | key handled by the edit only | window-wide shortcut |
+
+Also: the TTS WebSocket stays open and is reused for every reply (docs allow several requests per
+connection), raw PCM (`container: raw`), one speaker thread (a new reply cancels the old one),
+`cli voice latency` shows the last commands' stages.
+
+**Real API, after the redo** (2 Nov smoke, laptop under load):
+
+| Stage | Before | After |
+|---|---|---|
+| End of speech → first reply audio | 3–5 s (typ. 2.2–4.6 s TTS alone) | **0.55 s** |
+| TTS first audio | 0.45–4.6 s (new connection each time) | **0.30 s** (warm socket; reused for the 2nd reply) |
+| Gnani transcript latency (server) | – | 0.22–0.39 s |
+
+**Finding:** on a short *robotic* espeak clip, streaming STT returned wrong text ("Open.", "Oh, and he
+received.") while REST got it right ("Open the fee receipt"), with and without our VAD/format
+headers. Real voices streamed correctly earlier. If recognition is poor with your voice:
+`python -m zachary.cli set stt_streaming false` (REST: about +0.3–0.5 s, but full-clip accuracy).
+
+API calls used for the redo: 9 (smoke 3 + 3, debugging 3). Total for Phase 4: see `cli voice usage`.
 
 ## 1. "Done when"
 

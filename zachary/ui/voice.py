@@ -8,7 +8,9 @@ tts_first_audio -> tts_done.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import queue
 import threading
 from pathlib import Path
 
@@ -57,15 +59,22 @@ class VoiceController(QObject):
         self.latency_path = latency_path
         self.player = player or Player()
         self.listener: VoiceListener | None = None
+        self._source: FrameSource | None = None
         self._pending: dict[int, Timeline] = {}
+        # One speaker thread: replies are spoken in order, a new one cancels the old.
+        self._say_q: queue.Queue[tuple[int, str, Timeline] | None] = queue.Queue()
+        self._say_gen = 0
+        self._speaker = threading.Thread(target=self._speak_loop, name="zach-speak", daemon=True)
+        self._speaker.start()
         self.heard.connect(self._on_heard)
         self.state.connect(self._on_state)
         self._status.connect(self.bar.status.setText)
         engine.replied.connect(self._on_reply)
 
     def start(self, source: FrameSource | None = None) -> None:
+        self._source = source or self._source or MicSource(device=self.kit.mic_device)
         self.listener = VoiceListener(
-            source or MicSource(device=self.kit.mic_device),
+            self._source,
             on_heard=self.heard.emit,
             on_state=self.state.emit,
             rest_stt=self.kit.rest_stt,
@@ -75,18 +84,40 @@ class VoiceController(QObject):
             wake_word=self.wake_word,
         )
         self.listener.start()
+        warm = getattr(self.kit.tts, "warm", None)
+        if self.speak and warm is not None:  # connect TTS now: the first reply is faster
+            threading.Thread(target=self._warm, args=(warm,), daemon=True).start()
+
+    @staticmethod
+    def _warm(warm: object) -> None:
+        try:
+            warm()  # type: ignore[operator]
+        except Exception as e:
+            log.info("voice: TTS warm-up failed (%s); will connect on first reply", e)
 
     def stop(self) -> None:
         if self.listener is not None:
             self.listener.stop()
             self.listener.join(timeout=3)
             self.listener = None
-        self.player.stop()
+        self._cancel_speech()
+        self._say_q.put(None)
+        close = getattr(self.kit.tts, "close", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                close()
 
     def push_to_talk(self) -> None:
-        if self.listener is not None:
-            self.player.stop()  # talking over the reply interrupts it
-            self.listener.push_to_talk()
+        self._cancel_speech()  # talking over the reply interrupts it
+        if self.listener is None or not self.listener.is_alive():
+            log.warning("voice: listener was not running; restarting it")
+            self.start()
+        assert self.listener is not None
+        self.listener.push_to_talk()
+
+    def _cancel_speech(self) -> None:
+        self._say_gen += 1
+        self.player.stop()
 
     # -- UI thread -------------------------------------------------------------------
     def _on_state(self, state: str) -> None:
@@ -132,20 +163,45 @@ class VoiceController(QObject):
         if not self.speak or not reply.say:
             self._done(tl)
             return
-        threading.Thread(target=self._say, args=(reply.say, tl), daemon=True).start()
+        self._cancel_speech()
+        self._say_q.put((self._say_gen, reply.say, tl))
 
     # -- speaking thread -------------------------------------------------------------
-    def _say(self, text: str, tl: Timeline) -> None:
+    def _speak_loop(self) -> None:
+        while True:
+            item = self._say_q.get()
+            if item is None:
+                return
+            gen, text, tl = item
+            if gen != self._say_gen:
+                self._done(tl)  # superseded before it started
+                continue
+            try:
+                self._say(gen, text, tl)
+            except Exception:
+                log.exception("voice: speaking failed")
+                self._done(tl)
+
+    def _say(self, gen: int, text: str, tl: Timeline) -> None:
         assert self.kit.tts is not None
         first = True
+        self.player.stop()  # a fresh utterance
         try:
-            for chunk in self.kit.tts.stream(text):
-                if first:
-                    tl.mark("tts_first_audio")
-                    first = False
-                self.player.play(chunk.pcm, chunk.sample_rate)
+            with contextlib.closing(iter(self.kit.tts.stream(text))) as chunks:  # type: ignore[type-var]
+                for chunk in chunks:
+                    if gen != self._say_gen:
+                        tl.info["tts_cancelled"] = True
+                        break
+                    if first:
+                        tl.mark("tts_first_audio")
+                        first = False
+                    self.player.play(chunk.pcm, chunk.sample_rate)
             self.player.end()
             tl.mark("tts_done")
+            if self.player.wait(30) and self.player.first_audio_at is not None:
+                tl.info["audio_out_ms"] = round(
+                    (self.player.first_audio_at - tl.t0) * 1e3, 1
+                )  # press -> sound actually playing
         except VoiceError as e:
             tl.mark("tts_done")
             tl.info["tts_error"] = e.kind

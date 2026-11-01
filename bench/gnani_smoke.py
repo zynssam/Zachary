@@ -1,21 +1,20 @@
-"""Real-API smoke test for Gnani. COSTS QUOTA: 7 calls, all short. Run deliberately.
+"""Real-API smoke test for Gnani. COSTS QUOTA: 3 short calls. Run deliberately.
 
-    python bench/gnani_smoke.py --yes [--db ~/.local/share/zachary/zachary.db]
+    python bench/gnani_smoke.py --yes [--db PATH] [--out DIR]
 
-Calls (each recorded in <data dir>/gnani_usage.jsonl):
-  1 STT REST    English command (~3 s, espeak voice)
-  2 STT REST    Hinglish phrase (~2 s)
-  3 STT stream  English command, paced in real time
-  4 TTS REST    one short reply
-  5 TTS WS      same reply (first-audio latency)
-  6-7           "Hey Zach, open the fees document I opened yesterday" end to end:
-                local wake word -> Gnani STT -> search (dry run: nothing opened)
-                -> Gnani TTS
+1. Push-to-talk command through the real listener: an espeak recording of
+   "open the fee receipt" is fed at real-time pace into Gnani streaming STT, whose
+   server VAD ends the command (1 stt-stream call). Checks the model in use.
+2. The reply is spoken twice over ONE TTS WebSocket (2 tts-ws calls): the second
+   reply shows the warm-connection latency.
+3. Prints the per-stage timeline. Every call is recorded in gnani_usage.jsonl.
+Nothing is opened (dry run).
 """
 
 from __future__ import annotations
 
 import argparse
+import queue
 import shutil
 import subprocess
 import sys
@@ -26,150 +25,131 @@ from pathlib import Path
 from zachary.core.config import Config, default_db_path
 from zachary.core.db import open_db
 from zachary.core.env import get_secret
-from zachary.voice.audio import FRAME_BYTES, pcm_to_wav, resample, seconds, wav_to_pcm
-from zachary.voice.gnani_stt import GnaniRestSTT, GnaniStreamingSTT
-from zachary.voice.gnani_tts import GnaniRestTTS, GnaniWsTTS
-from zachary.voice.types import VoiceError
+from zachary.voice.audio import FRAME_BYTES, resample, wav_to_pcm
+from zachary.voice.gnani_stt import GnaniStreamingSTT
+from zachary.voice.gnani_tts import GnaniWsTTS
+from zachary.voice.pipeline import Heard, VoiceListener
 from zachary.voice.usage import UsageLedger
 
-CMD = "open the fees document I opened yesterday"
-HINGLISH = "kal wali fees file kholo"
-REPLY = "Opening Fee Receipt Sem 5.pdf."
+CMD = "open the fee receipt"
+
+
+class RealTimeSource:
+    """A 'microphone' playing a recording at real-time pace, then room noise."""
+
+    def __init__(self, pcm: bytes) -> None:
+        self.q: queue.Queue[bytes] = queue.Queue()
+        for i in range(0, len(pcm), FRAME_BYTES):
+            f = pcm[i : i + FRAME_BYTES]
+            self.q.put(f + b"\0" * (FRAME_BYTES - len(f)))
+        self.next_at = 0.0
+
+    def start(self) -> None:
+        self.next_at = time.monotonic()
+
+    def stop(self) -> None: ...
+
+    def get(self, timeout: float) -> bytes | None:
+        delay = self.next_at - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        self.next_at = max(self.next_at, time.monotonic() - 0.1) + 0.032
+        try:
+            return self.q.get_nowait()
+        except queue.Empty:
+            import numpy as np
+
+            return (np.random.default_rng().standard_normal(512) * 20).astype(np.int16).tobytes()
 
 
 def espeak(text: str, out: Path) -> bytes:
-    subprocess.run(["espeak-ng", "-v", "en-us", "-s", "145", "-w", str(out), text], check=True)
+    subprocess.run(["espeak-ng", "-v", "en-us", "-s", "150", "-w", str(out), text], check=True)
     pcm, sr = wav_to_pcm(out.read_bytes())
     return resample(pcm, sr)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--yes", action="store_true", help="really call the paid API (7 calls)")
-    ap.add_argument("--only-e2e", action="store_true", help="just steps 6-7 (2 calls)")
+    ap.add_argument("--yes", action="store_true", help="really call the paid API (3 calls)")
     ap.add_argument("--db", type=Path, default=None)
-    ap.add_argument("--out", type=Path, default=None, help="keep generated/received audio here")
-    ap.add_argument("--ledger", type=Path, default=None, help="usage ledger (default: data dir)")
+    ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
     print(__doc__)
     if not args.yes:
-        print("dry run: add --yes to make the 7 real calls")
+        print("dry run: add --yes to make the 3 real calls")
         return
     key = get_secret("GNANI_API_KEY")
     if not key or not shutil.which("espeak-ng"):
         sys.exit("need GNANI_API_KEY (.env) and espeak-ng")
     db = args.db or default_db_path()
-    ledger = UsageLedger(args.ledger or default_db_path().parent / "gnani_usage.jsonl")
+    ledger = UsageLedger(default_db_path().parent / "gnani_usage.jsonl")
     out = args.out or Path(tempfile.mkdtemp(prefix="gnani-smoke-"))
     out.mkdir(parents=True, exist_ok=True)
-    cmd_pcm = espeak(CMD, out / "cmd.wav")
-    hin_pcm = espeak(HINGLISH, out / "hinglish.wav")
+    utt = espeak(CMD, out / "cmd.wav")
 
-    def step(n: int, label: str, fn):  # type: ignore[no-untyped-def]
-        t = time.perf_counter()
-        try:
-            res = fn()
-            print(f"[{n}] {label}: {res}  ({(time.perf_counter() - t) * 1e3:.0f} ms)")
-        except VoiceError as e:
-            print(f"[{n}] {label}: ERROR {e.kind}: {e}  ({(time.perf_counter() - t) * 1e3:.0f} ms)")
-
-    rest = GnaniRestSTT(key, ledger=ledger)
-    if args.only_e2e:
-        return e2e(args, db, key, rest, ledger, out)
-    step(1, f"STT REST ({seconds(cmd_pcm):.1f}s)", lambda: repr(rest.transcribe(cmd_pcm).text))
-    step(2, f"STT REST Hinglish ({seconds(hin_pcm):.1f}s)",
-         lambda: repr(rest.transcribe(hin_pcm).text))  # fmt: skip
-
-    def streamed() -> str:
-        s = GnaniStreamingSTT(key, ledger=ledger)
-        s.open()
-        for i in range(0, len(cmd_pcm), FRAME_BYTES):
-            s.feed(cmd_pcm[i : i + FRAME_BYTES])
-            time.sleep(0.032)  # real-time pace, as the docs require
-        t = time.perf_counter()
-        tr = s.finish()
-        return f"{tr.text!r} (text {((time.perf_counter() - t) * 1e3):.0f} ms after speech end)"
-
-    step(3, "STT stream", streamed)
-
-    def tts_rest() -> str:
-        a = GnaniRestTTS(key, ledger=ledger).synthesize(REPLY)
-        (out / "tts_rest.wav").write_bytes(pcm_to_wav(a.pcm, a.sample_rate))
-        return f"{seconds(a.pcm, a.sample_rate):.2f}s of audio at {a.sample_rate} Hz"
-
-    step(4, "TTS REST", tts_rest)
-
-    def tts_ws() -> str:
-        t = time.perf_counter()
-        first = None
-        chunks = []
-        for c in GnaniWsTTS(key, ledger=ledger).stream(REPLY):
-            first = first or time.perf_counter()
-            chunks.append(c.pcm)
-        pcm = b"".join(chunks)
-        (out / "tts_ws.wav").write_bytes(pcm_to_wav(pcm, 24000))
-        starts_riff = pcm[:4] == b"RIFF"
-        ms = ((first or t) - t) * 1e3
-        return f"{len(chunks)} chunks, {seconds(pcm, 24000):.2f}s, first audio {ms:.0f} ms, RIFF left in stream: {starts_riff}"  # noqa: E501
-
-    step(5, "TTS WS", tts_ws)
-    e2e(args, db, key, rest, ledger, out)
-
-
-def e2e(args, db, key, rest, ledger, out) -> None:  # type: ignore[no-untyped-def]
-    """6-7: end to end on the real index (dry run: actions are not executed)."""
     from zachary.brain.handler import Handler
     from zachary.search.semantic import local_semantic
-    from zachary.voice.offline_stt import WhisperSTT
-    from zachary.voice.pipeline import VoiceListener
-    from zachary.voice.wakeword import WakeSpotter
+
+    conn = open_db(db)
+    c = Config(conn)
+    sem = local_semantic(conn, c)  # loaded first: the app has it warm
+
+    tts = GnaniWsTTS(key, ledger=ledger)
+    t = time.perf_counter()
+    tts.warm()  # what the assistant does at startup
+    print(f"TTS socket warm in {(time.perf_counter() - t) * 1e3:.0f} ms (free: no request)")
+
+    streams: list[GnaniStreamingSTT] = []
+
+    def make_stream() -> GnaniStreamingSTT:
+        s = GnaniStreamingSTT(key, ledger=ledger)
+        streams.append(s)
+        return s
+
+    got: list[Heard] = []
+    lis = VoiceListener(RealTimeSource(utt), on_heard=got.append, rest_stt=None,
+                        stream_stt=make_stream, offline_stt=None, spotter=None,
+                        wake_word=False)  # fmt: skip
+    lis.start()
+    lis.push_to_talk()
+    deadline = time.monotonic() + 20
+    while not got and time.monotonic() < deadline:
+        time.sleep(0.02)
+    lis.stop()
+    if not got:
+        sys.exit("[1] no result within 20 s")
+    h = got[0]
+    cfg = streams[0].server_config if streams else {}
+    print(f"[1] heard {h.text!r} (error: {h.error})  server config: {cfg}")
+    print(f"    gnani latency field: {h.timeline.info.get('gnani_latency_ms')}")
 
     class DryRun:
         def open(self, item):  # type: ignore[no-untyped-def]
-            print(f"     (would open {item.path})")
+            print(f"    (would open {item.path})")
             return True
 
         def reveal(self, item):  # type: ignore[no-untyped-def]
             return True
 
-    conn = open_db(db)
-    cfg = Config(conn)
-    whisper = WhisperSTT(Path(db).parent / "models" / "whisper", "tiny")
-    utt = espeak("Hey Zach, " + CMD, out / "e2e.wav")
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from tests.test_voice import ListSource, silence
-
-    got: list = []  # type: ignore[type-arg]
-    lis = VoiceListener(ListSource(silence(0.5) + utt + silence(1.5)), on_heard=got.append,
-                        rest_stt=rest, stream_stt=None, offline_stt=whisper,
-                        spotter=WakeSpotter(whisper))  # fmt: skip
-    lis.start()
-    deadline = time.monotonic() + 30
-    while not got and time.monotonic() < deadline:
-        time.sleep(0.05)
-    lis.stop()
-    if not got:
-        print("[6] e2e: wake word not detected")
-        return
-    h = got[0]
-    extra = h.transcript.extra if h.transcript else {}
-    print(f"[6] heard via {h.transcript.provider if h.transcript else '?'}: {h.text!r}  "
-          f"(round trip {h.transcript.latency_ms if h.transcript else 0:.0f} ms, "
-          f"Gnani server {extra.get('server_s')} s)")  # fmt: skip
-    handler = Handler(conn, DryRun(), cfg, lambda: local_semantic(conn, cfg))
-    reply = handler.submit(h.text)
+    reply = Handler(conn, DryRun(), c, lambda: sem).submit(h.text or CMD)
     h.timeline.mark("intent_search")
-    print(f"     zach: {reply.say}")
-    t = time.perf_counter()
-    first = None
-    for _chunk in GnaniWsTTS(key, ledger=ledger).stream(reply.say):
-        first = first or time.perf_counter()
-    if first:
-        h.timeline.mark("tts_first_audio", first)
-    h.timeline.mark("tts_done")
-    tts_ms = ((first or t) - t) * 1e3
-    print(f"[7] e2e latency: {h.timeline.durations()}  (tts first audio {tts_ms:.0f} ms)")
-    print(f"\naudio kept in {out}\nledger: {ledger.summary()}")
+    print(f"    zach: {reply.say}")
+    for n in (1, 2):
+        t = time.perf_counter()
+        first = None
+        for _chunk in tts.stream(reply.say):
+            first = first or time.perf_counter()
+        if n == 1 and first:
+            h.timeline.mark("tts_first_audio", first)
+            h.timeline.mark("tts_done")
+        print(f"[2] TTS reply {n}: first audio {((first or t) - t) * 1e3:.0f} ms "
+              f"(connects so far: {tts.connects})")  # fmt: skip
+    tts.close()
+    print(f"[3] timeline (ms since previous stage): {h.timeline.durations()}")
+    print(
+        f"    end of speech -> first reply audio: {h.timeline.total_ms(since='speech_end'):.0f} ms"
+    )
+    print(f"ledger: {ledger.summary()}")
 
 
 if __name__ == "__main__":

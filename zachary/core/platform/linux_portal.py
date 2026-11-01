@@ -38,7 +38,10 @@ def portal_available() -> bool:
 
 
 class PortalHotkey:
-    """Listens for the portal shortcut on a daemon thread."""
+    """One global shortcut. All shortcuts of the app share **one** portal session
+    (GNOME binds only one session per app: two sessions meant one key silently never
+    fired). ``start()`` registers with the shared session; registrations made close
+    together are bound in a single BindShortcuts call, a later one rebinds all."""
 
     name = "xdg-portal"
 
@@ -56,16 +59,62 @@ class PortalHotkey:
         self.error: str | None = None
         self.bound_trigger: str | None = None
         self.ready = threading.Event()  # set once bound (or failed)
-        self._conn: Any = None
-        self._stopping = False
-        self._thread = threading.Thread(target=self._run, name="zach-portal", daemon=True)
 
     def start(self) -> None:
-        self._thread.start()
+        _manager().add(self)
 
     def stop(self) -> None:
+        _manager().remove(self)
+
+
+class _PortalSession:
+    """The app's single GlobalShortcuts session, on one D-Bus connection/thread."""
+
+    BATCH_S = 0.4  # wait this long after a registration for others before binding
+
+    def __init__(self) -> None:
+        self.handles: list[PortalHotkey] = []
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._conn: Any = None
+        self._stopping = False
+        self.runs = 0  # sessions created (tests)
+
+    def add(self, h: PortalHotkey) -> None:
+        with self._lock:
+            self.handles = [x for x in self.handles if x.shortcut_id != h.shortcut_id] + [h]
+            h.ready.clear()
+            self._schedule()
+
+    def remove(self, h: PortalHotkey) -> None:
+        with self._lock:
+            self.handles = [x for x in self.handles if x is not h]
+            if not self.handles:
+                if self._timer is not None:
+                    self._timer.cancel()
+                self._close()
+
+    def _schedule(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = threading.Timer(self.BATCH_S, self._restart)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _restart(self) -> None:
+        with self._lock:
+            self._close()  # a new shortcut: rebind everything in a fresh session
+            handles = list(self.handles)
+            if not handles:
+                return
+            self._stopping = False
+            self.runs += 1
+            threading.Thread(target=self._run, args=(handles,), name="zach-portal",
+                             daemon=True).start()  # fmt: skip
+
+    def _close(self) -> None:
         self._stopping = True
-        conn = self._conn
+        conn, self._conn = self._conn, None
         if conn is not None:
             # Closing from another thread unblocks the pending receive.
             with contextlib.suppress(Exception):
@@ -103,59 +152,88 @@ class PortalHotkey:
             )
         return results
 
-    def _run(self) -> None:
+    def _run(self, handles: list[PortalHotkey]) -> None:
         try:
-            from jeepney import DBusAddress, MatchRule, new_method_call
-            from jeepney.bus_messages import message_bus
-            from jeepney.io.blocking import open_dbus_connection
-
-            conn = open_dbus_connection(bus="SESSION")
-            self._conn = conn
-            # Tell the portal who we are (unsandboxed apps; xdg-desktop-portal >= 1.19).
-            registry = DBusAddress(
-                _PATH, bus_name=_PORTAL, interface="org.freedesktop.host.portal.Registry"
-            )
-            conn.send_and_get_reply(new_method_call(registry, "Register", "sa{sv}", (APP_ID, {})))
-            res = self._request(
-                conn,
-                "CreateSession",
-                "a{sv}",
-                ({"session_handle_token": ("s", "zach" + secrets.token_hex(4))},),
-            )
-            session = res["session_handle"][1]
-            shortcuts = [
-                (
-                    self.shortcut_id,
-                    {
-                        "description": ("s", self.description),
-                        "preferred_trigger": ("s", self.hotkey.portal_trigger()),
-                    },
-                )
-            ]
-            res = self._request(
-                conn, "BindShortcuts", "oa(sa{sv})sa{sv}", (session, shortcuts, "", {})
-            )
-            for sid, props in res.get("shortcuts", ("", []))[1]:
-                if sid == self.shortcut_id:
-                    self.bound_trigger = props.get("trigger_description", ("s", ""))[1] or None
-            log.info("portal shortcut bound: %s", self.bound_trigger or "(set in system settings)")
-            self.ready.set()
-            rule = MatchRule(
-                type="signal",
-                interface="org.freedesktop.portal.GlobalShortcuts",
-                member="Activated",
-            )
-            conn.send_and_get_reply(message_bus.AddMatch(rule))
-            with conn.filter(rule) as queue:
-                while not self._stopping:
-                    msg = conn.recv_until_filtered(queue)
-                    _session, sid, _ts, opts = msg.body
-                    if sid == self.shortcut_id:
-                        token = opts.get("activation_token", ("s", None))[1]
-                        self.callback(token or None)
+            self._session(handles)
         except Exception as e:  # report, never crash the app
             if not self._stopping:
-                self.error = f"{type(e).__name__}: {e}"
-                log.warning("global shortcut portal unavailable: %s", self.error)
+                for h in handles:
+                    h.error = f"{type(e).__name__}: {e}"
+                log.warning("global shortcut portal unavailable: %s", handles[0].error)
         finally:
-            self.ready.set()
+            for h in handles:
+                h.ready.set()
+
+    def _session(self, handles: list[PortalHotkey]) -> None:
+        from jeepney import DBusAddress, MatchRule, new_method_call
+        from jeepney.bus_messages import message_bus
+        from jeepney.io.blocking import open_dbus_connection
+
+        conn = open_dbus_connection(bus="SESSION")
+        self._conn = conn
+        # Tell the portal who we are (unsandboxed apps; xdg-desktop-portal >= 1.19).
+        registry = DBusAddress(
+            _PATH, bus_name=_PORTAL, interface="org.freedesktop.host.portal.Registry"
+        )
+        conn.send_and_get_reply(new_method_call(registry, "Register", "sa{sv}", (APP_ID, {})))
+        res = self._request(
+            conn,
+            "CreateSession",
+            "a{sv}",
+            ({"session_handle_token": ("s", "zach" + secrets.token_hex(4))},),
+        )
+        session = res["session_handle"][1]
+        res = self._request(
+            conn, "BindShortcuts", "oa(sa{sv})sa{sv}", (session, shortcuts_body(handles), "", {})
+        )
+        by_id = {h.shortcut_id: h for h in handles}
+        for sid, props in res.get("shortcuts", ("", []))[1]:
+            if sid in by_id:
+                by_id[sid].bound_trigger = props.get("trigger_description", ("s", ""))[1] or None
+        for h in handles:
+            log.info("portal shortcut %r bound: %s", h.shortcut_id,
+                     h.bound_trigger or "(set in system settings)")  # fmt: skip
+            h.ready.set()
+        rule = MatchRule(
+            type="signal",
+            interface="org.freedesktop.portal.GlobalShortcuts",
+            member="Activated",
+        )
+        conn.send_and_get_reply(message_bus.AddMatch(rule))
+        with conn.filter(rule) as queue:
+            while not self._stopping:
+                msg = conn.recv_until_filtered(queue)
+                msg_session, sid, _ts, opts = msg.body
+                if msg_session != session or sid not in by_id:
+                    continue
+                token = opts.get("activation_token", ("s", None))[1]
+                try:
+                    by_id[sid].callback(token or None)
+                except Exception:
+                    log.exception("hotkey callback failed")
+
+
+def shortcuts_body(handles: list[PortalHotkey]) -> list[tuple[str, dict[str, Any]]]:
+    """The BindShortcuts ``a(sa{sv})`` argument: every shortcut of the app."""
+    return [
+        (
+            h.shortcut_id,
+            {
+                "description": ("s", h.description),
+                "preferred_trigger": ("s", h.hotkey.portal_trigger()),
+            },
+        )
+        for h in handles
+    ]
+
+
+_MANAGER: _PortalSession | None = None
+_MANAGER_LOCK = threading.Lock()
+
+
+def _manager() -> _PortalSession:
+    global _MANAGER
+    with _MANAGER_LOCK:
+        if _MANAGER is None:
+            _MANAGER = _PortalSession()
+        return _MANAGER

@@ -32,6 +32,11 @@ def tone_wav(seconds: float = 0.3, sr: int = 24000) -> bytes:
 class MockGnani:
     transcript: str = "open the fees document I opened yesterday"
     fail_status: int | None = None  # e.g. 402 -> credits used up
+    stream_vad: bool = True  # emulate the server VAD (speech_start/processing/transcript)
+    stream_fail_after: int | None = None  # close the STT socket after N frames
+    tts_close_after_request: bool = False  # server closes the TTS socket after each reply
+    transcript_delay_s: float = 0.0  # transcription time (the next segment may start first)
+    numbered_segments: bool = False  # "<transcript> 1", "<transcript> 2", ...
     calls: list[dict[str, Any]] = field(default_factory=list)
     http_port: int = 0
     ws_port: int = 0
@@ -113,7 +118,85 @@ def _http_handler(mock: MockGnani) -> type[BaseHTTPRequestHandler]:
     return H
 
 
+def _rms(frame: bytes) -> float:
+    x = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768
+    return float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
+
+
 def _ws_handler(mock: MockGnani):  # type: ignore[no-untyped-def]
+    def stt(ws, call: dict[str, Any]) -> None:  # type: ignore[no-untyped-def]
+        headers = call["headers"]
+        silence_frames = max(1, int(headers.get("x-min-silence-ms", "500")) // 32)
+        ws.send(json.dumps({"type": "connected", "message": "ok",
+                            "config": {"sample_rate": 16000, "chunk_size": 512,
+                                       "model": headers.get("model", "prisma-v2.5")}}))  # fmt: skip
+        in_speech = False
+        loud = quiet = 0
+        seg = 0
+
+        def final() -> None:
+            nonlocal seg
+            seg += 1
+            text = f"{mock.transcript} {seg}" if mock.numbered_segments else mock.transcript
+            msg = json.dumps({"type": "transcript", "text": text, "is_final": True,
+                              "segment_index": seg, "latency": 120,
+                              "detected_language_code": "en-IN"})  # fmt: skip
+            if mock.transcript_delay_s:
+                threading.Timer(mock.transcript_delay_s, ws.send, (msg,)).start()
+            else:
+                ws.send(msg)
+
+        for msg in ws:
+            if isinstance(msg, bytes):
+                call["frames"] += 1
+                call["bad_frames"] += int(len(msg) != 1024)
+                if mock.stream_fail_after is not None and call["frames"] >= mock.stream_fail_after:
+                    ws.close()
+                    return
+                if not mock.stream_vad:
+                    continue
+                loud_now = _rms(msg) > 0.02
+                if not in_speech:
+                    loud = loud + 1 if loud_now else 0
+                    if loud >= 3:
+                        in_speech, quiet = True, 0
+                        ws.send(json.dumps({"type": "speech_start"}))
+                else:
+                    quiet = 0 if loud_now else quiet + 1
+                    if quiet >= silence_frames:
+                        in_speech, loud = False, 0
+                        final()
+                continue
+            if json.loads(msg).get("type") == "commit":
+                call["committed"] = True
+                if in_speech or not mock.stream_vad:
+                    in_speech = False
+                    final()
+
+    def tts(ws, key: str | None) -> None:  # type: ignore[no-untyped-def]
+        call: dict[str, Any] = {"endpoint": "tts-conn", "key": key, "requests": 0}
+        mock.calls.append(call)
+        for raw in ws:
+            req = json.loads(raw)
+            call["requests"] += 1
+            mock.calls.append({"endpoint": "tts-ws", "key": key, "request": req})
+            if mock.fail_status:
+                ws.send(json.dumps({"type": "error", "message": "insufficient credits"}))
+                continue
+            wav = tone_wav()
+            container = req.get("audio_config", {}).get("container", "wav")
+            data = wav if container == "wav" else wav[44:]
+            ws.send(json.dumps({"type": "start", "message": "ok", "request_id": "t-1"}))
+            parts = [data[:2001], data[2001:6000], data[6000:]]  # odd split: half samples
+            for i, part in enumerate(parts):
+                ws.send(json.dumps({"type": "audio", "data": {"chunk_index": i,
+                    "audio": base64.b64encode(part).decode(), "is_final": False}}))  # fmt: skip
+            ws.send(json.dumps({"type": "complete", "data": {"chunk_index": 3, "audio": "",
+                                                             "is_final": True}}))  # fmt: skip
+            if mock.tts_close_after_request:
+                ws.close()
+                return
+
     def handler(ws) -> None:  # type: ignore[no-untyped-def]
         headers = ws.request.headers
         path = ws.request.path
@@ -122,30 +205,9 @@ def _ws_handler(mock: MockGnani):  # type: ignore[no-untyped-def]
             call: dict[str, Any] = {"endpoint": "stt-stream", "key": key, "frames": 0,
                                     "bad_frames": 0, "headers": dict(headers)}  # fmt: skip
             mock.calls.append(call)
-            ws.send(json.dumps({"type": "connected", "message": "ok"}))
-            for msg in ws:
-                if isinstance(msg, bytes):
-                    call["frames"] += 1
-                    call["bad_frames"] += int(len(msg) != 1024)
-                    continue
-                if json.loads(msg).get("type") == "commit":
-                    ws.send(json.dumps({"type": "transcript", "text": mock.transcript,
-                                        "is_final": True, "detected_language_code": "en-IN"}))  # fmt: skip
-                    call["committed"] = True
+            stt(ws, call)
         elif path == "/api/v1/tts":
-            req = json.loads(ws.recv())
-            mock.calls.append({"endpoint": "tts-ws", "key": key, "request": req})
-            if mock.fail_status:
-                ws.send(json.dumps({"type": "error", "message": "insufficient credits"}))
-                return
-            wav = tone_wav()
-            ws.send(json.dumps({"type": "start", "message": "ok", "request_id": "t-1"}))
-            parts = [wav[:2000], wav[2000:6000], wav[6000:]]
-            for i, part in enumerate(parts):
-                ws.send(json.dumps({"type": "audio", "data": {"chunk_index": i,
-                    "audio": base64.b64encode(part).decode(), "is_final": False}}))  # fmt: skip
-            ws.send(json.dumps({"type": "complete", "data": {"chunk_index": 3, "audio": "",
-                                                             "is_final": True}}))  # fmt: skip
+            tts(ws, key)
 
     return handler
 

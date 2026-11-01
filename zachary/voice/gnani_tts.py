@@ -17,6 +17,7 @@ import base64
 import contextlib
 import json
 import re
+import threading
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -145,7 +146,7 @@ class GnaniRestTTS(_Base):
 
 
 def _strip_wav_header(chunk: bytes) -> bytes:
-    """The first chunk of a WAV stream carries the RIFF header: drop it."""
+    """Safety net: if a WAV header ever arrives in the stream, drop it."""
     if chunk.startswith(b"RIFF") and b"data" in chunk[:200]:
         i = chunk.index(b"data", 12)
         return chunk[i + 8 :]
@@ -153,24 +154,41 @@ def _strip_wav_header(chunk: bytes) -> bytes:
 
 
 class GnaniWsTTS(_Base):
-    """WebSocket TTS: playback can start on the first chunk."""
+    """WebSocket TTS on one persistent connection (docs: a connection serves many
+    requests in sequence), so a reply skips the TCP + TLS + upgrade handshake.
+
+    ``warm()`` connects ahead of time. ``stream(text)`` yields raw PCM chunks as
+    they arrive (``container: raw``). If the server closed the idle socket, it
+    reconnects once *before anything was synthesized*; a request is never repeated
+    after Gnani started on it. Abandoning a stream midway drops the connection
+    (its remaining audio would otherwise arrive with the next reply).
+    """
 
     name = "gnani-tts-ws"
 
-    def __init__(self, api_key: str, *, url: str = WS_URL, timeout: float = 15.0, **kw: Any):
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        url: str = WS_URL,
+        timeout: float = 15.0,
+        keep_alive: bool = True,
+        **kw: Any,
+    ) -> None:
         super().__init__(api_key, **kw)
         self.url = url
         self.timeout = timeout
+        self.keep_alive = keep_alive
+        self._lock = threading.Lock()
+        self._ws: Any = None
+        self._stack: contextlib.ExitStack | None = None
+        self.connects = 0  # for tests / telemetry
 
-    def synthesize(self, text: str) -> SpeechAudio:
-        chunks = list(self.stream(text))
-        return SpeechAudio(b"".join(c.pcm for c in chunks), SAMPLE_RATE)
-
-    def stream(self, text: str) -> Iterator[SpeechAudio]:
+    # -- connection -------------------------------------------------------------------
+    def _connect(self) -> Any:
         from websockets.exceptions import InvalidStatus
         from websockets.sync.client import connect
 
-        text = speakable(text)
         stack = contextlib.ExitStack()
         try:
             sock = net.ws_socket(self.url, self.timeout)
@@ -185,44 +203,115 @@ class GnaniWsTTS(_Base):
                         "Content-Type": "application/json",
                     },
                     open_timeout=self.timeout,
-                    close_timeout=1.0,  # don't wait 10 s on a dead/aborted stream
+                    close_timeout=1.0,
                     **extra,
                 )
             )
         except InvalidStatus as e:
-            self.ledger.record("tts-ws", status=str(e.response.status_code), chars=len(text))
+            self.ledger.record("tts-ws", status=str(e.response.status_code), chars=0)
             raise classify(e.response.status_code, {}) from e
         except (OSError, TimeoutError) as e:
             raise VoiceError("network", f"can't reach Gnani: {type(e).__name__}") from e
-        status = "ok"
-        first = True
-        try:
-            ws.send(json.dumps(self._request(text, "wav")))
-            deadline = time.monotonic() + self.timeout
-            while time.monotonic() < deadline:
-                raw = ws.recv(timeout=max(0.05, deadline - time.monotonic()))
-                if isinstance(raw, bytes):
-                    continue
-                msg = json.loads(raw)
-                kind = msg.get("type")
-                if kind == "audio":
-                    data = base64.b64decode(msg.get("data", {}).get("audio") or b"")
-                    if first:
-                        data = _strip_wav_header(data)
-                        first = False
-                    if data:
-                        yield SpeechAudio(data, SAMPLE_RATE)
-                elif kind == "complete":
-                    return
-                elif kind == "error":
-                    status = "error"
-                    raise VoiceError("server", f"Gnani TTS error: {msg.get('message', '')}")
-            status = "timeout"
-            raise VoiceError("network", "Gnani TTS timed out")
-        except TimeoutError as e:
-            status = "timeout"
-            raise VoiceError("network", "Gnani TTS timed out") from e
-        finally:
-            self.ledger.record("tts-ws", status=status, chars=len(text))
+        self._ws, self._stack = ws, stack
+        self.connects += 1
+        return ws
+
+    def _drop(self) -> None:
+        self._ws = None
+        stack, self._stack = self._stack, None
+        if stack is not None:
             with contextlib.suppress(Exception):
                 stack.close()
+
+    def _alive(self) -> Any:
+        ws = self._ws
+        if ws is None:
+            return None
+        try:
+            from websockets.protocol import State
+
+            if ws.protocol.state is not State.OPEN:
+                self._drop()
+                return None
+        except Exception:
+            pass
+        return ws
+
+    def warm(self) -> None:
+        """Connect now (in the background at startup) so the first reply is fast."""
+        with self._lock:
+            if self._alive() is None:
+                self._connect()
+
+    def close(self) -> None:
+        with self._lock:
+            self._drop()
+
+    # -- synthesis ----------------------------------------------------------------------
+    def synthesize(self, text: str) -> SpeechAudio:
+        chunks = list(self.stream(text))
+        return SpeechAudio(b"".join(c.pcm for c in chunks), SAMPLE_RATE)
+
+    def stream(self, text: str) -> Iterator[SpeechAudio]:
+        from websockets.exceptions import ConnectionClosed
+
+        text = speakable(text)
+        request = json.dumps(self._request(text, "raw"))
+        with self._lock:
+            status = "ok"
+            done = False
+            started = False
+            try:
+                for attempt in (1, 2):
+                    ws = self._alive() or self._connect()
+                    try:
+                        ws.send(request)
+                        first = True
+                        carry = b""
+                        deadline = time.monotonic() + self.timeout
+                        while True:
+                            left = deadline - time.monotonic()
+                            if left <= 0:
+                                status = "timeout"
+                                raise VoiceError("network", "Gnani TTS timed out")
+                            raw = ws.recv(timeout=left)
+                            if isinstance(raw, bytes):
+                                continue
+                            msg = json.loads(raw)
+                            kind = msg.get("type")
+                            if kind == "start":
+                                started = True
+                            elif kind == "audio":
+                                started = True
+                                data = base64.b64decode(msg.get("data", {}).get("audio") or b"")
+                                if first:
+                                    data = _strip_wav_header(data)
+                                    first = False
+                                data = carry + data
+                                cut = len(data) - len(data) % 2  # whole 16-bit samples
+                                carry = data[cut:]
+                                if cut:
+                                    yield SpeechAudio(data[:cut], SAMPLE_RATE)
+                            elif kind == "complete":
+                                done = True
+                                return
+                            elif kind == "error":
+                                status = "error"
+                                done = True  # the connection stays usable
+                                raise VoiceError(
+                                    "server", f"Gnani TTS error: {msg.get('message', '')}"
+                                )
+                    except ConnectionClosed as e:
+                        self._drop()
+                        if attempt == 1 and not started:
+                            continue  # idle socket closed by the server: reconnect once
+                        status = "network"
+                        raise VoiceError("network", "Gnani TTS connection closed") from e
+                    except TimeoutError as e:
+                        status = "timeout"
+                        raise VoiceError("network", "Gnani TTS timed out") from e
+            finally:
+                if started or status != "ok":
+                    self.ledger.record("tts-ws", status=status, chars=len(text))
+                if not done or not self.keep_alive:
+                    self._drop()  # abandoned midway / one-shot: don't reuse

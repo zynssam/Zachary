@@ -61,6 +61,9 @@ class Timeline:
     def mark(self, stage: str, at: float | None = None) -> None:
         self.marks.append((stage, at if at is not None else time.perf_counter()))
 
+    def stages(self) -> list[str]:
+        return [stage for stage, _t in self.marks]
+
     def durations(self) -> dict[str, float]:
         out: dict[str, float] = {}
         prev = self.t0

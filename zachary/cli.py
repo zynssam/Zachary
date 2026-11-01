@@ -9,6 +9,7 @@ a few seconds, and search hides newly excluded paths immediately.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sqlite3
@@ -274,7 +275,31 @@ def cmd_voice(args: argparse.Namespace) -> int:
         return _voice_listen(args, kit, conn, cfg)
     if args.action == "mics":
         return _voice_mics(args, cfg)
+    if args.action == "latency":
+        return _voice_latency(data_dir / "latency.jsonl", int(args.text or 10))
     return 1
+
+
+def _voice_latency(path: Path, n: int) -> int:
+    """The last N voice commands, one row each, stage times in ms."""
+    if not path.exists():
+        print(f"no voice commands logged yet ({path})")
+        return 0
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines()[-n:]:
+        with contextlib.suppress(ValueError):
+            rows.append(json.loads(line))
+    cols = ["mic_open", "stream_open", "speech_start", "speech_end", "stt", "intent_search",
+            "tts_first_audio", "tts_done"]  # fmt: skip
+    print("when      " + " ".join(f"{c[:11]:>11}" for c in cols) + "  heard / error")
+    for r in rows:
+        st = r.get("stages_ms", {})
+        when = time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0)))
+        cells = " ".join(f"{st[c]:>11.0f}" if c in st else f"{'-':>11}" for c in cols)
+        note = r.get("error") or r.get("intent") or ""
+        print(f"{when}  {cells}  {note}")
+    print("(each stage: ms since the previous one; speech_end -> tts_first_audio is the wait)")
+    return 0
 
 
 def _voice_mics(args: argparse.Namespace, cfg: Config) -> int:
@@ -529,9 +554,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_related)
 
     s = sub.add_parser(
-        "voice", help="voice: usage | setup | mics [ID] | transcribe WAV | say TEXT | listen"
+        "voice",
+        help="voice: usage | setup | mics [ID] | latency [N] | transcribe WAV | say TEXT | listen",
     )
-    s.add_argument("action", choices=["usage", "setup", "mics", "transcribe", "say", "listen"])
+    s.add_argument(
+        "action", choices=["usage", "setup", "mics", "latency", "transcribe", "say", "listen"]
+    )
     s.add_argument("text", nargs="?", default=None, help="WAV path, text to say, or a mic id")
     s.add_argument("--offline", action="store_true", help="local speech recognition only")
     s.add_argument("--no-speak", action="store_true", help="don't speak the reply (listen)")

@@ -3,9 +3,10 @@ the provider can be swapped (and mocked in tests)."""
 
 from __future__ import annotations
 
+import queue
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 SAMPLE_RATE = 16_000  # mic capture and STT input: 16 kHz mono PCM16
 
@@ -52,11 +53,17 @@ class StreamingSTT(Protocol):
 
     name: str
 
+    events: queue.Queue[dict[str, Any]]  # server messages: speech_start, processing, ...
+
     def open(self) -> None: ...
 
     def feed(self, frame: bytes) -> None: ...
 
+    def commit(self) -> None: ...
+
     def finish(self) -> Transcript: ...
+
+    def close(self) -> None: ...
 
     def abort(self) -> None: ...
 

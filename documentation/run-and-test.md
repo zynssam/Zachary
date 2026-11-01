@@ -136,13 +136,14 @@ python -m zachary.assistant -v                  # restart the assistant to pick 
 ```
 | Key / phrase | Action |
 |---|---|
-| "Hey Zach, open the fee receipt" | wake word (checked locally), then the command goes to Gnani |
-| "Hey Zach" … pause … command | same, via streaming STT |
-| **Super+Alt+Space** (global) or **Ctrl+M** (in the bar) | push-to-talk; press again to stop early |
+| **Super+Alt+Space** (global) or **Ctrl+M** (in the bar) | push-to-talk (default): the mic opens, you speak, Gnani detects the end; press again to stop early |
+| "Hey Zach, open the fee receipt" | only with `cli set wake_word true` (runs whisper locally, ~300 MB; mic always open) |
 
 Other voice commands (the ones that use credits say so):
 ```bash
 python -m zachary.cli voice usage                       # Gnani calls so far (free)
+python -m zachary.cli voice latency                     # last 10 commands, ms per stage (free)
+python -m zachary.cli set stt_streaming false           # REST instead of streaming (if accuracy is poor)
 python -m zachary.cli voice mics                        # microphones with a live level (free)
 python -m zachary.cli voice mics bluez_input.XX         # use that mic ("" = system default)
 python -m zachary.cli voice listen --offline            # press Enter, speak; local whisper only (free)
@@ -153,7 +154,7 @@ python -m zachary.cli set speak_replies false           # text replies only (sav
 python -m zachary.cli set wake_word false               # push-to-talk only
 python -m zachary.cli set stt_language hi-IN            # default en-IN (handles Hinglish in Latin script)
 ```
-Real-API smoke test (deliberate, costs credits): `python bench/gnani_smoke.py --yes --only-e2e` (2 calls) or `--yes` (7 calls).
+Real-API smoke test (deliberate, costs credits): `python bench/gnani_smoke.py --yes` (3 calls).
 
 ---
 

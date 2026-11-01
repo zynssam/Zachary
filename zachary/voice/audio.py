@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import wave
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -230,12 +230,32 @@ def resolve_input(choice: str) -> tuple[int | str | None, str]:
     return None, ""
 
 
+# -- Bluetooth headset mode ----------------------------------------------------------------
+# Earbuds only have a working mic in headset (HFP) mode, which also makes music sound
+# like a phone call. We switch on press and switch back BT_RESTORE_GRACE_S after the
+# mic closes, so quick follow-up commands don't flip the profile (each flip takes 1-3 s).
+BT_RESTORE_GRACE_S = 8.0
+_bt_lock = threading.Lock()
+_bt_pending: tuple[threading.Timer, str, str] | None = None  # (timer, card, profile)
+
+
+def _bt_card(source: str) -> str:
+    return "bluez_card." + source.removeprefix("bluez_input.").split(".")[0].replace(":", "_")
+
+
 def _bt_headset_profile(source: str) -> tuple[str, str] | None:
     """Put the earbuds in headset mode if they're in playback-only (A2DP) mode.
-    Returns (card, previous profile) so it can be restored when listening stops."""
+    Returns (card, profile to restore later), or None if nothing was changed."""
+    global _bt_pending
+    card = _bt_card(source)
+    with _bt_lock:
+        pending = _bt_pending
+        if pending is not None and pending[1] == card:
+            pending[0].cancel()  # still in headset mode from the last command
+            _bt_pending = None
+            return card, pending[2]
     if not shutil.which("pactl"):
         return None
-    card = "bluez_card." + source.removeprefix("bluez_input.").split(".")[0].replace(":", "_")
     try:
         out = subprocess.run(["pactl", "-f", "json", "list", "cards"], capture_output=True,
                              text=True, timeout=3, check=True).stdout  # fmt: skip
@@ -255,15 +275,58 @@ def _bt_headset_profile(source: str) -> tuple[str, str] | None:
 
 
 def _set_profile(card: str, profile: str) -> None:
+    global _bt_pending
+    with _bt_lock:
+        if _bt_pending is not None and _bt_pending[1] == card:
+            _bt_pending = None
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         subprocess.run(["pactl", "set-card-profile", card, profile], timeout=3, check=False)
+        log.info("restored %s to %s", card, profile)
+
+
+def _restore_later(card: str, profile: str, delay: float = BT_RESTORE_GRACE_S) -> None:
+    global _bt_pending
+    timer = threading.Timer(delay, _set_profile, (card, profile))
+    timer.daemon = True
+    with _bt_lock:
+        if _bt_pending is not None:
+            _bt_pending[0].cancel()
+        _bt_pending = (timer, card, profile)
+    timer.start()
+
+
+_ROUTING_VARS = ("PIPEWIRE_NODE", "PULSE_SOURCE", "PIPEWIRE_PROPS", "PULSE_PROP")
+
+
+@contextlib.contextmanager
+def _routed_to(source: str) -> Iterator[None]:
+    """Point the default ALSA/PortAudio device at ``source`` *only while the input
+    stream is opened* (PipeWire's ALSA plugin reads PIPEWIRE_NODE, PulseAudio's
+    PULSE_SOURCE, at open time). Restored right after, so playback streams opened
+    later go to the normal output, never to a microphone node."""
+    saved = {v: os.environ.get(v) for v in _ROUTING_VARS}
+    try:
+        if source:
+            os.environ["PIPEWIRE_NODE"] = source
+            os.environ["PULSE_SOURCE"] = source
+            if source.startswith("bluez_input"):  # a call: lets PipeWire use the HFP mic
+                os.environ["PIPEWIRE_PROPS"] = "{ media.role = Communication }"
+                os.environ["PULSE_PROP"] = "media.role=phone"
+        yield
+    finally:
+        for v, old in saved.items():
+            if old is None:
+                os.environ.pop(v, None)
+            else:
+                os.environ[v] = old
 
 
 class MicStream:
     """16 kHz mono microphone, delivering 1,024-byte frames on a queue.
 
     ``device`` is the mic_device setting: "" (system default), a PipeWire/Pulse
-    source name, part of a device's name, or a sounddevice index.
+    source name, part of a device's name, or a sounddevice index. Can be started
+    and stopped repeatedly (push-to-talk opens it only while you talk).
     """
 
     def __init__(self, device: str | int | None = None) -> None:
@@ -273,6 +336,10 @@ class MicStream:
         self._buf = b""
         self.source_name = ""
         self._restore: tuple[str, str] | None = None  # (bt card, profile) to switch back to
+
+    @property
+    def active(self) -> bool:
+        return self._stream is not None
 
     def _callback(self, indata, _frames, _time, status) -> None:  # type: ignore[no-untyped-def]
         if status:
@@ -288,30 +355,24 @@ class MicStream:
                 self.frames.put_nowait(frame)
 
     def start(self) -> None:
+        if self._stream is not None:
+            return
         sd = _sd()
         device, source = resolve_input(self.device)
-        # Route the default ALSA/PortAudio device to that source (PipeWire's ALSA
-        # plugin reads PIPEWIRE_NODE, PulseAudio's reads PULSE_SOURCE).
-        for var in ("PIPEWIRE_NODE", "PULSE_SOURCE"):
-            if source:
-                os.environ[var] = source
-            else:
-                os.environ.pop(var, None)
         if source.startswith("bluez_input"):
-            # Bluetooth earbuds only have a working mic in headset (HFP) mode; marking
-            # the stream as a call makes PipeWire switch to it (and back afterwards).
-            os.environ["PIPEWIRE_PROPS"] = "{ media.role = Communication }"
-            os.environ["PULSE_PROP"] = "media.role=phone"
             self._restore = _bt_headset_profile(source)
         self.source_name = source
-        stream = sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=FRAME_SAMPLES,
-            channels=1,
-            dtype="int16",
-            device=device,
-            callback=self._callback,
-        )
+        self._buf = b""
+        self.drain()
+        with _routed_to(source):
+            stream = sd.RawInputStream(
+                samplerate=SAMPLE_RATE,
+                blocksize=FRAME_SAMPLES,
+                channels=1,
+                dtype="int16",
+                device=device,
+                callback=self._callback,
+            )
         stream.start()
         self._stream = stream
 
@@ -319,73 +380,138 @@ class MicStream:
         s = self._stream
         self._stream = None
         if s is not None:
-            s.stop()  # type: ignore[attr-defined]
-            s.close()  # type: ignore[attr-defined]
+            with contextlib.suppress(Exception):
+                s.stop()  # type: ignore[attr-defined]
+                s.close()  # type: ignore[attr-defined]
         restore, self._restore = self._restore, None
-        if restore is not None:  # earbuds back to high-quality playback
-            _set_profile(*restore)
+        if restore is not None:  # earbuds back to high-quality playback, a bit later
+            _restore_later(*restore)
 
     def drain(self) -> None:
-        while not self.frames.empty():
-            self.frames.get_nowait()
+        while True:
+            try:
+                self.frames.get_nowait()
+            except queue.Empty:
+                return
 
 
 class Player:
-    """Plays PCM16 mono audio without blocking; chunks can be appended while playing."""
+    """Plays PCM16 mono replies on one long-lived thread.
 
-    def __init__(self) -> None:
-        self._q: queue.Queue[tuple[bytes, int] | None] = queue.Queue()
+    Each reply is an *utterance*: ``play()`` chunks as they arrive, then ``end()``.
+    ``stop()`` cancels whatever is playing or queued (talking over a reply) and
+    leaves nothing behind for the next one: items carry a generation number and
+    stale ones are skipped. The output stream stays open between replies (opening
+    one costs ~50-300 ms, more over Bluetooth) and is closed after IDLE_CLOSE_S.
+    """
+
+    IDLE_CLOSE_S = 10.0
+    BLOCK_S = 0.05  # written in small blocks so stop() takes effect within ~50 ms
+
+    def __init__(self, open_stream: Any = None) -> None:
+        self._q: queue.Queue[tuple[int, bytes | None, int]] = queue.Queue()
+        self._gen = 0
+        self._lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
         self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
+        self._open = open_stream
         self.first_audio_at: float | None = None
+        self.played_bytes = 0
 
+    # -- any thread -------------------------------------------------------------------
     def play(self, pcm: bytes, sample_rate: int) -> None:
-        self._q.put((pcm, sample_rate))
-        if self._thread is None or not self._thread.is_alive():
-            self._stop.clear()
-            self._thread = threading.Thread(target=self._run, name="zach-play", daemon=True)
-            self._thread.start()
+        with self._lock:
+            self._idle.clear()
+            self._q.put((self._gen, pcm, sample_rate))
+            self._ensure_thread()
 
     def end(self) -> None:
         """No more chunks for this utterance."""
-        self._q.put(None)
+        with self._lock:
+            self._q.put((self._gen, None, 0))
+            self._ensure_thread()
 
     def stop(self) -> None:
-        self._stop.set()
-        self._q.put(None)
+        """Cancel the current utterance and anything queued; the next play() starts fresh."""
+        with self._lock:
+            self._gen += 1
+            while True:
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    break
+            self.first_audio_at = None
+            self.played_bytes = 0
+            self._idle.set()
 
-    def wait(self, timeout: float = 30.0) -> None:
-        t = self._thread
-        if t is not None:
-            t.join(timeout)
+    def wait(self, timeout: float = 30.0) -> bool:
+        """Wait until the current utterance has finished playing."""
+        return self._idle.wait(timeout)
+
+    @property
+    def busy(self) -> bool:
+        return not self._idle.is_set()
+
+    # -- playback thread ----------------------------------------------------------------
+    def _ensure_thread(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run, name="zach-play", daemon=True)
+            self._thread.start()
+
+    def _open_stream(self, sr: int) -> Any:
+        if self._open is not None:
+            return self._open(sr)
+        sd = _sd()
+        s = sd.RawOutputStream(samplerate=sr, channels=1, dtype="int16")
+        s.start()
+        return s
 
     def _run(self) -> None:
         import time
 
+        stream: Any = None
+        rate = 0
         try:
-            sd = _sd()
-        except AudioUnavailable as e:
-            log.warning("%s", e)
-            return
-        stream = None
-        rate = None
-        try:
-            while not self._stop.is_set():
-                item = self._q.get()
-                if item is None:
-                    break
-                pcm, sr = item
+            while True:
+                try:
+                    gen, pcm, sr = self._q.get(timeout=self.IDLE_CLOSE_S)
+                except queue.Empty:
+                    if stream is not None:  # release the device when quiet
+                        with contextlib.suppress(Exception):
+                            stream.stop()
+                            stream.close()
+                        stream = None
+                    continue
+                if gen != self._gen:
+                    continue  # cancelled
+                if pcm is None:
+                    with self._lock:
+                        if gen == self._gen and self._q.empty():
+                            self._idle.set()
+                    continue
                 if stream is None or sr != rate:
                     if stream is not None:
-                        stream.stop()
-                        stream.close()
-                    stream = sd.RawOutputStream(samplerate=sr, channels=1, dtype="int16")
-                    stream.start()
+                        with contextlib.suppress(Exception):
+                            stream.stop()
+                            stream.close()
+                    try:
+                        stream = self._open_stream(sr)
+                    except Exception as e:
+                        log.warning("can't play audio: %s", e)
+                        stream = None
+                        continue
                     rate = sr
-                if self.first_audio_at is None:
-                    self.first_audio_at = time.perf_counter()
-                stream.write(pcm)
+                block = max(2, int(sr * self.BLOCK_S) * 2)
+                for i in range(0, len(pcm), block):
+                    if gen != self._gen:
+                        break
+                    if self.first_audio_at is None:
+                        self.first_audio_at = time.perf_counter()
+                    stream.write(pcm[i : i + block])
+                    self.played_bytes += min(block, len(pcm) - i)
         finally:
             if stream is not None:
-                stream.stop()
-                stream.close()
+                with contextlib.suppress(Exception):
+                    stream.stop()
+                    stream.close()

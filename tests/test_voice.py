@@ -103,6 +103,9 @@ def test_streaming_stt_frames_and_commit(gnani: MockGnani, ledger: UsageLedger) 
     call = gnani.calls[0]
     assert call["bad_frames"] == 0 and call["frames"] >= len(audio) // FRAME_BYTES
     assert call["committed"] and call["headers"]["language_code"] == "en-IN"
+    h = call["headers"]  # server-side VAD tuned for commands, model pinned both ways
+    assert h["model"] == h["x-model"] == "prisma-v3.0"
+    assert h["x-vad-threshold"] == "0.5" and h["x-min-silence-ms"] == "450"
     assert ledger.summary()["stt-stream"]["audio_s"] == pytest.approx(1.0, abs=0.05)
 
 
@@ -121,7 +124,9 @@ def test_tts_rest_and_ws(gnani: MockGnani, ledger: UsageLedger) -> None:
     chunks = list(GnaniWsTTS(KEY, url=gnani.tts_ws, ledger=ledger).stream("Hello"))
     assert len(chunks) == 3
     joined = b"".join(c.pcm for c in chunks)
-    assert not joined.startswith(b"RIFF")  # header stripped from the stream
+    assert all(len(c.pcm) % 2 == 0 for c in chunks)  # whole samples despite odd splits
+    assert not joined.startswith(b"RIFF")
+    assert gnani.calls[-1]["request"]["audio_config"]["container"] == "raw"
     assert abs(len(joined) - len(a.pcm)) < 100  # same audio as the REST call
     assert set(ledger.summary()) == {"tts-rest", "tts-ws"}
 
@@ -130,6 +135,36 @@ def test_tts_ws_error(gnani: MockGnani) -> None:
     gnani.fail_status = 402
     with pytest.raises(VoiceError):
         list(GnaniWsTTS(KEY, url=gnani.tts_ws).stream("Hello"))
+
+
+def test_tts_reuses_one_connection(gnani: MockGnani, ledger: UsageLedger) -> None:
+    tts = GnaniWsTTS(KEY, url=gnani.tts_ws, ledger=ledger)
+    tts.warm()
+    for text in ("Opening fee receipt.", "Found three."):
+        assert b"".join(c.pcm for c in tts.stream(text))
+    assert tts.connects == 1  # no handshake per reply
+    conns = [c for c in gnani.calls if c["endpoint"] == "tts-conn"]
+    assert len(conns) == 1 and conns[0]["requests"] == 2
+    assert ledger.summary()["tts-ws"]["calls"] == 2  # one ledger row per reply
+    tts.close()
+
+
+def test_tts_reconnects_when_the_server_closed_it(gnani: MockGnani) -> None:
+    gnani.tts_close_after_request = True
+    tts = GnaniWsTTS(KEY, url=gnani.tts_ws)
+    assert list(tts.stream("one"))
+    time.sleep(0.1)
+    assert list(tts.stream("two"))  # the idle socket was gone: reconnect, not an error
+    assert tts.connects == 2 and gnani.count("tts-ws") == 2  # each text synthesized once
+
+
+def test_tts_abandoned_stream_is_not_reused(gnani: MockGnani) -> None:
+    tts = GnaniWsTTS(KEY, url=gnani.tts_ws)
+    it = tts.stream("first reply")
+    next(it)
+    it.close()  # type: ignore[attr-defined]  # a generator  # interrupted after one chunk: the rest must not leak into the next reply
+    chunks = list(tts.stream("second reply"))
+    assert tts.connects == 2 and len(b"".join(c.pcm for c in chunks)) > 10000
 
 
 @pytest.mark.parametrize(
@@ -208,6 +243,17 @@ class ListSource:
         if self.realtime:
             time.sleep(0.002)
         return f
+
+
+class ZeroSource(ListSource):
+    """A 'microphone' that delivers exact digital silence (a dead or virtual input)."""
+
+    def __init__(self) -> None:
+        super().__init__(b"")
+
+    def get(self, timeout: float) -> bytes | None:
+        time.sleep(0.001)
+        return b"\0" * FRAME_BYTES
 
 
 class FakeSpotter:
@@ -448,10 +494,11 @@ def test_tests_cannot_reach_the_real_api() -> None:
 def test_silent_microphone_is_reported() -> None:
     """A monitor/virtual input gives exact zeros: say so instead of waiting forever."""
     states: list[str] = []
-    lis = VoiceListener(ListSource(b"\0" * int(3.5 * SAMPLE_RATE) * 2), on_heard=lambda _h: None,
+    lis = VoiceListener(ZeroSource(), on_heard=lambda _h: None,
                         on_state=states.append, rest_stt=None, stream_stt=None,
                         offline_stt=None, spotter=None)  # fmt: skip
     lis.start()
+    lis.push_to_talk()
     deadline = time.monotonic() + 10
     while not any(s.startswith("error: the microphone is silent") for s in states):
         assert time.monotonic() < deadline, states
@@ -482,7 +529,7 @@ def test_input_device_choice(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_silent_microphone_switches_to_another() -> None:
     """Laptop mic without a driver (zeros) -> the listener asks the source for the next mic."""
 
-    class TwoMics(ListSource):
+    class TwoMics(ZeroSource):
         switched = False
 
         def try_next(self) -> str | None:
@@ -490,10 +537,11 @@ def test_silent_microphone_switches_to_another() -> None:
             return "Bullets Z2"
 
     states: list[str] = []
-    src = TwoMics(b"\0" * int(3.5 * SAMPLE_RATE) * 2)
+    src = TwoMics()
     lis = VoiceListener(src, on_heard=lambda _h: None, on_state=states.append, rest_stt=None,
                         stream_stt=None, offline_stt=None, spotter=None)  # fmt: skip
     lis.start()
+    lis.push_to_talk()
     deadline = time.monotonic() + 10
     while "info: using microphone Bullets Z2" not in states:
         assert time.monotonic() < deadline, states
@@ -501,3 +549,315 @@ def test_silent_microphone_switches_to_another() -> None:
     lis.stop()
     lis.join(5)
     assert src.switched and not any(s.startswith("error") for s in states)
+
+
+# -- push-to-talk with the server's VAD ---------------------------------------------------
+class CountingSource(ListSource):
+    """Records how often the mic was opened/closed (push-to-talk opens it per command)."""
+
+    def __init__(self, pcm: bytes = b"") -> None:
+        super().__init__(pcm)
+        self.starts = self.stops = 0
+        self.active = False
+
+    def start(self) -> None:
+        self.starts += 1
+        self.active = True
+
+    def stop(self) -> None:
+        self.stops += 1
+        self.active = False
+
+
+def _ptt_listener(
+    gnani: MockGnani, src: ListSource, got: list[Heard], **kw: object
+) -> VoiceListener:
+    args: dict[str, object] = {
+        "rest_stt": GnaniRestSTT(KEY, url=gnani.stt_url),
+        "stream_stt": lambda: GnaniStreamingSTT(KEY, url=gnani.stt_ws),
+        "offline_stt": FakeOffline(),
+        "spotter": None,
+        "wake_word": False,
+    }
+    args.update(kw)
+    lis = VoiceListener(src, on_heard=got.append, **args)  # type: ignore[arg-type]
+    lis.start()
+    return lis
+
+
+def test_server_vad_ends_the_command_without_commit(gnani: MockGnani) -> None:
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got)
+    try:
+        assert src.starts == 0  # mic closed until the key is pressed
+        lis.push_to_talk()
+        src.load(silence(0.3) + speech(1.2) + silence(1.0))
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    h = got[0]
+    assert h.text == gnani.transcript and h.via == "ptt" and h.error is None
+    call = gnani.calls[0]
+    assert "committed" not in call  # Gnani's VAD found the end of speech by itself
+    assert call["bad_frames"] == 0
+    assert src.starts == 1 and src.stops >= 1 and not src.active  # mic closed again
+    stages = h.timeline.stages()
+    assert stages[:2] == ["mic_open", "stream_open"] and "speech_start" in stages
+    assert stages.index("speech_end") < stages.index("stt")
+    assert h.timeline.info["gnani_latency_ms"] == [120]
+
+
+def test_two_push_to_talk_commands_in_a_row(gnani: MockGnani) -> None:
+    """The bug: after one command, voice never activated again."""
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got)
+    try:
+        for n in (1, 2, 3):
+            lis.push_to_talk()
+            src.load(speech(0.8) + silence(0.8))
+            wait_until(lambda n=n: len(got) == n, timeout=10)  # type: ignore[misc]
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert [h.text for h in got] == [gnani.transcript] * 3
+    assert gnani.count("stt-stream") == 3 and src.starts == 3 and not src.active
+
+
+def test_a_pause_mid_command_keeps_both_halves(gnani: MockGnani) -> None:
+    """Real smoke run: "open ... the fee receipt" came back as just "Open." because the
+    second segment started before the first transcript arrived."""
+    gnani.numbered_segments = True
+    gnani.transcript_delay_s = 0.5
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got)
+    try:
+        lis.push_to_talk()
+        src.load(speech(0.6) + silence(0.55) + speech(0.6, seed=1) + silence(1.0))
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert got[0].text == f"{gnani.transcript} 1 {gnani.transcript} 2"
+
+
+def test_second_press_commits(gnani: MockGnani) -> None:
+    gnani.stream_vad = False  # the server never ends it by itself
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got)
+    try:
+        lis.push_to_talk()
+        src.load(speech(1.0))
+        time.sleep(0.6)
+        lis.push_to_talk()  # pressed again: "that's it"
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert got[0].text == gnani.transcript and gnani.calls[0]["committed"]
+
+
+def test_nothing_said_reports_the_mic_and_level(
+    gnani: MockGnani, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zachary.voice import pipeline
+
+    monkeypatch.setattr(pipeline, "NO_SPEECH_S", 1.0)
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got)
+    try:
+        lis.push_to_talk()
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    h = got[0]
+    assert h.text == "" and h.error is not None and "didn't hear anything" in str(h.error)
+    assert "too quiet" in str(h.error) and float(h.timeline.info["mic_peak"]) > 0  # type: ignore[arg-type]
+    assert gnani.count("stt-rest") == 0  # nothing said: nothing transcribed
+
+
+@pytest.mark.parametrize("how", ["no_connection", "breaks_midway"])
+def test_stream_failure_falls_back_to_rest(gnani: MockGnani, how: str) -> None:
+    url = "ws://127.0.0.1:9/stt/v3/stream" if how == "no_connection" else gnani.stt_ws
+    if how == "breaks_midway":
+        gnani.stream_fail_after = 10
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got,
+                        stream_stt=lambda: GnaniStreamingSTT(KEY, url=url, connect_timeout=2))  # fmt: skip
+    try:
+        lis.push_to_talk()
+        src.load(silence(0.2) + speech(1.2) + silence(1.0))
+        wait_until(lambda: got, timeout=15)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert got[0].text == gnani.transcript and got[0].transcript is not None
+    assert got[0].transcript.provider == "gnani-rest" and gnani.count("stt-rest") == 1
+
+
+def test_listener_survives_a_crash_in_a_command(gnani: MockGnani) -> None:
+    class Exploding:
+        name = "boom"
+
+        def transcribe(self, pcm: bytes, sample_rate: int = SAMPLE_RATE) -> Transcript:
+            raise RuntimeError("unexpected")
+
+    src = CountingSource()
+    got: list[Heard] = []
+    states: list[str] = []
+    lis = _ptt_listener(gnani, src, got, stream_stt=None, rest_stt=Exploding(),
+                        offline_stt=None, on_state=states.append)  # fmt: skip
+    try:
+        lis.push_to_talk()
+        src.load(speech(0.8) + silence(1.0))
+        wait_until(lambda: any(s.startswith("error: voice command failed") for s in states))
+        assert lis.is_alive() and src.stops == 1  # the mic was still closed
+        lis.rest_stt = GnaniRestSTT(KEY, url=gnani.stt_url)
+        lis.push_to_talk()
+        src.load(speech(0.8) + silence(1.0))
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert got[0].text == gnani.transcript
+
+
+# -- playback ---------------------------------------------------------------------------------
+class FakeOut:
+    def __init__(self) -> None:
+        self.written = bytearray()
+        self.opened = 0
+
+    def open(self, sr: int) -> FakeOut:
+        self.opened += 1
+        return self
+
+    def write(self, pcm: bytes) -> None:
+        time.sleep(len(pcm) / 2 / 24000 / 20)  # "plays" 20x faster than real time
+        self.written += pcm
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+def test_player_stop_when_idle_does_not_eat_the_next_reply() -> None:
+    """The bug: stop() left a marker that made the next reply silent (it then came
+    out with the following command, 'really late')."""
+    from zachary.voice.audio import Player
+
+    out = FakeOut()
+    p = Player(open_stream=out.open)
+    p.stop()  # push-to-talk pressed while nothing was playing
+    p.stop()
+    p.play(b"\1\0" * 4800, 24000)
+    p.end()
+    assert p.wait(5) and len(out.written) == 9600 and p.first_audio_at is not None
+    p.play(b"\2\0" * 2400, 24000)  # next reply: same open stream, no new device open
+    p.end()
+    assert p.wait(5) and len(out.written) == 9600 + 4800 and out.opened == 1
+
+
+def test_player_stop_drops_the_old_reply() -> None:
+    from zachary.voice.audio import Player
+
+    out = FakeOut()
+    p = Player(open_stream=out.open)
+    p.play(b"\1\0" * 240000, 24000)  # 10 s
+    time.sleep(0.05)
+    p.stop()
+    p.play(b"\2\0" * 2400, 24000)
+    p.end()
+    assert p.wait(5)
+    time.sleep(0.1)
+    assert len(out.written) < 480000  # the old reply was cut short
+    assert out.written.endswith(b"\2\0" * 2400)  # and the new one played in full
+
+
+def test_mic_routing_does_not_leak_to_playback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from zachary.voice.audio import _routed_to
+
+    monkeypatch.delenv("PIPEWIRE_NODE", raising=False)
+    with _routed_to("bluez_input.88:D6"):
+        assert os.environ["PIPEWIRE_NODE"] == "bluez_input.88:D6"
+        assert "Communication" in os.environ["PIPEWIRE_PROPS"]
+    assert "PIPEWIRE_NODE" not in os.environ and "PIPEWIRE_PROPS" not in os.environ
+
+
+def test_bluetooth_profile_restored_after_a_grace_period(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zachary.voice import audio
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("shutil.which", lambda _n: None)  # no pactl: only our bookkeeping
+    monkeypatch.setattr(audio, "_set_profile",
+                        lambda card, prof: calls.append((card, prof)))  # fmt: skip
+    audio._restore_later("bluez_card.88_D6", "a2dp-sink", delay=0.3)
+    # A new command within the grace period: still in headset mode, nothing restored.
+    assert audio._bt_headset_profile("bluez_input.88:D6") == ("bluez_card.88_D6", "a2dp-sink")
+    time.sleep(0.5)
+    assert calls == []
+    audio._restore_later("bluez_card.88_D6", "a2dp-sink", delay=0.1)
+    time.sleep(0.4)
+    assert calls == [("bluez_card.88_D6", "a2dp-sink")]
+
+
+# -- assistant: push-to-talk twice through the real engine and bar ---------------------------
+def test_push_to_talk_twice_through_the_assistant(
+    qtbot: object, gnani: MockGnani, store: FileStore, home: Path, db_path: Path,
+    fake_platform: FakePlatform, tmp_path: Path,
+) -> None:  # fmt: skip
+    from zachary.ui.engine import Engine
+    from zachary.ui.quickbar import QuickBar
+    from zachary.ui.voice import VoiceController
+    from zachary.voice.factory import VoiceKit
+
+    write(home / "College" / "Fee Receipt Sem 5.pdf", mtime=time.time() - 86400 * 100)
+    write(home / "code" / "app" / "pyproject.toml", mtime=time.time() - 3600)
+    scan(store)
+    engine = Engine(db_path, fake_platform, semantic_factory=lambda _c, _cfg: None)
+    engine.start()
+    bar = QuickBar(engine)
+    tts = GnaniWsTTS(KEY, url=gnani.tts_ws)
+    kit = VoiceKit(
+        rest_stt=GnaniRestSTT(KEY, url=gnani.stt_url),
+        stream_stt=lambda: GnaniStreamingSTT(KEY, url=gnani.stt_ws),
+        offline_stt=FakeOffline(), spotter=FakeSpotter(),  # type: ignore[arg-type]
+        tts=tts, ledger=UsageLedger(None), has_key=True,
+    )  # fmt: skip
+    out = FakeOut()
+    from zachary.voice.audio import Player
+
+    voice = VoiceController(engine, bar, kit, wake_word=False, latency_path=tmp_path / "l.jsonl",
+                            player=Player(open_stream=out.open))  # fmt: skip
+    records: list[dict[str, object]] = []
+    voice.spoken.connect(records.append)
+    src = CountingSource()
+    voice.start(src)
+    try:
+        for n, said in ((1, "open fee receipt"), (2, "show my projects")):
+            gnani.transcript = said
+            voice.push_to_talk()
+            src.load(speech(0.8) + silence(0.8))
+            qtbot.waitUntil(lambda n=n: len(records) == n, timeout=15000)  # type: ignore[attr-defined]
+    finally:
+        voice.stop()
+        engine.stop()
+    assert [p.name for p in fake_platform.opened] == ["Fee Receipt Sem 5.pdf"]
+    assert bar.edit.text() == "show my projects"
+    assert tts.connects == 1  # warmed once, reused for both replies
+    assert len(out.written) > 10000  # both replies actually played
+    stages = list(dict(records[1]["stages_ms"]))  # type: ignore[call-overload]
+    assert stages[:2] == ["mic_open", "stream_open"]
+    assert stages[-3:] == ["intent_search", "tts_first_audio", "tts_done"]
+    assert records[1]["audio_out_ms"] is not None and src.starts == 2
