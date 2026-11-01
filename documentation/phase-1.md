@@ -1,7 +1,6 @@
 # Phase 1: Metadata memory (report)
 
-Status: **complete, waiting for review.** Branch `phase-1` (https://github.com/zynssam/Zachary/tree/phase-1),
-not yet merged into `main`. CI is green on Linux and Windows (Python 3.11 and 3.12).
+Status: **complete and reviewed; merged into `main`.** CI is green on Linux and Windows (Python 3.11 and 3.12).
 
 ## 1. Goal and "done when"
 
@@ -44,7 +43,11 @@ the CLI, the inotify limit check, and the privacy controls.
 
 ## 3. Design decisions made (easy to change)
 
-1. **Hidden folders are not indexed by default** (`set index_hidden_folders true` turns them on). `~/AppData` is excluded on Windows, as are `site-packages`, `~/snap` and `~/go/pkg`.
+1. **Hidden folders stay excluded until they are un-hidden** (confirmed in review).
+   - "Hidden" means a dot-folder (`.config`, `.vscode`, ...) on any OS, and on Windows also a folder with the *hidden* attribute (e.g. `AppData`).
+   - Un-hiding makes a folder indexable automatically: renaming `.notes` → `notes`, or clearing the attribute. The watcher, catch-up and scans all pick this up. Hiding it again purges it.
+   - `set index_hidden_folders true` indexes hidden folders anyway.
+   - `~/AppData` (Windows), `site-packages`, `~/snap` and `~/go/pkg` are also excluded.
    - **Why:** on your real home folder, 120k of 129k entries were app data (VS Code extensions, Claude plugins, `site-packages`, browser caches). They polluted projects, recent and search.
    - **Effect:** 129,594 → 9,470 entries; first scan 23.5 s → 1.1 s; inotify watches 25,786 → 1,609.
    - Project markers like `.git` are still detected.
@@ -66,8 +69,8 @@ the CLI, the inotify limit check, and the privacy controls.
 |---|---|
 | `ruff check .` / `ruff format --check .` | clean |
 | `mypy zachary tests` (strict), also `--platform win32` | no issues (45 files) |
-| `pytest` on Linux (local + CI 3.11/3.12) | **149 passed, 4 skipped** (Windows-only tests) |
-| `pytest` on Windows CI 3.11/3.12 | **150 passed, 3 skipped** (Linux-only tests) |
+| `pytest` on Linux (local + CI 3.11/3.12) | **150 passed, 5 skipped** (Windows-only tests) |
+| `pytest` on Windows CI 3.11/3.12 | **152 passed, 3 skipped** (Linux-only tests) |
 
 ### 4.2 Test inventory (153 tests, 15 files; Phase 0 tests unchanged)
 
@@ -153,7 +156,7 @@ About the ranking in the benchmark: with 5,000 random "opened" events, several "
 - **The search benchmark had one 633 ms outlier in 1,200 queries** in one run (the next run's max was 72 ms); it looks like system noise.
 - **Benchmark data stays on disk:** `~/.cache/zachary-bench` (~250k empty files + DBs). `rm -rf ~/.cache/zachary-bench` removes it.
 
-## 7. Open questions for review
-1. Keep **hidden folders excluded by default**? It's the biggest quality change. The alternative is indexing them and adding more app-specific excludes.
-2. Is **Windows USN catch-up only when running with volume access (admin)** acceptable? Otherwise catch-up is the scan diff, ~7 s per 200k files.
-3. Merge `phase-1` into `main` after review?
+## 7. Review outcome
+1. Hidden folders: keep them excluded unless un-hidden. Done, including the Windows hidden attribute (`test_windows_hidden_attribute_folders`, `test_unhiding_a_folder_indexes_it`).
+2. Windows USN catch-up only with volume access (admin), otherwise the scan diff: left as designed (no objection in review).
+3. `phase-1` merged into `main` (fast-forward).
