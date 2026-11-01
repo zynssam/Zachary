@@ -61,6 +61,36 @@ class FrameSource(Protocol):
 class MicSource:
     def __init__(self, mic: MicStream | None = None, device: str = "") -> None:
         self.mic = mic or MicStream(device)
+        self.auto = mic is None and not device  # free to try other mics
+        self._tried: set[str] = set()
+
+    def try_next(self) -> str | None:
+        """The current mic gives digital silence (e.g. a laptop mic with no Linux
+        driver): switch to the next real microphone. Returns its name, or None."""
+        if not self.auto:
+            return None
+        from zachary.voice.audio import list_inputs
+
+        self._tried.add(self.mic.source_name or self.mic.device or "<default>")
+        try:
+            current_default = [d.id for d in list_inputs() if d.is_default]
+            self._tried.update(current_default if not self.mic.source_name else [])
+            options = [d for d in list_inputs() if d.id not in self._tried]
+        except Exception:
+            return None
+        # Prefer a headset mic (what the user is wearing), then anything else.
+        options.sort(key=lambda d: not d.id.startswith("bluez_input"))
+        for d in options:
+            self._tried.add(d.id)
+            self.mic.stop()
+            self.mic.drain()
+            self.mic = MicStream(d.id)
+            try:
+                self.mic.start()
+            except Exception:
+                continue
+            return d.label
+        return None
 
     def start(self) -> None:
         self.mic.start()
@@ -141,6 +171,13 @@ class VoiceListener(threading.Thread):
             return
         self._zero_frames += 1
         if not self._warned_silent and self._zero_frames >= SILENT_FRAMES:
+            self._zero_frames = 0
+            try_next = getattr(self.source, "try_next", None)
+            switched = try_next() if try_next is not None else None
+            if switched:
+                log.info("microphone was silent; switched to %s", switched)
+                self.on_state(f"info: using microphone {switched}")
+                return
             self._warned_silent = True
             self.on_state(
                 "error: the microphone is silent (check the input device in Sound settings)"

@@ -96,6 +96,8 @@ class VoiceController(QObject):
             self.bar.status.setText(STATE_TEXT[state])
         elif state == "thinking":
             self.bar.status.setText(STATE_TEXT[state])
+        elif state.startswith("info"):
+            log.info("voice: %s", state)
         elif state.startswith("error"):
             log.warning("voice: %s", state)
             self.bar.status.setText(state)

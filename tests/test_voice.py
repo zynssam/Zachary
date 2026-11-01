@@ -477,3 +477,27 @@ def test_input_device_choice(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(audio, "_pactl_sources", lambda: (srcs, "alsa_input.pci.analog-stereo"))
     assert audio.resolve_input("") == (None, "")  # a real default: follow the system
     assert [d.is_default for d in audio.list_inputs()] == [True, False]
+
+
+def test_silent_microphone_switches_to_another() -> None:
+    """Laptop mic without a driver (zeros) -> the listener asks the source for the next mic."""
+
+    class TwoMics(ListSource):
+        switched = False
+
+        def try_next(self) -> str | None:
+            self.switched = True
+            return "Bullets Z2"
+
+    states: list[str] = []
+    src = TwoMics(b"\0" * int(3.5 * SAMPLE_RATE) * 2)
+    lis = VoiceListener(src, on_heard=lambda _h: None, on_state=states.append, rest_stt=None,
+                        stream_stt=None, offline_stt=None, spotter=None)  # fmt: skip
+    lis.start()
+    deadline = time.monotonic() + 10
+    while "info: using microphone Bullets Z2" not in states:
+        assert time.monotonic() < deadline, states
+        time.sleep(0.05)
+    lis.stop()
+    lis.join(5)
+    assert src.switched and not any(s.startswith("error") for s in states)
