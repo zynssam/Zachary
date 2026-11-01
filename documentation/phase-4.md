@@ -56,6 +56,8 @@ Voice is **off by default** (`voice_enabled false`). Turn it on with `python -m 
 | Check | Result |
 |---|---|
 | ruff / ruff format / mypy strict (+ `--platform win32`) | clean |
+| Linux CI 3.11 / 3.12 | 351 passed, 9 skipped / **354 passed, 6 skipped** (+ real whisper wake-word tests) |
+| Windows CI 3.11 / 3.12 | 349 passed, 11 skipped |
 | Voice tests (`test_voice.py`) | all pass: clients, error mapping (no retry), streaming frame sizes, TTS header stripping, `speakable`, VAD, wake-phrase rules, every pipeline path, offline fallback, the "done when" end to end through the real Engine and quick bar, the real-API guard |
 | Real whisper tests (`ZACHARY_TEST_WHISPER=1`) | pass locally; CI runs them on Linux 3.12 (espeak-ng + cached model) |
 | Handler tests | all pass, including 3 new confidence-rule tests |
