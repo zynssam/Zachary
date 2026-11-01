@@ -301,9 +301,15 @@ class FileStore:
 
     def insert(self, e: Entry, parent_id: int | None, root: str | None = None) -> int:
         ext, kind = classify(e.name, e.is_dir)
+        # Upsert: if the row appeared since the caller looked (a race between event
+        # batches), update it in place instead of failing the whole batch.
         cur = self.conn.execute(
             "INSERT INTO files(path, parent_id, name, ext, size, mtime, ctime, inode, dev,"
-            " kind, is_dir, indexed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+            " kind, is_dir, indexed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(path) DO UPDATE SET parent_id = excluded.parent_id,"
+            " size = excluded.size, mtime = excluded.mtime, ctime = excluded.ctime,"
+            " inode = excluded.inode, dev = excluded.dev, indexed_at = excluded.indexed_at"
+            " RETURNING id",
             (
                 e.path,
                 parent_id,
@@ -320,7 +326,7 @@ class FileStore:
             ),
         )
         file_id = int(cur.fetchone()[0])
-        self._fts_put(file_id, e.path, e.name, root or self.root_for(e.path), fresh=True)
+        self._fts_put(file_id, e.path, e.name, root or self.root_for(e.path))
         return file_id
 
     def update(self, row_id: int, e: Entry) -> None:

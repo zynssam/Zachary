@@ -43,7 +43,7 @@ def toggle_cmd() -> list[str]:
     return [sys.executable, "-m", "zachary.assistant", "--toggle"]
 
 
-def send_to_running(message: bytes, timeout_ms: int = 1000) -> bool:
+def send_to_running(message: bytes, timeout_ms: int = 3000) -> bool:
     """Deliver a command to an already-running assistant and wait for its "ok".
 
     Waiting for the reply matters on Windows: with named pipes, a client that
@@ -79,10 +79,11 @@ def serve_commands(server: QLocalServer, handlers: dict[bytes, Callable[[], None
                 return
             cmd = bytes(buf).split(b"\n", 1)[0].strip()
             fn = handlers.get(cmd)
-            if fn is not None:
-                fn()
+            # Acknowledge first, act on the next loop turn: the sender is waiting.
             sock.write(b"ok\n" if fn is not None or cmd == b"ping" else b"unknown\n")
             sock.flush()
+            if fn is not None:
+                QTimer.singleShot(0, fn)
 
         sock.readyRead.connect(handle)
         sock.disconnected.connect(sock.deleteLater)

@@ -165,7 +165,8 @@ class InotifyTree:
     def stop(self) -> None:
         with contextlib.suppress(OSError):
             os.write(self._w, b"x")
-        self._thread.join(timeout=3)
+        if self._thread.is_alive():
+            self._thread.join(timeout=3)
         with contextlib.suppress(OSError):
             os.close(self.fd)
         for f in (self._r, self._w):

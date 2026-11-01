@@ -37,6 +37,7 @@ def test_send_to_running(qtbot: QtBot, instance: str) -> None:
     t.start()
     qtbot.waitUntil(lambda: bool(result), timeout=5000)
     t.join()
+    qtbot.waitUntil(lambda: bool(got), timeout=2000)  # the handler runs after the ack
     assert result == [True] and got == ["toggle"]
     server.close()
 
