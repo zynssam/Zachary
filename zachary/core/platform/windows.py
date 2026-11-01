@@ -109,36 +109,39 @@ _GENERIC_READ = 0x80000000
 _FILE_READ_ATTRIBUTES = 0x80
 _FILE_SHARE_RW = 0x1 | 0x2
 _OPEN_EXISTING = 3
-_USN_RECORD_V2 = struct.Struct("<IHHQQqqIIIIHH")  # 60 bytes
+_USN_RECORD_V2 = struct.Struct("<IHHQQqqIIIIHH")  # 60 bytes, 64-bit file ids
+_USN_RECORD_V3 = struct.Struct("<IHH16s16sqqIIIIHH")  # 76 bytes, 128-bit file ids
 _READ_BUF = 1 << 16
 
 
 def parse_usn_records(buf: bytes, n: int) -> tuple[int, list[JournalRecord]]:
-    """Parse a FSCTL_READ_USN_JOURNAL output buffer: (next usn, V2 records)."""
+    """Parse a FSCTL_READ_USN_JOURNAL output buffer: (next usn, V2/V3 records).
+
+    V3 records carry 128-bit file ids; they are returned as ints (callers fold them
+    the same way as ``st_ino``).
+    """
     next_usn = struct.unpack_from("<q", buf, 0)[0]
     out: list[JournalRecord] = []
     off = 8
-    while off + _USN_RECORD_V2.size <= n:
-        (
-            length,
-            major,
-            _minor,
-            frn,
-            parent,
-            _usn,
-            _ts,
-            reason,
-            _src,
-            _sec,
-            _attr,
-            name_len,
-            name_off,
-        ) = _USN_RECORD_V2.unpack_from(buf, off)
-        if length == 0:
+    while off + 8 <= n:
+        length, major = struct.unpack_from("<IH", buf, off)
+        if length == 0 or off + length > n:
             break
-        if major == 2:
-            name = buf[off + name_off : off + name_off + name_len].decode("utf-16-le", "replace")
-            out.append(JournalRecord(frn, parent, name, reason))
+        frn: int
+        parent: int
+        if major == 2 and length >= _USN_RECORD_V2.size:
+            v2 = _USN_RECORD_V2.unpack_from(buf, off)
+            frn, parent, reason, name_len, name_off = v2[3], v2[4], v2[7], v2[11], v2[12]
+        elif major == 3 and length >= _USN_RECORD_V3.size:
+            v3 = _USN_RECORD_V3.unpack_from(buf, off)
+            frn = int.from_bytes(v3[3], "little")
+            parent = int.from_bytes(v3[4], "little")
+            reason, name_len, name_off = v3[7], v3[11], v3[12]
+        else:
+            off += length
+            continue
+        name = buf[off + name_off : off + name_off + name_len].decode("utf-16-le", "replace")
+        out.append(JournalRecord(frn, parent, name, reason))
         off += length
     return next_usn, out
 

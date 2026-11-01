@@ -12,7 +12,7 @@ import pytest
 
 from tests.fakes import write
 from zachary.core.config import Config
-from zachary.indexer.catchup import catch_up
+from zachary.indexer.catchup import catch_up, load_cursor
 from zachary.indexer.store import FileStore
 
 win_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
@@ -41,10 +41,21 @@ def test_usn_journal_catchup_end_to_end(conn: sqlite3.Connection, home: Path) ->
     new = home / "docs" / "new name.txt"
     os.rename(old, new)
     write(home / "docs" / "fresh.txt")
+    cursor = load_cursor(store, str(home))
+    assert cursor is not None
+    got = plat.read_journal(home, cursor)
+    assert got is not None
+    names = ("old name.txt", "new name.txt", "fresh.txt", "docs")
+    mine = [(r.frn, r.parent_frn, r.name, hex(r.reason)) for r in got[0] if r.name in names]
+    docs = store.get_row(store.norm(home / "docs"))
+    detail = (
+        f"row inode={row.inode} docs inode={docs.inode if docs else None}"
+        f" st_ino={os.stat(new).st_ino} total records={len(got[0])} mine={mine}"
+    )
     st = catch_up(store, plat)
     assert st.method[str(home)] == "journal", st.method
     moved = store.get_row(store.norm(new))
-    assert moved is not None and moved.id == row.id
+    assert moved is not None and moved.id == row.id, detail
     assert store.get_row(store.norm(home / "docs" / "fresh.txt")) is not None
     assert store.get_row(store.norm(old)) is None
 

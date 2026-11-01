@@ -135,3 +135,33 @@ def test_parse_usn_records() -> None:
         (11, 5, "नोट्स.txt", 0x2000),
     ]
     assert parse_usn_records(buf[:8], 8) == (4242, [])
+
+
+def _usn_record_v3(frn: int, parent: int, name: str, reason: int) -> bytes:
+    raw = name.encode("utf-16-le")
+    length = (76 + len(raw) + 7) // 8 * 8
+    rec = struct.pack(
+        "<IHH16s16sqqIIIIHH",
+        length,
+        3,
+        0,
+        frn.to_bytes(16, "little"),
+        parent.to_bytes(16, "little"),
+        1,
+        0,
+        reason,
+        0,
+        0,
+        0,
+        len(raw),
+        76,
+    )
+    return (rec + raw).ljust(length, b"\0")  # fmt: skip
+
+
+def test_parse_usn_records_v3_and_unknown_versions() -> None:
+    big = (7 << 64) | 99
+    unknown = struct.pack("<IHH", 16, 4, 0).ljust(16, b"\0")  # skipped by its length
+    buf = struct.pack("<q", 1) + _usn_record_v3(big, 5, "x.txt", 0x100) + unknown
+    _nxt, recs = parse_usn_records(buf, len(buf))
+    assert [(r.frn, r.parent_frn, r.name) for r in recs] == [(big, 5, "x.txt")]

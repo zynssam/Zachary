@@ -60,12 +60,27 @@ def test_first_scan_metadata_and_excludes(store: FileStore, home: Path) -> None:
     assert st.markers[str(home / "code" / "zach")] == {".git", "pyproject.toml"}
 
 
+def _meta(conn: sqlite3.Connection) -> dict[str, tuple[object, ...]]:
+    return {
+        str(r[0]): tuple(r[1:])
+        for r in conn.execute("SELECT path, is_dir, size, mtime, inode, dev FROM files")
+    }
+
+
 def test_rescan_unchanged_is_a_noop(store: FileStore, home: Path) -> None:
     make_tree(home)
     scan(store)
-    st = scan(store)
-    r = st.result
-    assert (r.inserted, r.updated, r.moved, r.deleted) == (0, 0, 0, 0)
+    before = _meta(store.conn)
+    r = scan(store).result
+    after = _meta(store.conn)
+    diff = {p: (before[p], after[p]) for p in before if before[p] != after.get(p)}
+    assert (r.inserted, r.moved, r.deleted) == (0, 0, 0), diff
+    if sys.platform == "win32":
+        # NTFS refreshes a folder's timestamp in its parent's index lazily, so a
+        # second scandir may see a newer folder mtime. Files must never differ.
+        assert all(before[p][0] == 1 for p in diff), diff
+    else:
+        assert r.updated == 0, diff
 
 
 def test_rescan_detects_new_modified_deleted(store: FileStore, home: Path) -> None:
