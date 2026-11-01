@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+
+# Qt tests run headless everywhere (CI and local) unless a platform is forced.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path

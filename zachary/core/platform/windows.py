@@ -7,16 +7,93 @@ Explorer open/reveal come later (see phase notes).
 
 from __future__ import annotations
 
+import logging
 import os
 import struct
+import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from zachary.core.hotkeys import Hotkey, HotkeyBackend, HotkeyCallback
 from zachary.core.platform import JournalCursor, JournalRecord, RecentItem, WatchLimit
 
-_NOT_YET = "not implemented yet (planned for phase {})"
+log = logging.getLogger(__name__)
+
+# --- Global hotkey: RegisterHotKey on a dedicated thread with its own message loop ----
+MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
+WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
+_HOTKEY_ID = 0x5A43  # "ZC"
+_VK_NAMED = {"space": 0x20, "return": 0x0D, "escape": 0x1B, "tab": 0x09, "backspace": 0x08}
+
+
+def hotkey_codes(hotkey: Hotkey) -> tuple[int, int]:
+    """(modifiers, virtual-key code) for RegisterHotKey."""
+    mods = MOD_NOREPEAT
+    for m, bit in (("alt", MOD_ALT), ("ctrl", MOD_CONTROL), ("shift", MOD_SHIFT),
+                   ("super", MOD_WIN)):  # fmt: skip
+        if m in hotkey.mods:
+            mods |= bit
+    k = hotkey.key
+    if k in _VK_NAMED:
+        vk = _VK_NAMED[k]
+    elif k.startswith("f") and k[1:].isdigit():
+        vk = 0x70 + int(k[1:]) - 1
+    else:
+        vk = ord(k.upper())  # A-Z and 0-9 map to their ASCII codes
+    return mods, vk
+
+
+class WindowsHotkey:
+    name = "win32-registerhotkey"
+
+    def __init__(self, hotkey: Hotkey, callback: HotkeyCallback) -> None:
+        self.hotkey = hotkey
+        self.callback = callback
+        self.error: str | None = None
+        self.ready = threading.Event()
+        self.thread_id: int | None = None
+        self._thread = threading.Thread(target=self._run, name="zach-hotkey", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        if sys.platform == "win32" and self.thread_id:
+            import ctypes
+
+            ctypes.windll.user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+        self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        if sys.platform != "win32":
+            self.error = "not Windows"
+            self.ready.set()
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        self.thread_id = kernel32.GetCurrentThreadId()
+        mods, vk = hotkey_codes(self.hotkey)
+        msg = wintypes.MSG()
+        # Make sure this thread has a message queue before anyone posts to it.
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+        if not user32.RegisterHotKey(None, _HOTKEY_ID, mods, vk):
+            self.error = f"{self.hotkey} is already used by another application"
+            self.ready.set()
+            return
+        self.ready.set()
+        try:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == WM_HOTKEY and msg.wParam == _HOTKEY_ID:
+                    self.callback(None)
+        finally:
+            user32.UnregisterHotKey(None, _HOTKEY_ID)
+
 
 # KNOWNFOLDERID GUIDs. Desktop/Documents may be redirected (e.g. to OneDrive).
 _FOLDERID = {
@@ -369,10 +446,58 @@ class WindowsPlatform:
         return iter(items)
 
     def open_path(self, path: Path) -> None:
-        raise NotImplementedError(_NOT_YET.format(2))
+        """Open with the associated app (ShellExecute; returns immediately)."""
+        if sys.platform == "win32":
+            os.startfile(str(path))
 
     def reveal_in_file_manager(self, path: Path) -> None:
-        raise NotImplementedError(_NOT_YET.format(2))
+        """Explorer with the item selected. Paths can't contain '"' on Windows."""
+        if sys.platform == "win32":
+            subprocess.Popen(f'explorer /select,"{path}"', close_fds=True)
+
+    def spawn_detached(self, argv: list[str]) -> None:
+        if sys.platform != "win32":
+            return
+        flags = (
+            subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_NO_WINDOW
+        )
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+
+    def try_lock(self, path: Path) -> object | None:
+        """Exclusive lock held for the process lifetime (single instance)."""
+        if sys.platform != "win32":
+            return None
+        import msvcrt
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "a+")  # noqa: SIM115 - kept open while the lock is held
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            f.close()
+            return None
+        return f
+
+    def ensure_app_registration(self, exec_argv: list[str]) -> None:
+        """Nothing needed for hotkeys on Windows (Start-menu entry comes with packaging)."""
+
+    def global_hotkey(
+        self, hotkey: Hotkey, callback: HotkeyCallback, description: str
+    ) -> HotkeyBackend:
+        return WindowsHotkey(hotkey, callback)
+
+    def hotkey_hint(self, toggle_cmd: list[str]) -> str:
+        return "Pick a different hotkey in settings (e.g. ctrl+alt+space)."
 
     def check_watch_limit(self, needed: int) -> WatchLimit:
         # ReadDirectoryChangesW has no per-user watch cap comparable to inotify.

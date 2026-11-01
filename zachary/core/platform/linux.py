@@ -7,19 +7,25 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import logging
 import os
 import platform as _platform
 import re
+import shlex
+import subprocess
 import sys
+import threading
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 
+from zachary.core.hotkeys import Hotkey, HotkeyBackend, HotkeyCallback
 from zachary.core.platform import JournalCursor, JournalRecord, RecentItem, WatchLimit
 
-_NOT_YET = "not implemented yet (planned for phase {})"
+log = logging.getLogger(__name__)
+
 
 # Real on-disk filesystems worth indexing. Network (nfs, cifs, sshfs), pseudo
 # (proc, tmpfs, overlay) and image (squashfs: snaps) filesystems are skipped.
@@ -162,6 +168,54 @@ def check_watch_limit_values(current: int | None, needed: int) -> WatchLimit:
     )
 
 
+DESKTOP_FILE_NAME = "ai.zachary.Zachary.desktop"
+
+
+def desktop_entry(exec_argv: list[str]) -> str:
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Zachary\n"
+        "Comment=Find and open your files by name, time or voice\n"
+        f"Exec={shlex.join(exec_argv)}\n"
+        "Icon=system-search\n"
+        "Terminal=false\n"
+        "Categories=Utility;\n"
+        "StartupNotify=false\n"
+    )
+
+
+def _show_items_dbus(uri: str) -> bool:
+    """org.freedesktop.FileManager1.ShowItems (Nautilus, Dolphin, Nemo, Thunar...)."""
+    try:
+        from jeepney import DBusAddress, new_method_call
+        from jeepney.io.blocking import open_dbus_connection
+
+        addr = DBusAddress(
+            "/org/freedesktop/FileManager1",
+            bus_name="org.freedesktop.FileManager1",
+            interface="org.freedesktop.FileManager1",
+        )
+        with open_dbus_connection(bus="SESSION") as conn:
+            reply = conn.send_and_get_reply(
+                new_method_call(addr, "ShowItems", "ass", ([uri], "")), timeout=3
+            )
+        return bool(reply.header.message_type.name == "method_return")
+    except Exception:
+        return False
+
+
+def _popen_quiet(argv: list[str]) -> None:
+    subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
 class LinuxPlatform:
     name = "linux"
     case_insensitive_paths = False
@@ -232,10 +286,66 @@ class LinuxPlatform:
         return iter(parse_xbel(text))
 
     def open_path(self, path: Path) -> None:
-        raise NotImplementedError(_NOT_YET.format(2))
+        """Open with the default app (non-blocking; xdg-open, never a shell)."""
+        _popen_quiet(["xdg-open", str(path)])
 
     def reveal_in_file_manager(self, path: Path) -> None:
-        raise NotImplementedError(_NOT_YET.format(2))
+        """Select the file in the file manager; fall back to opening its folder."""
+
+        def work() -> None:
+            if not _show_items_dbus(path.as_uri()):
+                _popen_quiet(["xdg-open", str(path.parent if not path.is_dir() else path)])
+
+        threading.Thread(target=work, name="zach-reveal", daemon=True).start()
+
+    def spawn_detached(self, argv: list[str]) -> None:
+        _popen_quiet(argv)
+
+    def try_lock(self, path: Path) -> object | None:
+        """Exclusive advisory lock held for the process lifetime (single instance)."""
+        if sys.platform == "win32":
+            return None
+        import fcntl
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "a+")  # noqa: SIM115 - kept open while the lock is held
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            return None
+        return f
+
+    def ensure_app_registration(self, exec_argv: list[str]) -> None:
+        """Install a user .desktop entry (needed for the portal to know our app id)."""
+        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+        target = Path(base) / "applications" / DESKTOP_FILE_NAME
+        content = desktop_entry(exec_argv)
+        try:
+            if target.exists() and target.read_text(encoding="utf-8") == content:
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        except OSError as e:
+            log.warning("could not write %s: %s", target, e)
+
+    def global_hotkey(
+        self, hotkey: Hotkey, callback: HotkeyCallback, description: str
+    ) -> HotkeyBackend:
+        """Wayland: XDG GlobalShortcuts portal. X11: XGrabKey."""
+        if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
+            from zachary.core.platform.linux_portal import PortalHotkey
+
+            return PortalHotkey(hotkey, callback, description)
+        from zachary.core.platform.linux_x11 import X11Hotkey
+
+        return X11Hotkey(hotkey, callback)
+
+    def hotkey_hint(self, toggle_cmd: list[str]) -> str:
+        return (
+            "If the shortcut doesn't work, add a custom shortcut in your desktop's keyboard "
+            f"settings that runs:\n  {shlex.join(toggle_cmd)}"
+        )
 
     def check_watch_limit(self, needed: int) -> WatchLimit:
         try:

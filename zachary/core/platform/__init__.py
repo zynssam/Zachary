@@ -13,6 +13,8 @@ from functools import cache
 from pathlib import Path
 from typing import Protocol
 
+from zachary.core.hotkeys import Hotkey, HotkeyBackend, HotkeyCallback
+
 
 @dataclass(frozen=True, slots=True)
 class RecentItem:
@@ -71,11 +73,11 @@ class Platform(Protocol):
         ...
 
     def open_path(self, path: Path) -> None:
-        """Open a file or folder with the default application (Phase 2)."""
+        """Open a file or folder with the default application (non-blocking)."""
         ...
 
     def reveal_in_file_manager(self, path: Path) -> None:
-        """Show a file selected in its folder (Phase 2)."""
+        """Show a file selected in its folder (non-blocking)."""
         ...
 
     def check_watch_limit(self, needed: int) -> WatchLimit:
@@ -84,6 +86,28 @@ class Platform(Protocol):
 
     def lower_process_priority(self) -> None:
         """Run the current process at low CPU/IO priority."""
+        ...
+
+    def spawn_detached(self, argv: list[str]) -> None:
+        """Start a background process that outlives us (no console window)."""
+        ...
+
+    def try_lock(self, path: Path) -> object | None:
+        """Take an exclusive single-instance lock; ``None`` if already held."""
+        ...
+
+    def ensure_app_registration(self, exec_argv: list[str]) -> None:
+        """Register the app with the desktop if a hotkey backend needs it."""
+        ...
+
+    def global_hotkey(
+        self, hotkey: Hotkey, callback: HotkeyCallback, description: str
+    ) -> HotkeyBackend:
+        """A not-yet-started global hotkey listener for this OS/session."""
+        ...
+
+    def hotkey_hint(self, toggle_cmd: list[str]) -> str:
+        """How to bind the hotkey manually if the automatic way fails."""
         ...
 
     def journal_cursor(self, root: Path) -> JournalCursor | None:

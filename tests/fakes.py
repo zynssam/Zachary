@@ -8,7 +8,23 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+from zachary.core.hotkeys import Hotkey, HotkeyBackend, HotkeyCallback
 from zachary.core.platform import JournalCursor, JournalRecord, RecentItem, WatchLimit
+
+
+class FakeHotkey:
+    name = "fake"
+
+    def __init__(self, callback: HotkeyCallback) -> None:
+        self.callback = callback
+        self.error: str | None = None
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def press(self, token: str | None = None) -> None:
+        self.callback(token)
 
 
 class FakePlatform:
@@ -23,6 +39,9 @@ class FakePlatform:
         self.journal: tuple[list[JournalRecord], JournalCursor] | None = None
         self.cursor: JournalCursor | None = None
         self.watch_limit = WatchLimit(True, None, None, "")
+        self.opened: list[Path] = []
+        self.revealed: list[Path] = []
+        self.spawned: list[list[str]] = []
 
     def data_dir(self) -> Path:
         return self.root / "data"
@@ -36,9 +55,27 @@ class FakePlatform:
     def recent_items(self) -> Iterator[RecentItem]:
         return iter(list(self.recent))
 
-    def open_path(self, path: Path) -> None: ...
+    def open_path(self, path: Path) -> None:
+        self.opened.append(path)
 
-    def reveal_in_file_manager(self, path: Path) -> None: ...
+    def reveal_in_file_manager(self, path: Path) -> None:
+        self.revealed.append(path)
+
+    def spawn_detached(self, argv: list[str]) -> None:
+        self.spawned.append(argv)
+
+    def try_lock(self, path: Path) -> object | None:
+        return object()
+
+    def ensure_app_registration(self, exec_argv: list[str]) -> None: ...
+
+    def global_hotkey(
+        self, hotkey: Hotkey, callback: HotkeyCallback, description: str
+    ) -> HotkeyBackend:
+        return FakeHotkey(callback)
+
+    def hotkey_hint(self, toggle_cmd: list[str]) -> str:
+        return "bind " + " ".join(toggle_cmd)
 
     def check_watch_limit(self, needed: int) -> WatchLimit:
         return self.watch_limit

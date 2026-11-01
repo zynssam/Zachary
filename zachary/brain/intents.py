@@ -1,0 +1,277 @@
+"""Fast, local intent parser: rules + light fuzzy matching. No network, no LLM.
+
+Phase 2 intents:
+  open           "open the fee receipt", "fee receipt kholo", "opne fees"
+  find           "find my DSA notes", "fees yesterday" (default when no verb)
+  show_projects  "show me all my projects", "mere projects dikhao"
+  recent         "recent files", "what did I open yesterday"
+Follow-ups (need a previous result list, see ``context.py``):
+  select         "open the second one", "doosra wala", "#3", "the last one"
+  reveal         "show its folder", "where is it", "iska folder kholo"
+  older / newer  "the older one", "purana wala", "the latest one"
+
+English, Hinglish and Kannada words are accepted; typos in command words are
+corrected (only command words, so a filename like "shop receipts" is left alone).
+``confidence`` < 0.7 marks a guess (Phase 6 can ask an LLM instead).
+"""
+
+from __future__ import annotations
+
+import difflib
+import re
+from dataclasses import dataclass, field
+
+from zachary.brain.timeparse import parse_time
+from zachary.search.hybrid import query_terms
+
+_TOKEN = re.compile(r"[#\w'ऀ-ॣ०-෿]+", re.UNICODE)
+
+OPEN_VERBS = frozenset(
+    """
+    open launch kholo khol kholna kholdo khole kholiye kholna tere teri terey tegi
+""".split()
+)
+FIND_VERBS = frozenset(
+    """
+    find search look locate where get fetch bring dhundo dhoondo dhundho dhoondh dhund
+    khojo hudukku huduku hudki
+""".split()
+)
+SHOW_VERBS = frozenset(
+    """
+    show list display see view dikhao dikha dikhana batao torisu toris thorisu
+""".split()
+)
+PROJECT_WORDS = frozenset("project projects repo repos repository repositories".split())
+RECENT_WORDS = frozenset("recent recently lately".split())
+FOLDER_WORDS = frozenset("folder directory location containing explorer finder".split())
+REVEAL_VERBS = frozenset("reveal locate".split())
+PRONOUNS = frozenset("it its it's that this isko usko ise use iska uska iski uski idu adu".split())
+OLDER = frozenset("older old earlier previous purana purani purane haleya hale".split())
+NEWER = frozenset("newer new latest newest naya nayi naye hosa hosadu".split())
+ORDINALS: dict[str, int] = {
+    "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3, "fourth": 4, "4th": 4,
+    "fifth": 5, "5th": 5, "sixth": 6, "6th": 6, "seventh": 7, "7th": 7, "eighth": 8, "8th": 8,
+    "ninth": 9, "9th": 9, "last": -1,
+    "pehla": 1, "pehli": 1, "pahla": 1, "pahli": 1, "doosra": 2, "dusra": 2, "doosri": 2,
+    "dusri": 2, "teesra": 3, "tisra": 3, "teesri": 3, "tisri": 3, "chautha": 4, "chauthi": 4,
+    "aakhri": -1, "akhri": -1,
+    "modala": 1, "modaladu": 1, "modalane": 1, "eradane": 2, "eradanedu": 2, "moorane": 3,
+    "mooraneya": 3, "mooranedu": 3, "koneya": -1, "konedu": -1,
+}  # fmt: skip
+NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+                "eight": 8, "nine": 9}  # fmt: skip
+# Words that carry no content in a command ("open *the* second *one* please").
+FILLER = frozenset(
+    """
+    the a an one ones please pls plz kindly now just me my mine for of on in to with
+    can could would will you i want need hey ok okay yo so and
+    wala wali wale waala waali ko ka ki ke ye yeh wo woh vo voh hai na zara jara bhai yaar ji
+    do de dena madu maadu maadi file files document doc item result option choice version
+    number no is was
+""".split()
+)
+PROJECT_FILLER = frozenset(
+    """
+    all every my mine files file across storage drive drives disk disks everywhere computer
+    laptop pc system list the of in on me mere meri saare sare sab sabhi nanna ella entire
+    whole ones code coding
+""".split()
+)
+RECENT_FILLER = frozenset(
+    """
+    what which did do i you open opened opening opens edit edited editing work worked working on
+    files file documents docs stuff things was were have had been the my me show list
+    recent recently lately last kya maine kholi khola kholi thi tha kaam kar raha rahi
+    opens forgot forget remember name named called
+    madida maadida madide maadide nodida noDida terede teredidde kelsa
+""".split()
+)
+
+# Command words eligible for typo correction: English only (Hinglish/Kannada verbs are
+# short and collide with ordinary words, e.g. "mere" vs "tere"), never content words.
+_FUZZY_VOCAB = sorted(
+    {"open", "launch", "find", "search", "locate", "show", "list", "display", "projects",
+     "project", "repository", "repositories", "recent", "recently", "folder", "directory",
+     "first", "second", "third", "fourth", "fifth", "older", "newer", "latest"}
+)  # fmt: skip
+_VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show", "list", "display"})
+
+
+@dataclass(frozen=True, slots=True)
+class Intent:
+    kind: str  # open | find | show_projects | recent | select | reveal | older | newer | none
+    query: str = ""  # text to search (time phrases included; search parses them)
+    ordinal: int | None = None  # 1-based; -1 = last
+    action: str = "open"  # for follow-ups: open | reveal
+    project_hint: bool = False  # "open the zachary project" -> prefer project folders
+    confidence: float = 1.0
+    corrected: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def is_followup(self) -> bool:
+        return self.kind in {"select", "reveal", "older", "newer"}
+
+
+def tokenize(text: str) -> list[str]:
+    out = []
+    for m in _TOKEN.finditer(text):
+        t = m.group(0).lower().strip("'")
+        if t.endswith("'s"):
+            t = t[:-2]  # "one's folder" -> "one"
+        if t:
+            out.append(t)
+    return out
+
+
+def _known(tok: str) -> bool:
+    from zachary.search.hybrid import STOPWORDS
+
+    return (
+        tok in FILLER or tok in PROJECT_FILLER or tok in RECENT_FILLER or tok in STOPWORDS
+        or tok in OPEN_VERBS or tok in FIND_VERBS or tok in SHOW_VERBS or tok in ORDINALS
+        or tok in OLDER or tok in NEWER or tok in PRONOUNS
+    )  # fmt: skip
+
+
+def _one_missing(tok: str, word: str) -> bool:
+    """``tok`` is ``word`` with exactly one letter left out ("oldr" / "older")."""
+    if len(word) != len(tok) + 1:
+        return False
+    return any(word[:i] + word[i + 1 :] == tok for i in range(len(word)))
+
+
+def _fix(tok: str, position: int) -> str:
+    """Correct a misspelled command word ("opne", "shwo", "porjects", "secnd").
+
+    Only English command words are targets; known words are never changed; verbs only
+    in the first two positions; 4-letter words only by transposition (so "shop" stays).
+    """
+    if len(tok) < 4 or tok in _FUZZY_VOCAB or _known(tok):
+        return tok
+    cutoff = 0.75 if len(tok) <= 5 else 0.8
+    for word in difflib.get_close_matches(tok, _FUZZY_VOCAB, n=3, cutoff=cutoff):
+        if abs(len(word) - len(tok)) > 1:
+            continue
+        if len(tok) <= 4 and sorted(tok) != sorted(word) and not _one_missing(tok, word):
+            continue
+        if word in _VERB_TARGETS and position > 1:
+            continue
+        return word
+    return tok
+
+
+def _ordinal(tokens: list[str]) -> tuple[int | None, set[int]]:
+    """Find an ordinal ("second", "2nd", "#2", "number 2", "open 2"); returns (n, token idxs)."""
+    for i, t in enumerate(tokens):
+        if t in ORDINALS:
+            return ORDINALS[t], {i}
+        if t.startswith("#") and t[1:].isdigit():
+            return int(t[1:]), {i}
+        if t.isdigit() and 0 < int(t) < 50:
+            prev = tokens[i - 1] if i else ""
+            if (
+                prev in {"number", "no", "item", "result", "option"}
+                or prev in OPEN_VERBS
+                or (i == len(tokens) - 1 and len(tokens) <= 3)
+            ):
+                return int(t), {i}
+        if t in NUMBER_WORDS and i and tokens[i - 1] in {"number", "no"}:
+            return NUMBER_WORDS[t], {i}
+    return None, set()
+
+
+def parse(text: str) -> Intent:
+    raw = tokenize(text)
+    raw = raw[_lead_fillers(raw) :]  # "hey zach, ..." / "please ..."
+    corrected: dict[str, str] = {}
+    toks: list[str] = []
+    for i, t in enumerate(raw):
+        f = _fix(t, i)
+        if f != t:
+            corrected[t] = f
+        toks.append(f)
+    conf = 0.8 if corrected else 1.0
+    if not toks:
+        return Intent("none", confidence=1.0)
+
+    has_open = any(t in OPEN_VERBS for t in toks)
+    has_find = any(t in FIND_VERBS for t in toks)
+    has_show = any(t in SHOW_VERBS for t in toks)
+    has_folder = any(t in FOLDER_WORDS for t in toks)
+    has_pronoun = any(t in PRONOUNS for t in toks)
+    older = any(t in OLDER for t in toks)
+    newer = any(t in NEWER for t in toks)
+    ordinal, ord_idx = _ordinal(toks)
+    verbs = OPEN_VERBS | FIND_VERBS | SHOW_VERBS | REVEAL_VERBS
+
+    # --- follow-ups: nothing but command words, ordinals and filler ---------------
+    content = [
+        t for i, t in enumerate(toks)
+        if i not in ord_idx and t not in FILLER and t not in verbs and t not in PRONOUNS
+        and t not in FOLDER_WORDS and t not in OLDER and t not in NEWER
+        and t not in {"where", "which", "kahan", "kidhar", "elli", "ide", "hai"}
+    ]  # fmt: skip
+    where_q = any(t in {"where", "kahan", "kidhar", "elli"} for t in toks)
+    if not content:
+        reveal = has_folder or where_q or any(t in REVEAL_VERBS for t in toks)
+        action = "reveal" if reveal else "open"
+        if ordinal is not None:
+            return Intent("select", ordinal=ordinal, action=action, confidence=conf,
+                          corrected=corrected)  # fmt: skip
+        if older or newer:
+            return Intent("older" if older else "newer", action=action, confidence=conf,
+                          corrected=corrected)  # fmt: skip
+        if reveal and (has_pronoun or has_folder or where_q):
+            return Intent("reveal", action="reveal", confidence=conf, corrected=corrected)
+        if has_pronoun and (has_open or has_show):
+            return Intent("select", ordinal=None, action="open", confidence=conf,
+                          corrected=corrected)  # fmt: skip
+
+    # --- projects -------------------------------------------------------------------
+    if any(t in PROJECT_WORDS for t in toks):
+        rest = [t for t in toks if t not in PROJECT_WORDS and t not in PROJECT_FILLER
+                and t not in verbs and t not in FILLER]  # fmt: skip
+        if not rest:
+            return Intent("show_projects", confidence=conf, corrected=corrected)
+        query = " ".join(t for t in raw if corrected.get(t, t) not in verbs and t not in FILLER)
+        return Intent("open" if has_open else "find", query=query, project_hint=True,
+                      confidence=conf, corrected=corrected)  # fmt: skip
+
+    # --- recent ---------------------------------------------------------------------
+    tp = parse_time(" ".join(toks))
+    leftover = [
+        t for t in query_terms(tp.rest)
+        if t not in RECENT_FILLER and t not in verbs and _fix(t, 0) not in verbs
+    ]  # fmt: skip
+    if (tp.range is not None or any(t in RECENT_WORDS for t in toks)) and not leftover:
+        # The handler re-parses the time phrase from the query.
+        return Intent("recent", query=" ".join(toks), confidence=conf, corrected=corrected)
+
+    # --- open / find ----------------------------------------------------------------
+    query = _strip_lead(" ".join(t for t, f in zip(raw, toks, strict=True) if f not in verbs))
+    if has_open:
+        return Intent("open", query=query, confidence=conf, corrected=corrected)
+    if has_find or has_show:
+        return Intent("find", query=query, confidence=conf, corrected=corrected)
+    return Intent("find", query=query, confidence=min(conf, 0.6), corrected=corrected)
+
+
+_LEAD = frozenset("hey ok okay zach zachary please pls plz can could would you".split())
+
+
+def _lead_fillers(tokens: list[str]) -> int:
+    n = 0
+    for t in tokens:
+        if t in _LEAD:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _strip_lead(query: str) -> str:
+    toks = query.split()
+    while toks and toks[0] in _LEAD:
+        toks.pop(0)
+    return " ".join(toks)

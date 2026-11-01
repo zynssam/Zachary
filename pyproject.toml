@@ -11,17 +11,21 @@ requires-python = ">=3.11"
 dependencies = [
     "sqlite-vec>=0.1.6",
     "watchdog>=4.0",
+    "PySide6-Essentials>=6.6",
+    "jeepney>=0.8; sys_platform == 'linux'",  # D-Bus: hotkey portal, file-manager reveal
 ]
 
 [project.scripts]
 zachary = "zachary.cli:main"
 zachary-indexer = "zachary.indexer.__main__:main"
+zachary-assistant = "zachary.assistant:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
     "ruff>=0.6",
     "mypy>=1.11",
+    "pytest-qt>=4.4",
 ]
 
 [tool.setuptools.packages.find]
@@ -53,8 +57,13 @@ packages = ["zachary"]
 module = ["zachary.core.platform", "zachary.core.platform.windows", "zachary.core.platform.linux"]
 warn_unreachable = false
 
+# pytest-qt's QtBot key/mouse helpers are untyped.
 [[tool.mypy.overrides]]
-module = ["sqlite_vec"]
+module = ["tests.test_ui"]
+disallow_untyped_calls = false
+
+[[tool.mypy.overrides]]
+module = ["sqlite_vec", "jeepney", "jeepney.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
