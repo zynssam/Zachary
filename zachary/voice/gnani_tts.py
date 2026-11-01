@@ -185,6 +185,7 @@ class GnaniWsTTS(_Base):
                         "Content-Type": "application/json",
                     },
                     open_timeout=self.timeout,
+                    close_timeout=1.0,  # don't wait 10 s on a dead/aborted stream
                     **extra,
                 )
             )

@@ -169,6 +169,7 @@ class GnaniStreamingSTT:
                     self.url,
                     additional_headers=headers,
                     open_timeout=self.connect_timeout,
+                    close_timeout=1.0,  # don't wait 10 s on a dead/aborted stream
                     **extra,
                 )
             )

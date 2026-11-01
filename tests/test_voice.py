@@ -443,3 +443,18 @@ def test_tests_cannot_reach_the_real_api() -> None:
     with pytest.raises(VoiceError) as e:
         GnaniRestSTT("not-a-key", ledger=ledger).transcribe(silence(0.5))
     assert e.value.kind == "network"
+
+
+def test_silent_microphone_is_reported() -> None:
+    """A monitor/virtual input gives exact zeros: say so instead of waiting forever."""
+    states: list[str] = []
+    lis = VoiceListener(ListSource(b"\0" * int(3.5 * SAMPLE_RATE) * 2), on_heard=lambda _h: None,
+                        on_state=states.append, rest_stt=None, stream_stt=None,
+                        offline_stt=None, spotter=None)  # fmt: skip
+    lis.start()
+    deadline = time.monotonic() + 10
+    while not any(s.startswith("error: the microphone is silent") for s in states):
+        assert time.monotonic() < deadline, states
+        time.sleep(0.05)
+    lis.stop()
+    lis.join(5)

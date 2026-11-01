@@ -34,6 +34,7 @@ PREROLL_S = 0.4  # audio kept from before speech starts, so the first word isn't
 COMMAND_WAIT_S = 5.0  # after a bare "Hey Zach", how long to wait for the command
 MAX_COMMAND_S = 12.0
 MIN_COMMAND_S = 0.35
+SILENT_FRAMES = int(3.0 * SAMPLE_RATE / 512)  # 3 s of exact zeros
 
 
 @dataclass(slots=True)
@@ -100,6 +101,8 @@ class VoiceListener(threading.Thread):
         self.vad = vad or EnergyVAD()
         self._stop_ev = threading.Event()
         self._ptt = threading.Event()
+        self._zero_frames = 0  # digital silence in a row: wrong input device or muted
+        self._warned_silent = False
 
     # -- control (any thread) -------------------------------------------------------
     def stop(self) -> None:
@@ -122,7 +125,26 @@ class VoiceListener(threading.Thread):
             self.source.stop()
 
     def _frame(self, timeout: float = 0.1) -> bytes | None:
-        return self.source.get(timeout)
+        f = self.source.get(timeout)
+        if f is not None:
+            self._check_silent(f)
+        return f
+
+    def _check_silent(self, frame: bytes) -> None:
+        """Real microphones always have some noise; exact zeros for 3 s mean the input
+        is a monitor/virtual device or muted. Say so once (until sound comes back)."""
+        if frame.count(0) != len(frame):
+            self._zero_frames = 0
+            if self._warned_silent:
+                self._warned_silent = False
+                self.on_state("idle")
+            return
+        self._zero_frames += 1
+        if not self._warned_silent and self._zero_frames >= SILENT_FRAMES:
+            self._warned_silent = True
+            self.on_state(
+                "error: the microphone is silent (check the input device in Sound settings)"
+            )
 
     def _loop(self) -> None:
         preroll: collections.deque[bytes] = collections.deque(
