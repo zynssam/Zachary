@@ -227,6 +227,35 @@ def resolve_input(choice: str) -> tuple[int | str | None, str]:
     return None, ""
 
 
+def _bt_headset_profile(source: str) -> tuple[str, str] | None:
+    """Put the earbuds in headset mode if they're in playback-only (A2DP) mode.
+    Returns (card, previous profile) so it can be restored when listening stops."""
+    if not shutil.which("pactl"):
+        return None
+    card = "bluez_card." + source.removeprefix("bluez_input.").split(".")[0].replace(":", "_")
+    try:
+        out = subprocess.run(["pactl", "-f", "json", "list", "cards"], capture_output=True,
+                             text=True, timeout=3, check=True).stdout  # fmt: skip
+        info = next((c for c in json.loads(out) if c.get("name") == card), None)
+        if info is None or "head" in str(info.get("active_profile", "")):
+            return None
+        profiles = [p for p in info.get("profiles", {}) if "head-unit" in p or "hfp" in p]
+        if not profiles:
+            return None
+        best = "headset-head-unit" if "headset-head-unit" in profiles else profiles[0]
+        subprocess.run(["pactl", "set-card-profile", card, best], timeout=3, check=False)
+        log.info("switched %s to %s for its microphone", card, best)
+        return card, str(info.get("active_profile"))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        log.debug("couldn't switch the Bluetooth profile", exc_info=True)
+        return None
+
+
+def _set_profile(card: str, profile: str) -> None:
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(["pactl", "set-card-profile", card, profile], timeout=3, check=False)
+
+
 class MicStream:
     """16 kHz mono microphone, delivering 1,024-byte frames on a queue.
 
@@ -240,6 +269,7 @@ class MicStream:
         self._stream: object | None = None
         self._buf = b""
         self.source_name = ""
+        self._restore: tuple[str, str] | None = None  # (bt card, profile) to switch back to
 
     def _callback(self, indata, _frames, _time, status) -> None:  # type: ignore[no-untyped-def]
         if status:
@@ -264,6 +294,12 @@ class MicStream:
                 os.environ[var] = source
             else:
                 os.environ.pop(var, None)
+        if source.startswith("bluez_input"):
+            # Bluetooth earbuds only have a working mic in headset (HFP) mode; marking
+            # the stream as a call makes PipeWire switch to it (and back afterwards).
+            os.environ["PIPEWIRE_PROPS"] = "{ media.role = Communication }"
+            os.environ["PULSE_PROP"] = "media.role=phone"
+            self._restore = _bt_headset_profile(source)
         self.source_name = source
         stream = sd.RawInputStream(
             samplerate=SAMPLE_RATE,
@@ -282,6 +318,9 @@ class MicStream:
         if s is not None:
             s.stop()  # type: ignore[attr-defined]
             s.close()  # type: ignore[attr-defined]
+        restore, self._restore = self._restore, None
+        if restore is not None:  # earbuds back to high-quality playback
+            _set_profile(*restore)
 
     def drain(self) -> None:
         while not self.frames.empty():
