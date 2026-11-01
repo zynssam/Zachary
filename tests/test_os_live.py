@@ -13,7 +13,7 @@ import pytest
 from tests.fakes import write
 from zachary.core.config import Config
 from zachary.indexer.catchup import catch_up, load_cursor
-from zachary.indexer.store import FileStore
+from zachary.indexer.store import FileStore, inode_key
 
 win_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only")
@@ -36,7 +36,7 @@ def test_usn_journal_catchup_end_to_end(conn: sqlite3.Connection, home: Path) ->
     old = home / "docs" / "old name.txt"
     row = store.get_row(store.norm(old))
     assert row is not None
-    assert row.inode == os.stat(old).st_ino  # FRN == st_ino, which journal mapping relies on
+    assert row.inode == inode_key(os.stat(old).st_ino)  # journal FRNs map via the same fold
     # Changes while "not running":
     new = home / "docs" / "new name.txt"
     os.rename(old, new)

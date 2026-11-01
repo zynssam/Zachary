@@ -10,7 +10,7 @@ import pytest
 
 from tests.fakes import write
 from zachary.indexer.scanner import scan, scan_subtree
-from zachary.indexer.store import FileStore
+from zachary.indexer.store import FileStore, inode_key
 
 
 def _ids(conn: sqlite3.Connection) -> dict[str, int]:
@@ -142,7 +142,7 @@ def test_recycled_inode_is_not_treated_as_move(store: FileStore, home: Path) -> 
     a.unlink()
     store.conn.execute(
         "UPDATE files SET inode = ?, dev = ? WHERE id = ?",
-        (os.lstat(b).st_ino, os.lstat(b).st_dev, row.id),
+        (inode_key(os.lstat(b).st_ino), inode_key(os.lstat(b).st_dev), row.id),
     )
     r = scan(store).result
     assert r.moved == 0 and r.inserted == 1 and r.deleted == 1
