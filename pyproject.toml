@@ -10,7 +10,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "sqlite-vec>=0.1.6",
+    "watchdog>=4.0",
 ]
+
+[project.scripts]
+zachary = "zachary.cli:main"
+zachary-indexer = "zachary.indexer.__main__:main"
 
 [project.optional-dependencies]
 dev = [
@@ -30,7 +35,9 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PTH", "C4"]
+# No PTH (pathlib) rules: hot paths (scanner, watcher, store) use str + os.path for speed.
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "C4"]
+ignore = ["SIM905"]  # word lists read better as """...""".split()
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]

@@ -32,6 +32,24 @@ class WatchLimit:
     message: str
 
 
+@dataclass(frozen=True, slots=True)
+class JournalCursor:
+    """Position in a volume change journal (Windows USN)."""
+
+    journal_id: int
+    next_usn: int
+
+
+@dataclass(frozen=True, slots=True)
+class JournalRecord:
+    """One change-journal record. ``frn``/``parent_frn`` equal ``os.stat().st_ino``."""
+
+    frn: int
+    parent_frn: int
+    name: str
+    reason: int
+
+
 class Platform(Protocol):
     name: str
     case_insensitive_paths: bool
@@ -49,7 +67,7 @@ class Platform(Protocol):
         ...
 
     def recent_items(self) -> Iterator[RecentItem]:
-        """Files the OS reports as recently used (Phase 1)."""
+        """Files the OS reports as recently used."""
         ...
 
     def open_path(self, path: Path) -> None:
@@ -61,11 +79,24 @@ class Platform(Protocol):
         ...
 
     def check_watch_limit(self, needed: int) -> WatchLimit:
-        """Check whether the OS can watch ``needed`` directories (Phase 1)."""
+        """Check whether the OS can watch ``needed`` directories."""
         ...
 
     def lower_process_priority(self) -> None:
-        """Run the current process at low CPU/IO priority (Phase 1)."""
+        """Run the current process at low CPU/IO priority."""
+        ...
+
+    def journal_cursor(self, root: Path) -> JournalCursor | None:
+        """Current change-journal position for the volume holding ``root``.
+
+        ``None`` if the OS/volume has no usable journal (then catch-up re-scans).
+        """
+        ...
+
+    def read_journal(
+        self, root: Path, since: JournalCursor
+    ) -> tuple[list[JournalRecord], JournalCursor] | None:
+        """Records since ``since``. ``None`` if unavailable, reset or wrapped (re-scan)."""
         ...
 
 
@@ -81,4 +112,11 @@ def get_platform() -> Platform:
     return LinuxPlatform()
 
 
-__all__ = ["Platform", "RecentItem", "WatchLimit", "get_platform"]
+__all__ = [
+    "JournalCursor",
+    "JournalRecord",
+    "Platform",
+    "RecentItem",
+    "WatchLimit",
+    "get_platform",
+]

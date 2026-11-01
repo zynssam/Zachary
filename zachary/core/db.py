@@ -9,10 +9,12 @@ Rules:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import sqlite_vec
 
@@ -196,7 +198,27 @@ CREATE TRIGGER trg_chunks_delete AFTER DELETE ON chunks BEGIN
 END;
 """
 
-MIGRATIONS: tuple[str, ...] = (_MIGRATION_1,)
+# Migration #2 (Phase 1):
+# - files_fts gets the porter stemmer so "fees" matches "Fee", and keeps combining
+#   marks (M*) inside words so Devanagari/Kannada names aren't split. Rows are rebuilt by
+#   the indexer (FileStore.ensure_fts) because tokens are computed in Python.
+# - files_fts_vocab exposes indexed terms for typo correction.
+# - state: indexer runtime state (journal cursors, config revision), not user settings.
+_MIGRATION_2 = """
+DROP TABLE files_fts;
+CREATE VIRTUAL TABLE files_fts USING fts5(
+    name, path_tokens, title, keywords,
+    tokenize = "porter unicode61 remove_diacritics 2 categories 'L* N* Co M*'",
+    prefix = '2 3'
+);
+CREATE VIRTUAL TABLE files_fts_vocab USING fts5vocab(files_fts, 'row');
+CREATE TABLE state (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL            -- JSON
+) WITHOUT ROWID;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_MIGRATION_1, _MIGRATION_2)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
@@ -283,3 +305,17 @@ def _split_statements(script: str) -> list[str]:
     if buf.strip():
         raise ValueError(f"incomplete SQL statement in migration: {buf[:80]!r}")
     return statements
+
+
+def get_state(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
+    """Read an indexer state value (JSON-decoded)."""
+    row = conn.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+    return default if row is None else json.loads(row[0])
+
+
+def set_state(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    conn.execute(
+        "INSERT INTO state(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, json.dumps(value)),
+    )

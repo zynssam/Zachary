@@ -1,47 +1,23 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from tests.fakes import FakePlatform
 from zachary.core.config import Config, ExcludeMatcher, Settings, default_db_path
-from zachary.core.platform import RecentItem, WatchLimit
 
 
-class FakePlatform:
-    name = "fake"
-    case_insensitive_paths = False
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-
-    def data_dir(self) -> Path:
-        return self.root / "data"
-
-    def default_index_roots(self) -> list[Path]:
-        return [self.root / "home"]
-
-    def system_excludes(self) -> list[str]:
-        return [str(self.root / "sys")]
-
-    def recent_items(self) -> Iterator[RecentItem]:
-        return iter(())
-
-    def open_path(self, path: Path) -> None: ...
-
-    def reveal_in_file_manager(self, path: Path) -> None: ...
-
-    def check_watch_limit(self, needed: int) -> WatchLimit:
-        return WatchLimit(True, None, None, "")
-
-    def lower_process_priority(self) -> None: ...
+def _platform(root: Path) -> FakePlatform:
+    p = FakePlatform(root)
+    p.case_insensitive_paths = False  # these tests compare plain paths on every OS
+    return p
 
 
 @pytest.fixture
 def cfg(conn: sqlite3.Connection, tmp_path: Path) -> Config:
-    c = Config(conn, FakePlatform(tmp_path))
+    c = Config(conn, _platform(tmp_path))
     c.seed_defaults()
     return c
 
@@ -128,4 +104,4 @@ def test_default_db_path_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setenv("ZACHARY_DB", str(tmp_path / "x.db"))
     assert default_db_path() == tmp_path / "x.db"
     monkeypatch.delenv("ZACHARY_DB")
-    assert default_db_path(FakePlatform(tmp_path)) == tmp_path / "data" / "zachary.db"
+    assert default_db_path(_platform(tmp_path)) == tmp_path / "data" / "zachary.db"

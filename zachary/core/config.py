@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from zachary.core.db import transaction
+from zachary.core.db import get_state, transaction
 from zachary.core.platform import Platform, get_platform
 
 ExcludeKind = Literal["dirname", "glob", "path"]
@@ -151,7 +151,7 @@ def default_db_path(platform: Platform | None = None) -> Path:
 def normalize_path(path: str | Path, *, case_insensitive: bool) -> str:
     """Absolute, normalized path string used as the canonical key."""
     # abspath, not resolve(): symlinks must keep the path the user sees.
-    p = os.path.normpath(os.path.abspath(os.fspath(path)))  # noqa: PTH100
+    p = os.path.normpath(os.path.abspath(os.fspath(path)))
     return os.path.normcase(p) if case_insensitive else p
 
 
@@ -173,6 +173,19 @@ def collapse_roots(roots: Iterable[str]) -> list[str]:
     return sorted(out)
 
 
+def canonical_path(path: str | os.PathLike[str], *, case_insensitive: bool) -> str:
+    """Absolute, normalized path in its on-disk spelling, as stored in ``files.path``.
+
+    On case-insensitive systems (Windows) the real case is looked up for the part of
+    the path that exists, so paths from different sources (scandir, watcher, Recent
+    Items) agree. Case is never folded here; use :func:`normalize_path` for rule matching.
+    """
+    p = os.path.normpath(os.path.abspath(os.fspath(path)))
+    if case_insensitive:
+        p = os.path.realpath(p)
+    return p
+
+
 @dataclass(frozen=True, slots=True)
 class ExcludeMatcher:
     """Fast, precompiled exclude check used on the scanner/watcher hot path."""
@@ -181,6 +194,7 @@ class ExcludeMatcher:
     glob_re: re.Pattern[str] | None
     paths: tuple[str, ...]  # normalized; matched as prefixes on path boundaries
     case_insensitive: bool
+    path_set: frozenset[str] = frozenset()
 
     @classmethod
     def build(
@@ -198,7 +212,9 @@ class ExcludeMatcher:
             flags = re.IGNORECASE if case_insensitive else 0
             glob_re = re.compile("|".join(fnmatch.translate(g) for g in globs), flags)
         norm = tuple(sorted({normalize_path(p, case_insensitive=case_insensitive) for p in paths}))
-        return cls(frozenset(fold(d) for d in dirnames), glob_re, norm, case_insensitive)
+        return cls(
+            frozenset(fold(d) for d in dirnames), glob_re, norm, case_insensitive, frozenset(norm)
+        )
 
     def excludes_name(self, name: str, *, is_dir: bool) -> bool:
         """Check by entry name only (cheap; for use inside ``os.scandir`` loops)."""
@@ -207,8 +223,16 @@ class ExcludeMatcher:
         return self.glob_re is not None and self.glob_re.match(name) is not None
 
     def excludes_path(self, path: str) -> bool:
-        """Check whether ``path`` (already normalized) is at/under an excluded path."""
+        """Check whether ``path`` is at/under an excluded path."""
+        if self.case_insensitive:
+            path = os.path.normcase(path)
         return any(is_under(path, p) for p in self.paths)
+
+    def excludes_exact(self, path: str) -> bool:
+        """O(1) check for a path rule on exactly ``path`` (top-down walks only need this)."""
+        if not self.path_set:
+            return False
+        return (os.path.normcase(path) if self.case_insensitive else path) in self.path_set
 
     def is_excluded(self, path: str | Path, *, is_dir: bool) -> bool:
         """Full check for a single path: excluded path prefix, or any excluded component."""
@@ -233,6 +257,24 @@ class Config:
     # -- helpers -----------------------------------------------------------
     def _norm(self, path: str | Path) -> str:
         return normalize_path(path, case_insensitive=self.platform.case_insensitive_paths)
+
+    def normalize(self, path: str | Path) -> str:
+        """Case-folded (on Windows) path used to match rules. Not for storage."""
+        return self._norm(path)
+
+    def canonical(self, path: str | os.PathLike[str]) -> str:
+        """Path as stored in ``files.path`` (real on-disk case)."""
+        return canonical_path(path, case_insensitive=self.platform.case_insensitive_paths)
+
+    def config_rev(self) -> int:
+        """Revision counter bumped on every config change; the indexer polls it to reload."""
+        return int(get_state(self.conn, "config_rev", 0))
+
+    def _bump(self) -> None:
+        self.conn.execute(
+            "INSERT INTO state(key, value) VALUES ('config_rev', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1"
+        )
 
     # -- settings ----------------------------------------------------------
     def seed_defaults(self) -> None:
@@ -266,6 +308,7 @@ class Config:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, json.dumps(value)),
         )
+        self._bump()
 
     def load(self) -> Settings:
         stored = {
@@ -284,10 +327,10 @@ class Config:
         """
         stored: list[str] = self.get_setting("index_roots")
         raw = stored or [str(r) for r in self.platform.default_index_roots()]
-        return [Path(r) for r in collapse_roots(self._norm(r) for r in raw)]
+        return [Path(r) for r in collapse_roots(self.canonical(r) for r in raw)]
 
     def set_index_roots(self, roots: Iterable[str | Path]) -> None:
-        self.set_setting("index_roots", sorted({self._norm(r) for r in roots}))
+        self.set_setting("index_roots", sorted({self.canonical(r) for r in roots}))
 
     # -- exclude rules -----------------------------------------------------
     def add_exclude(self, pattern: str | Path, kind: ExcludeKind = "path") -> None:
@@ -297,6 +340,7 @@ class Config:
             "ON CONFLICT(pattern, kind) DO UPDATE SET enabled = 1",
             (pat, kind),
         )
+        self._bump()
 
     def set_exclude_enabled(self, pattern: str | Path, kind: ExcludeKind, enabled: bool) -> None:
         pat = self._norm(pattern) if kind == "path" else str(pattern)
@@ -304,6 +348,7 @@ class Config:
             "UPDATE exclude_rules SET enabled = ? WHERE pattern = ? AND kind = ?",
             (int(enabled), pat, kind),
         )
+        self._bump()
 
     def remove_exclude(self, pattern: str | Path, kind: ExcludeKind = "path") -> None:
         """Delete a user rule. Default rules can only be disabled."""
@@ -312,6 +357,16 @@ class Config:
             "DELETE FROM exclude_rules WHERE pattern = ? AND kind = ? AND source = 'user'",
             (pat, kind),
         )
+        self._bump()
+
+    def list_excludes(self) -> list[tuple[str, str, str, bool]]:
+        """(pattern, kind, source, enabled) for every exclude rule."""
+        return [
+            (r[0], r[1], r[2], bool(r[3]))
+            for r in self.conn.execute(
+                "SELECT pattern, kind, source, enabled FROM exclude_rules ORDER BY kind, pattern"
+            )
+        ]
 
     def exclude_matcher(self, roots: Iterable[str | Path] | None = None) -> ExcludeMatcher:
         """Build the matcher for scanning ``roots`` (default: :meth:`index_roots`).
@@ -342,11 +397,13 @@ class Config:
         self.conn.execute(
             "INSERT OR IGNORE INTO folder_rules(path, rule) VALUES (?, ?)", (self._norm(path), rule)
         )
+        self._bump()
 
     def remove_folder_rule(self, path: str | Path, rule: FolderRule) -> None:
         self.conn.execute(
             "DELETE FROM folder_rules WHERE path = ? AND rule = ?", (self._norm(path), rule)
         )
+        self._bump()
 
     def folder_rules_for(self, path: str | Path) -> set[str]:
         """Rules that apply to ``path``: those set on it or on any ancestor folder."""
