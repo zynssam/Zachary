@@ -100,31 +100,19 @@ def test_linux_watch_limit_reads_proc() -> None:
 
 
 @win_only
-def test_usn_diagnostics(home: Path) -> None:
-    """Which journal read works on this machine, and does it see our own changes?"""
+def test_usn_read_sees_create_and_rename(home: Path) -> None:
     from zachary.core.platform import windows as w
 
     cur = w._usn_cursor(home)
     if cur is None:
-        pytest.skip("USN journal not readable")
+        pytest.skip("USN journal not readable (needs volume read access)")
     a = write(home / "diag_a.txt")
     os.rename(a, home / "diag_b.txt")
-    report: dict[str, object] = {}
-    for label, code in (
-        ("unprivileged", w._FSCTL_READ_UNPRIVILEGED_USN_JOURNAL),
-        ("classic", w._FSCTL_READ_USN_JOURNAL),
-    ):
-        got = w._usn_read(home, cur, [code])
-        if got is None:
-            report[label] = None
-            continue
-        recs, nxt = got
-        report[label] = (
-            len(recs),
-            nxt.next_usn - cur.next_usn,
-            [(r.name, hex(r.reason)) for r in recs if r.name.startswith("diag_")],
-            [r.name for r in recs][:12],
-        )
-    # Each read method must see our own create + rename, or catch-up silently misses changes.
-    for label, v in report.items():
-        assert isinstance(v, tuple) and v[2], f"{label}: cursor={cur} report={report}"
+    got = w._usn_read(home, cur)
+    assert got is not None
+    recs, nxt = got
+    mine = {(r.name, r.reason & 0x3100) for r in recs if r.name.startswith("diag_")}
+    assert ("diag_a.txt", 0x100) in mine  # FILE_CREATE
+    assert ("diag_a.txt", 0x1000) in mine  # RENAME_OLD_NAME
+    assert ("diag_b.txt", 0x2000) in mine  # RENAME_NEW_NAME
+    assert nxt.next_usn > cur.next_usn

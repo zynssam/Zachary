@@ -103,10 +103,13 @@ def parse_lnk_target(data: bytes) -> str | None:
 
 # --- USN change journal ------------------------------------------------------------
 _FSCTL_QUERY_USN_JOURNAL = 0x000900F4
+# Only the classic read is used. FSCTL_READ_UNPRIVILEGED_USN_JOURNAL (0x903AB) was
+# tested on Windows Server 2022 CI: it returned records with empty names and missed
+# our own creates/renames, so catch-up can't rely on it. The classic read needs a
+# volume handle opened for GENERIC_READ (normally admin); without it, catch-up
+# falls back to the scan-based diff (same as Linux).
 _FSCTL_READ_USN_JOURNAL = 0x000900BB
-_FSCTL_READ_UNPRIVILEGED_USN_JOURNAL = 0x000903AB
 _GENERIC_READ = 0x80000000
-_FILE_READ_ATTRIBUTES = 0x80
 _FILE_SHARE_RW = 0x1 | 0x2
 _OPEN_EXISTING = 3
 _USN_RECORD_V2 = struct.Struct("<IHHQQqqIIIIHH")  # 60 bytes, 64-bit file ids
@@ -178,12 +181,12 @@ def _kernel32() -> Any:
 
 
 def _open_volume(k32: Any, root: Path) -> Any:
-    """Handle to the volume holding ``root`` (no admin needed for read-attributes access)."""
+    """Read handle to the volume holding ``root`` (normally needs admin; None otherwise)."""
     drive = os.path.splitdrive(str(root))[0]
     if len(drive) != 2 or drive[1] != ":":
         return None  # UNC / network paths have no local journal
     invalid = (1 << (8 * struct.calcsize("P"))) - 1
-    for access in (_GENERIC_READ, _FILE_READ_ATTRIBUTES):
+    for access in (_GENERIC_READ,):
         h = k32.CreateFileW(
             f"\\\\.\\{drive}", access, _FILE_SHARE_RW, None, _OPEN_EXISTING, 0, None
         )
@@ -221,9 +224,7 @@ def _usn_cursor(root: Path) -> JournalCursor | None:
     return None if q is None else JournalCursor(journal_id=q[0], next_usn=q[2])
 
 
-def _usn_read(
-    root: Path, since: JournalCursor, codes: list[int] | None = None
-) -> tuple[list[JournalRecord], JournalCursor] | None:
+def _usn_read(root: Path, since: JournalCursor) -> tuple[list[JournalRecord], JournalCursor] | None:
     if sys.platform != "win32":
         return None
     import ctypes
@@ -244,22 +245,14 @@ def _usn_read(
         start = since.next_usn
         buf = ctypes.create_string_buffer(_READ_BUF)
         ret = wintypes.DWORD()
-        codes = list(codes or [_FSCTL_READ_UNPRIVILEGED_USN_JOURNAL, _FSCTL_READ_USN_JOURNAL])
         while True:
             # READ_USN_JOURNAL_DATA_V0 -> V2 records (64-bit ids, same as st_ino on NTFS).
             req = struct.pack("<qIIQQQ", start, 0xFFFFFFFF, 0, 0, 0, jid)
-            ok = False
-            while codes:
-                ok = bool(
-                    k32.DeviceIoControl(
-                        h, codes[0], req, len(req), buf, _READ_BUF, ctypes.byref(ret), None
-                    )
-                )
-                if ok:
-                    break
-                codes.pop(0)  # e.g. unprivileged read unsupported: try the classic call
+            ok = k32.DeviceIoControl(
+                h, _FSCTL_READ_USN_JOURNAL, req, len(req), buf, _READ_BUF, ctypes.byref(ret), None
+            )
             if not ok:
-                return None
+                return None  # e.g. no volume read access (not admin): caller re-scans
             nxt, recs = parse_usn_records(buf.raw, ret.value)
             records.extend(recs)
             if ret.value <= 8 or nxt == start:
