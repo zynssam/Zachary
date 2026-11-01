@@ -59,8 +59,8 @@ class FrameSource(Protocol):
 
 
 class MicSource:
-    def __init__(self, mic: MicStream | None = None) -> None:
-        self.mic = mic or MicStream()
+    def __init__(self, mic: MicStream | None = None, device: str = "") -> None:
+        self.mic = mic or MicStream(device)
 
     def start(self) -> None:
         self.mic.start()

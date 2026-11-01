@@ -458,3 +458,22 @@ def test_silent_microphone_is_reported() -> None:
         time.sleep(0.05)
     lis.stop()
     lis.join(5)
+
+
+def test_input_device_choice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Bluetooth output *monitor* as the default input is never used as the mic."""
+    from zachary.voice import audio
+
+    srcs = [{"name": "alsa_input.pci.analog-stereo", "description": "Internal Microphone"},
+            {"name": "bluez_input.88:D6", "description": "Bullets Z2"}]  # fmt: skip
+    monkeypatch.setattr(audio, "_pactl_sources", lambda: (srcs, "bluez_output.88:D6.monitor"))
+    assert audio.resolve_input("") == (None, "bluez_input.88:D6")  # headset mic preferred
+    assert audio.resolve_input("bullets") == (None, "bluez_input.88:D6")
+    assert audio.resolve_input("alsa_input.pci.analog-stereo") == (
+        None,
+        "alsa_input.pci.analog-stereo",
+    )
+    assert audio.resolve_input("3") == (3, "")
+    monkeypatch.setattr(audio, "_pactl_sources", lambda: (srcs, "alsa_input.pci.analog-stereo"))
+    assert audio.resolve_input("") == (None, "")  # a real default: follow the system
+    assert [d.is_default for d in audio.list_inputs()] == [True, False]

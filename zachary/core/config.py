@@ -156,6 +156,7 @@ class Settings:
     tts_language: str = "en-IN"
     speak_replies: bool = True
     offline_stt_model: str = "tiny"
+    mic_device: str = ""  # "" = system default input; see `cli voice mics`
 
 
 _SETTING_KEYS: tuple[str, ...] = tuple(Settings.__dataclass_fields__)

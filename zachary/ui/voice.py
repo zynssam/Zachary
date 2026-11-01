@@ -65,7 +65,7 @@ class VoiceController(QObject):
 
     def start(self, source: FrameSource | None = None) -> None:
         self.listener = VoiceListener(
-            source or MicSource(),
+            source or MicSource(device=self.kit.mic_device),
             on_heard=self.heard.emit,
             on_state=self.state.emit,
             rest_stt=self.kit.rest_stt,

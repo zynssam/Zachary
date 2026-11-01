@@ -143,6 +143,8 @@ python -m zachary.assistant -v                  # restart the assistant to pick 
 Other voice commands (the ones that use credits say so):
 ```bash
 python -m zachary.cli voice usage                       # Gnani calls so far (free)
+python -m zachary.cli voice mics                        # microphones with a live level (free)
+python -m zachary.cli voice mics bluez_input.XX         # use that mic ("" = system default)
 python -m zachary.cli voice listen --offline            # press Enter, speak; local whisper only (free)
 python -m zachary.cli voice listen                      # same with Gnani (1 STT + 1 TTS call)
 python -m zachary.cli voice transcribe clip.wav --offline   # free

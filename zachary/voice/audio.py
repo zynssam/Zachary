@@ -9,8 +9,13 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
+import os
 import queue
+import shutil
+import subprocess
+import sys
 import threading
 import wave
 from collections.abc import Iterable
@@ -146,14 +151,95 @@ def _sd() -> Any:
     return sd
 
 
-class MicStream:
-    """16 kHz mono microphone, delivering 1,024-byte frames on a queue."""
+# -- choosing the input device ------------------------------------------------------------
+@dataclass(slots=True)
+class InputDevice:
+    id: str  # what goes in the mic_device setting
+    label: str
+    is_default: bool = False
 
-    def __init__(self, device: int | str | None = None) -> None:
-        self.device = device
+
+def _pactl_sources() -> tuple[list[dict[str, Any]], str]:
+    """PipeWire/PulseAudio capture sources (monitors excluded) and the default source."""
+    platform: str = sys.platform  # (a plain str: checked at runtime, not by mypy)
+    if not platform.startswith("linux") or not shutil.which("pactl"):
+        return [], ""
+    try:
+        out = subprocess.run(["pactl", "-f", "json", "list", "sources"], capture_output=True,
+                             text=True, timeout=3, check=True).stdout  # fmt: skip
+        default = subprocess.run(["pactl", "get-default-source"], capture_output=True,
+                                 text=True, timeout=3).stdout.strip()  # fmt: skip
+        sources = json.loads(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return [], ""
+    real = [
+        x
+        for x in sources
+        if isinstance(x, dict) and not str(x.get("name", "")).endswith(".monitor")
+    ]
+    return real, default
+
+
+def list_inputs() -> list[InputDevice]:
+    """Microphones the user can pick, by stable name where the system has one."""
+    sources, default = _pactl_sources()
+    if sources:
+        return [
+            InputDevice(
+                str(x["name"]), str(x.get("description") or x["name"]), x["name"] == default
+            )
+            for x in sources
+        ]
+    sd = _sd()
+    default_in = sd.default.device[0]
+    return [
+        InputDevice(str(i), str(d["name"]), i == default_in)
+        for i, d in enumerate(sd.query_devices())
+        if d.get("max_input_channels", 0) > 0
+    ]
+
+
+def resolve_input(choice: str) -> tuple[int | str | None, str]:
+    """(sounddevice device, PipeWire/Pulse source name) for a mic_device setting.
+
+    "" follows the system's default input, except when that default is a *monitor*
+    (the sound going to speakers/earbuds, never a microphone; it happens when
+    Bluetooth earbuds connect): then the first real microphone is used, preferring
+    a Bluetooth headset mic, since that's what the user is wearing.
+    """
+    choice = choice.strip()
+    sources, default = _pactl_sources()
+    names = [str(x["name"]) for x in sources]
+    if choice in names:
+        return None, choice
+    if choice.isdigit():
+        return int(choice), ""
+    if choice:
+        low = choice.lower()
+        for x in sources:  # part of a name or description, e.g. "bullets"
+            if low in str(x["name"]).lower() or low in str(x.get("description", "")).lower():
+                return None, str(x["name"])
+        return choice, ""  # sounddevice name match
+    if sources and (default.endswith(".monitor") or default not in names):
+        pick = next((n for n in names if n.startswith("bluez_input")), names[0])
+        log.info("default input %r is not a microphone; using %r", default, pick)
+        return None, pick
+    return None, ""
+
+
+class MicStream:
+    """16 kHz mono microphone, delivering 1,024-byte frames on a queue.
+
+    ``device`` is the mic_device setting: "" (system default), a PipeWire/Pulse
+    source name, part of a device's name, or a sounddevice index.
+    """
+
+    def __init__(self, device: str | int | None = None) -> None:
+        self.device = "" if device is None else str(device)
         self.frames: queue.Queue[bytes] = queue.Queue(maxsize=600)  # ~19 s backlog
         self._stream: object | None = None
         self._buf = b""
+        self.source_name = ""
 
     def _callback(self, indata, _frames, _time, status) -> None:  # type: ignore[no-untyped-def]
         if status:
@@ -170,12 +256,21 @@ class MicStream:
 
     def start(self) -> None:
         sd = _sd()
+        device, source = resolve_input(self.device)
+        # Route the default ALSA/PortAudio device to that source (PipeWire's ALSA
+        # plugin reads PIPEWIRE_NODE, PulseAudio's reads PULSE_SOURCE).
+        for var in ("PIPEWIRE_NODE", "PULSE_SOURCE"):
+            if source:
+                os.environ[var] = source
+            else:
+                os.environ.pop(var, None)
+        self.source_name = source
         stream = sd.RawInputStream(
             samplerate=SAMPLE_RATE,
             blocksize=FRAME_SAMPLES,
             channels=1,
             dtype="int16",
-            device=self.device,
+            device=device,
             callback=self._callback,
         )
         stream.start()

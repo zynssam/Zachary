@@ -24,6 +24,7 @@ class VoiceKit:
     tts: TTS | None
     ledger: UsageLedger
     has_key: bool
+    mic_device: str = ""
 
 
 def build_voice(config: Config, data_dir: Path, *, api_key: str | None = None) -> VoiceKit:
@@ -48,4 +49,6 @@ def build_voice(config: Config, data_dir: Path, *, api_key: str | None = None) -
         tts = gnani_tts.GnaniWsTTS(
             key, voice=s.tts_voice, model=s.tts_model, language=s.tts_language, ledger=ledger
         )
-    return VoiceKit(rest, stream, whisper, WakeSpotter(whisper), tts, ledger, bool(key))
+    return VoiceKit(
+        rest, stream, whisper, WakeSpotter(whisper), tts, ledger, bool(key), s.mic_device
+    )

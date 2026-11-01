@@ -272,7 +272,47 @@ def cmd_voice(args: argparse.Namespace) -> int:
         return 0
     if args.action == "listen":
         return _voice_listen(args, kit, conn, cfg)
+    if args.action == "mics":
+        return _voice_mics(args, cfg)
     return 1
+
+
+def _voice_mics(args: argparse.Namespace, cfg: Config) -> int:
+    """List microphones with a live level, or pick one: ``voice mics NAME``."""
+    import numpy as np
+
+    from zachary.voice.audio import AudioUnavailable, MicStream, list_inputs, pcm_to_float
+
+    if args.text:
+        cfg.set_setting("mic_device", args.text)
+        print(f"mic_device = {args.text!r} (restart the assistant to use it)")
+    current = str(cfg.get_setting("mic_device"))
+    try:
+        devices = list_inputs()
+    except AudioUnavailable as e:
+        print(e)
+        return 1
+    print("Speak while this runs (1.5 s per microphone):")
+    for d in devices:
+        m = MicStream(d.id)
+        try:
+            m.start()
+            time.sleep(1.5)
+            m.stop()
+            fr = []
+            while not m.frames.empty():
+                fr.append(m.frames.get_nowait())
+            x = pcm_to_float(b"".join(fr))
+            level = float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
+            meter = "silent (no signal)" if level == 0 else "#" * max(1, min(30, int(level * 300)))
+        except Exception as e:
+            meter = f"can't open ({type(e).__name__})"
+        tags = (" [system default]" if d.is_default else "") + (
+            " [selected]" if current and current == d.id else ""
+        )
+        print(f"  {d.label}{tags}\n    id: {d.id}\n    level: {meter}")
+    print('\nPick one:  python -m zachary.cli voice mics <id>   ("" = follow the system default)')
+    return 0
 
 
 def _voice_listen(args: argparse.Namespace, kit: Any, conn: Any, cfg: Config) -> int:
@@ -292,7 +332,7 @@ def _voice_listen(args: argparse.Namespace, kit: Any, conn: Any, cfg: Config) ->
         done.set()
 
     listener = VoiceListener(
-        MicSource(),
+        MicSource(device=kit.mic_device),
         on_heard=got,
         on_state=lambda st: print(f"  [{st}]") if st != "idle" else None,
         rest_stt=None if args.offline else kit.rest_stt,
@@ -488,9 +528,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("path")
     s.set_defaults(fn=cmd_related)
 
-    s = sub.add_parser("voice", help="voice: usage | setup | transcribe WAV | say TEXT | listen")
-    s.add_argument("action", choices=["usage", "setup", "transcribe", "say", "listen"])
-    s.add_argument("text", nargs="?", default="", help="WAV path (transcribe) or text (say)")
+    s = sub.add_parser(
+        "voice", help="voice: usage | setup | mics [ID] | transcribe WAV | say TEXT | listen"
+    )
+    s.add_argument("action", choices=["usage", "setup", "mics", "transcribe", "say", "listen"])
+    s.add_argument("text", nargs="?", default=None, help="WAV path, text to say, or a mic id")
     s.add_argument("--offline", action="store_true", help="local speech recognition only")
     s.add_argument("--no-speak", action="store_true", help="don't speak the reply (listen)")
     s.set_defaults(fn=cmd_voice)
