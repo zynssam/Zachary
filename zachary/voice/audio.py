@@ -106,6 +106,8 @@ class EnergyVAD:
         self.min_rms = min_rms
         self.start_frames = start_frames
         self.end_frames = max(1, end_silence_ms * SAMPLE_RATE // 1000 // FRAME_SAMPLES)
+        self.end_ms = end_silence_ms
+        self.last_rms = 0.0
         self.noise = 0.002
         self.in_speech = False
         self._loud = 0
@@ -119,6 +121,7 @@ class EnergyVAD:
     def push(self, frame: bytes) -> VadEvent | None:
         x = pcm_to_float(frame)
         rms = float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
+        self.last_rms = rms
         self.index += 1
         loud = rms > max(self.min_rms, self.noise * self.ratio)
         if not loud:  # track the room's noise floor while quiet

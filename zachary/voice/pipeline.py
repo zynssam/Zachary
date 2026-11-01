@@ -245,6 +245,12 @@ class VoiceListener(threading.Thread):
         else:
             self._command(tl, via="wake", buffered=rest, live=False, already_ended=ended)
 
+    def _mic_name(self) -> str:
+        mic = getattr(self.source, "mic", None)
+        return str(
+            getattr(mic, "source_name", "") or getattr(mic, "device", "") or "system default"
+        )
+
     def _drain(self) -> None:
         drain = getattr(self.source, "drain", None)
         if drain is not None:
@@ -280,7 +286,11 @@ class VoiceListener(threading.Thread):
                 stream.open()
             except VoiceError as e:
                 stream, stream_error = None, e
-        self.vad.reset()
+        # The user pressed the key / said "Hey Zach": they're about to talk, so listen
+        # more sensitively than while idle (Bluetooth headset mics are quiet).
+        vad = EnergyVAD(ratio=2.0, min_rms=0.003, end_silence_ms=self.vad.end_ms)
+        vad.noise = min(self.vad.noise, 0.0015)
+        peak = 0.0
         started = bool(buffered)
         start_deadline = time.monotonic() + COMMAND_WAIT_S
         max_bytes = int(MAX_COMMAND_S * SAMPLE_RATE * 2)
@@ -294,10 +304,11 @@ class VoiceListener(threading.Thread):
                 if not started and time.monotonic() > start_deadline:
                     break
                 continue
-            ev = self.vad.push(f)
+            ev = vad.push(f)
+            peak = max(peak, vad.last_rms)
             if ev is not None and ev.kind == "start":
                 started = True
-            if not started and not self.vad.in_speech:
+            if not started and not vad.in_speech:
                 if time.monotonic() > start_deadline:
                     break
                 continue
@@ -315,6 +326,24 @@ class VoiceListener(threading.Thread):
                 break
         tl.mark("speech_end")
         pcm = bytes(audio)
+        mic = self._mic_name()
+        tl.info.update({"mic": mic, "mic_peak": round(peak, 4)})
+        if not started:
+            if stream is not None:
+                stream.abort()
+            tl.mark("stt")
+            hint = (
+                "no sound at all: pick another input with `cli voice mics`"
+                if peak == 0
+                else "too quiet: speak closer, or raise the input volume"
+            )
+            msg = f"I didn't hear anything (mic: {mic}, level {peak:.3f}; {hint})"
+            heard = Heard("", None, tl, VoiceError("bad_request", msg))
+            heard.via = via
+            self.on_heard(heard)
+            self.vad.reset()
+            self.on_state("idle")
+            return
         self.on_state("thinking")
         heard = self._transcribe(pcm, stream, stream_error, tl)
         heard.via = via

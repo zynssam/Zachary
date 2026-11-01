@@ -105,6 +105,7 @@ class VoiceController(QObject):
     def _on_heard(self, h: Heard) -> None:
         if not h.text:
             msg = str(h.error) if h.error else "I didn't catch that."
+            log.info("voice: %s", msg)
             self.bar.status.setText(msg)
             h.timeline.info["error"] = h.error.kind if h.error else "empty"
             h.timeline.finish(str(self.latency_path) if self.latency_path else None)
