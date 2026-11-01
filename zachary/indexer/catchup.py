@@ -21,7 +21,7 @@ from zachary.core.db import get_state, set_state
 from zachary.core.platform import JournalCursor, JournalRecord, Platform
 from zachary.indexer import projects
 from zachary.indexer.scanner import scan
-from zachary.indexer.store import FileStore, ReconcileResult
+from zachary.indexer.store import FileStore, ReconcileResult, inode_key
 from zachary.indexer.watcher import apply_followups
 
 log = logging.getLogger(__name__)
@@ -48,9 +48,12 @@ def journal_dirty_paths(store: FileStore, root: str, records: list[JournalRecord
     by_inode: dict[int, list[str]] = {}
 
     def paths_for(frn: int) -> list[str]:
-        if frn not in by_inode:
-            by_inode[frn] = [r.path for r in store.rows_by_inode(dev, frn)]
-        return by_inode[frn]
+        key = inode_key(frn)
+        if key is None:
+            return []
+        if key not in by_inode:
+            by_inode[key] = [r.path for r in store.rows_by_inode(dev, key)]
+        return by_inode[key]
 
     dirty: set[str] = set()
     for rec in records:

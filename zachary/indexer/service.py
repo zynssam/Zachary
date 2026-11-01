@@ -57,7 +57,8 @@ class IndexerService:
         self.lower_priority = lower_priority
         self.watcher: Watcher | None = None
         self.watching = False
-        self.ready = threading.Event()  # set after the first catch-up
+        self.ready = threading.Event()  # set after the first catch-up (or a failure)
+        self.failed = False
         self._stop = threading.Event()
 
     # -- helpers ---------------------------------------------------------------
@@ -139,15 +140,22 @@ class IndexerService:
         self._stop.set()
 
     def run(self) -> None:
-        if self.lower_priority:
-            self.platform.lower_process_priority()
-        self.store.ensure_fts()
-        self.store.purge_excluded()
-        sig = self._sig()
-        if not sig.paused:
-            self._catch_up()
-            self._ingest_recent()
-            self._start_watcher()
+        try:
+            if self.lower_priority:
+                self.platform.lower_process_priority()
+            self.store.ensure_fts()
+            self.store.purge_excluded()
+            sig = self._sig()
+            if not sig.paused:
+                self._catch_up()
+                self._ingest_recent()
+                self._start_watcher()
+        except BaseException:
+            self.failed = True
+            self.ready.set()  # don't leave waiters hanging; the error propagates
+            self._stop_watcher()
+            self.conn.close()
+            raise
         self.ready.set()
         next_recent = time.monotonic() + self.recent_interval
         next_cursor = time.monotonic() + self.cursor_interval

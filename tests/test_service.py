@@ -27,6 +27,7 @@ def running(
     t = threading.Thread(target=svc.run, daemon=True)
     t.start()
     assert svc.ready.wait(10)
+    assert not svc.failed
     yield svc, cfg
     svc.stop()
     t.join(10)

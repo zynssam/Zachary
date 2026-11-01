@@ -85,6 +85,23 @@ class ReconcileResult:
         self.markers.update(other.markers)
 
 
+_U64 = (1 << 64) - 1
+
+
+def inode_key(v: int | None) -> int | None:
+    """Fold an inode / file id into SQLite's signed 64-bit INTEGER.
+
+    Windows ``st_ino`` can be a 128-bit file id (Python >= 3.12), and NTFS file
+    reference numbers use the top bits for a sequence number, so values >= 2**63
+    are normal. Keep the low 64 bits (where NTFS puts the FRN) as a signed value;
+    journal ids go through the same function so they still compare equal.
+    """
+    if not v:
+        return None
+    v &= _U64
+    return v - (1 << 64) if v >= 1 << 63 else v
+
+
 def is_link_like(st: os.stat_result) -> bool:
     """True for symlinks and Windows junctions, which are never followed."""
     if stat_mod.S_ISLNK(st.st_mode):
@@ -103,7 +120,7 @@ def entry_from_stat(
         size=0 if is_dir else st.st_size,
         mtime=st.st_mtime,
         ctime=st.st_ctime,
-        inode=inode if inode is not None else (st.st_ino or None),
+        inode=inode_key(inode if inode is not None else st.st_ino),
         dev=dev if dev is not None else (st.st_dev or None),
     )
 

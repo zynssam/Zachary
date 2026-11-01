@@ -197,3 +197,14 @@ def test_reconcile_paths_replaces_file_with_dir(store: FileStore, home: Path) ->
     r = store.reconcile_paths([str(home / "thing")])
     assert store.get_row(str(home / "thing" / "inner.txt")) is not None
     assert r.deleted == 1
+
+
+def test_inode_key_fits_sqlite() -> None:
+    from zachary.indexer.store import inode_key
+
+    assert inode_key(None) is None and inode_key(0) is None
+    assert inode_key(12345) == 12345
+    big_ntfs = (0x8001 << 48) | 0x1234  # sequence number with the top bit set
+    assert -(1 << 63) <= inode_key(big_ntfs) < (1 << 63)  # type: ignore[operator]
+    refs_128 = (0xDEADBEEF << 64) | big_ntfs
+    assert inode_key(refs_128) == inode_key(big_ntfs)  # low 64 bits = NTFS FRN
