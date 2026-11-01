@@ -80,7 +80,7 @@ zachary/
     executor.py        # executes approved plans, writes undo log
     undo.py
   ui/
-    quickbar.py        # Alt+Space search bar
+    quickbar.py        # Super+Space search bar (configurable)
     results.py         # clickable list, project view, topic view, timeline
     tray.py
   telemetry/

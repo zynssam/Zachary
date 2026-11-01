@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="zachary.assistant", description="Zachary quick bar")
     ap.add_argument("--db", default=None)
     ap.add_argument("--toggle", action="store_true", help="toggle a running quick bar")
-    ap.add_argument("--hotkey", default=None, help='e.g. "alt+space" (default from settings)')
+    ap.add_argument("--hotkey", default=None, help='e.g. "super+space" (default from settings)')
     ap.add_argument("--no-hotkey", action="store_true")
     ap.add_argument("--no-indexer", action="store_true", help="don't start the indexer")
     ap.add_argument("--show", action="store_true", help="show the quick bar at start")

@@ -43,7 +43,7 @@ New dependencies: `PySide6-Essentials` (Qt), `jeepney` (Linux only, pure-Python 
 2. **As-you-type previews show what Enter would do** ("Enter to open Fee Receipt Sem 5.pdf") but never act.
 3. **The quick bar hides itself** 0.7 s after opening something, and whenever it loses focus.
 4. **"the older/newer one"** walks the shown list by time (newest of mtime and last access), starting from the focused item.
-5. **Default hotkey stays `alt+space`** (from the spec). It conflicts with GNOME's window menu on your machine; see 6.
+5. **Default hotkey is `super+space`** (decided in review, instead of the spec's Alt+Space, which is GNOME's window-menu key). On GNOME, Super+Space is also bound to "switch input source"; with a single keyboard layout that binding does nothing, but it should be freed so GNOME doesn't take the key (see `run-and-test.md` §3.3). On Windows, Win+Space is reserved by the OS input switcher; if registration fails the bar says so and suggests another key.
 6. **No tray on stock GNOME** (it needs the AppIndicator extension, which you don't have enabled). The hotkey and the CLI (`pause`/`resume`) cover it.
 
 ## 4. Testing
@@ -89,7 +89,7 @@ Budget: quick bar open → first results < 150 ms ✅ (worst measured p95: 23.3 
 
 ## 6. Known limitations / not verified
 - **The GNOME hotkey hasn't been tried end to end.** On first start GNOME shows a dialog to approve the shortcut; that, and pressing the key, need you.
-- **Alt+Space is GNOME's "window menu" shortcut on your machine** (`activate-window-menu = ['<Alt>space']`). GNOME may give it to the window menu instead, or let you choose another key in the dialog. See the questions below.
+- **Super+Space is GNOME's "switch input source" shortcut** (`switch-input-source = ['<Super>space', 'XF86Keyboard']`). It does nothing with one layout (yours is `us` only), but GNOME may still claim the key; free it with the command in `run-and-test.md` §3.3.
 - **Window placement on Wayland:** the compositor decides where the bar appears (usually centred). Exact positioning works only on X11/Windows.
 - **Focus on Wayland** relies on the portal's activation token. If GNOME doesn't pass one, the bar can open without keyboard focus (you'd need to click it once). This needs checking on your desktop.
 - **The tray icon is not shown on stock GNOME** (no AppIndicator extension).
@@ -98,9 +98,6 @@ Budget: quick bar open → first results < 150 ms ✅ (worst measured p95: 23.3 
 - **`--toggle` startup time** (~0.4 s of Python/Qt imports) only matters for the fallback binding, not for the in-process hotkey.
 
 ## 7. Questions for review
-1. **Hotkey:** Alt+Space collides with GNOME's window menu here. Options:
-   - keep Alt+Space and turn off GNOME's binding (`gsettings set org.gnome.desktop.wm.keybindings activate-window-menu "[]"`);
-   - use **Super+Space** (GNOME uses it to switch input sources if you have more than one);
-   - use **Ctrl+Alt+Space** (usually free).
+1. ~~Hotkey~~: **decided: Super+Space** (default changed, `test_default_hotkey_is_super_space`).
 2. Please try it: `.venv/bin/python -m zachary.assistant -v`, approve the shortcut in GNOME's dialog, press it, and try "fees yesterday", "my projects", then "open the second one". Tell me whether the bar gets keyboard focus.
 3. Merge `phase-2` into `main` after review?

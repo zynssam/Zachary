@@ -106,3 +106,12 @@ def test_x11_reports_key_already_taken() -> None:
     second.stop()
     first.stop()
     assert second.error is not None and "already taken" in second.error
+
+
+def test_default_hotkey_is_super_space() -> None:
+    from zachary.core.config import Settings
+
+    hk = parse_hotkey(Settings().quickbar_hotkey)
+    assert str(hk) == "super+space"
+    assert hk.portal_trigger() == "LOGO+space"
+    assert modifier_mask(hk) == 64  # X11 Mod4

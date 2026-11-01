@@ -73,7 +73,7 @@ python -m zachary.cli forget ~/Private/diary.txt   # hide now; indexer purges al
 python -m zachary.cli pause                   # pause indexing (resume with: resume)
 python -m zachary.cli set                     # show settings
 python -m zachary.cli set index_hidden_folders true   # also index hidden folders
-python -m zachary.cli set quickbar_hotkey ctrl+alt+space
+python -m zachary.cli set quickbar_hotkey ctrl+alt+space   # default is super+space
 ```
 
 ### 3.3 Quick bar (assistant)
@@ -95,10 +95,17 @@ Quit: tray → Quit, or `pkill -f zachary.assistant`.
 | Windows | Registered directly. |
 | Anything else / if it fails | Desktop Settings → Keyboard → Custom shortcut → command `<repo>/.venv/bin/python -m zachary.assistant --toggle`. |
 
-On this machine (GNOME) **Alt+Space is also GNOME's window-menu shortcut**. Either pick another key
-(`--hotkey ctrl+alt+space`) or free it:
-`gsettings set org.gnome.desktop.wm.keybindings activate-window-menu "[]"`
-(undo: `gsettings reset org.gnome.desktop.wm.keybindings activate-window-menu`).
+The default hotkey is **Super+Space**. On GNOME, Super+Space is also the "switch input source"
+shortcut. With a single keyboard layout it does nothing, but GNOME may still take the key, so free it
+(keeps the dedicated keyboard-switch key):
+```bash
+gsettings set org.gnome.desktop.wm.keybindings switch-input-source "['XF86Keyboard']"
+gsettings set org.gnome.desktop.wm.keybindings switch-input-source-backward "['<Shift>XF86Keyboard']"
+```
+Undo: `gsettings reset org.gnome.desktop.wm.keybindings switch-input-source` (and `...-backward`).
+If you add a second keyboard layout later, pick another key for one of them.
+
+On Windows, Win+Space is reserved by the OS; use e.g. `--hotkey ctrl+alt+space` there.
 
 **Quick bar keys**
 
@@ -221,7 +228,7 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 | Problem | Fix |
 |---|---|
 | "inotify limit" warning | `sudo sysctl fs.inotify.max_user_watches=524288` and persist with `echo fs.inotify.max_user_watches=524288 \| sudo tee /etc/sysctl.d/90-zachary.conf` |
-| Hotkey does nothing (GNOME) | Alt+Space conflict (see 3.3), or the dialog was dismissed: check Settings → Keyboard → Shortcuts → Apps, or use `--hotkey ctrl+alt+space`, or bind `--toggle` manually |
+| Hotkey does nothing (GNOME) | GNOME's input-source binding still owns Super+Space (free it, see 3.3), or the dialog was dismissed: check Settings → Keyboard → Shortcuts → Apps, or use `--hotkey ctrl+alt+space`, or bind `--toggle` manually |
 | "Hotkey unavailable" message in the bar | follow the hint shown (bind `python -m zachary.assistant --toggle`) |
 | Bar opens without keyboard focus (Wayland) | click it once; report it (depends on GNOME passing an activation token) |
 | No tray icon on GNOME | needs the AppIndicator extension; use the hotkey and `cli pause/resume` instead |

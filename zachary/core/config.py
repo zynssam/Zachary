@@ -134,7 +134,7 @@ class Settings:
 
     index_roots: list[str] = field(default_factory=list)  # empty → platform defaults
     indexing_paused: bool = False
-    quickbar_hotkey: str = "alt+space"
+    quickbar_hotkey: str = "super+space"  # chosen in Phase 2 review
     language_code: str = "en-IN"
     llm_enabled: bool = False
     embed_max_kb: int = 64  # "embed less": first N KB per document by default
