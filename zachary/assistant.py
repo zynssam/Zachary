@@ -46,8 +46,9 @@ def toggle_cmd() -> list[str]:
 def send_to_running(message: bytes, timeout_ms: int = 3000) -> bool:
     """Deliver a command to an already-running assistant and wait for its "ok".
 
-    Waiting for the reply matters on Windows: with named pipes, a client that
-    disconnects right after writing can lose its message.
+    Returns False only if no instance is listening. Waiting for the reply matters on
+    Windows: with named pipes, a client that disconnects right after writing can
+    lose its message.
     """
     sock = QLocalSocket()
     sock.connectToServer(server_name())
@@ -61,7 +62,11 @@ def send_to_running(message: bytes, timeout_ms: int = 3000) -> bool:
         if sock.waitForReadyRead(50):
             got += bytes(sock.readAll().data())
     sock.disconnectFromServer()
-    return got.startswith(b"ok")
+    if not got:
+        # We connected, so an instance is running; it is just slow to answer. Never start
+        # a second app in that case (it would fight over the hotkey and the socket).
+        log.warning("running assistant did not acknowledge %r in time", message)
+    return True
 
 
 def serve_commands(server: QLocalServer, handlers: dict[bytes, Callable[[], None]]) -> None:
