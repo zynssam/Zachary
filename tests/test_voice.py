@@ -157,7 +157,7 @@ def test_vad_start_and_end() -> None:
             events.append((ev.kind, round(i / 2 / SAMPLE_RATE, 2)))
     kinds = [k for k, _ in events]
     assert kinds == ["start", "end"]
-    assert 0.55 <= events[0][1] <= 0.75 and 2.3 <= events[1][1] <= 2.5
+    assert 0.55 <= events[0][1] <= 0.75 and 2.1 <= events[1][1] <= 2.3  # 1.6 s + 0.6 s of quiet
 
 
 @pytest.mark.parametrize(

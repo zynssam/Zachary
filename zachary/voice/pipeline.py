@@ -104,6 +104,10 @@ class MicSource:
         except queue.Empty:
             return None
 
+    def drain(self) -> None:
+        """Drop audio that piled up while we were busy (it's already in the past)."""
+        self.mic.drain()
+
 
 class VoiceListener(threading.Thread):
     def __init__(
@@ -191,6 +195,7 @@ class VoiceListener(threading.Thread):
         while not self._stop_ev.is_set():
             if self._ptt.is_set():
                 self._ptt.clear()
+                self._drain()  # only what's said after the press counts
                 self._command(Timeline("voice"), via="ptt", buffered=b"", live=True)
                 preroll.clear()
                 self.vad.reset()
@@ -227,8 +232,9 @@ class VoiceListener(threading.Thread):
                 break
         wake = self.spotter.check(bytes(buf))
         if not wake.found:
+            self._drain()  # audio queued during the check: not for us either
             if not ended:
-                self._skip_until_silence()  # someone talking, not to us
+                self._skip_until_silence()  # someone talking, not to us (cheap: VAD only)
             return
         tl.mark("wake")
         tl.info["wake_heard"] = wake.heard
@@ -238,6 +244,12 @@ class VoiceListener(threading.Thread):
             self._command(tl, via="wake", buffered=b"", live=True)
         else:
             self._command(tl, via="wake", buffered=rest, live=False, already_ended=ended)
+
+    def _drain(self) -> None:
+        drain = getattr(self.source, "drain", None)
+        if drain is not None:
+            drain()
+        self.vad.reset()
 
     def _skip_until_silence(self) -> None:
         deadline = time.monotonic() + 30

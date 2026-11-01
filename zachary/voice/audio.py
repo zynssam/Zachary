@@ -100,7 +100,7 @@ class EnergyVAD:
         ratio: float = 3.0,
         min_rms: float = 0.008,
         start_frames: int = 3,
-        end_silence_ms: int = 800,
+        end_silence_ms: int = 600,
     ) -> None:
         self.ratio = ratio
         self.min_rms = min_rms

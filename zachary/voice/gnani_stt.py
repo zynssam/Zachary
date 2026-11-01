@@ -131,7 +131,7 @@ class GnaniStreamingSTT:
         url: str = STREAM_URL,
         ledger: UsageLedger | None = None,
         connect_timeout: float = 5.0,
-        result_timeout: float = 8.0,
+        result_timeout: float = 3.0,  # finals arrive in < 0.5 s after commit
     ) -> None:
         if not api_key:
             raise VoiceError("config", "GNANI_API_KEY is not set")

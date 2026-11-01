@@ -146,7 +146,9 @@ class Settings:
     embed_on_battery: bool = False
     # Voice (Phase 4). Off until enabled: the microphone is only opened when on.
     voice_enabled: bool = False
-    wake_word: bool = True  # local "Hey Zach" spotting while voice is enabled
+    # Local "Hey Zach" spotting runs whisper on the CPU (~300 MB RAM). Off by default:
+    # push-to-talk sends speech straight to Gnani and needs no local model.
+    wake_word: bool = False
     voice_hotkey: str = "super+alt+space"  # push-to-talk (press, speak, pause)
     stt_language: str = "en-IN"  # Gnani: en-IN also handles English+Hindi mixing
     stt_model: str = "prisma-v3.0"

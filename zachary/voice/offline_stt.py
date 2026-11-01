@@ -38,7 +38,8 @@ class WhisperSTT:
     def __init__(self, models_dir: Path, model: str = DEFAULT_MODEL, threads: int | None = None):
         self.models_dir = models_dir
         self.model = model
-        self.threads = threads or max(1, min(4, os.cpu_count() or 2))
+        # At most 2 threads: leave the other cores to the UI and the rest of the desktop.
+        self.threads = threads or max(1, min(2, (os.cpu_count() or 2) // 2))
         self._m: Any = None
         self._lock = threading.Lock()
 
