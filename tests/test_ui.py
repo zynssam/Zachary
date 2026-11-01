@@ -114,8 +114,10 @@ def test_keyboard_navigation(qtbot: QtBot, bar: QuickBar, fake_platform: FakePla
     assert fake_platform.opened[-1].name == names[2]
     bar.show_bar()
     _type(qtbot, bar, "report")
+    # Opening logs an access, so the order changed: read the list as shown now.
+    top = bar.list.results.items[0].name
     _enter(qtbot, bar, Qt.KeyboardModifier.ControlModifier)
-    assert fake_platform.revealed[-1].name == names[0]
+    assert fake_platform.revealed[-1].name == top
     bar.show_bar()
     qtbot.keyClick(bar.edit, Qt.Key.Key_Escape)
     assert not bar.isVisible()

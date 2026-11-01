@@ -27,16 +27,17 @@ def test_send_to_running(qtbot: QtBot, instance: str) -> None:
     assert not assistant.send_to_running(b"toggle")  # nobody listening
     server = QLocalServer()
     assert server.listen(assistant.server_name())
-    got: list[bytes] = []
+    got: list[str] = []
+    assistant.serve_commands(server, {b"toggle": lambda: got.append("toggle")})
+    # The client blocks waiting for "ok", so run it off the GUI thread.
+    import threading
 
-    def on_conn() -> None:
-        sock = server.nextPendingConnection()
-        sock.readyRead.connect(lambda: got.append(bytes(sock.readAll().data())))
-
-    server.newConnection.connect(on_conn)
-    assert assistant.send_to_running(b"toggle")
-    qtbot.waitUntil(lambda: bool(got))
-    assert got[0].strip() == b"toggle"
+    result: list[bool] = []
+    t = threading.Thread(target=lambda: result.append(assistant.send_to_running(b"toggle")))
+    t.start()
+    qtbot.waitUntil(lambda: bool(result), timeout=5000)
+    t.join()
+    assert result == [True] and got == ["toggle"]
     server.close()
 
 

@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -42,16 +43,53 @@ def toggle_cmd() -> list[str]:
     return [sys.executable, "-m", "zachary.assistant", "--toggle"]
 
 
-def send_to_running(message: bytes, timeout_ms: int = 500) -> bool:
-    """Deliver a command to an already-running assistant. False if none is running."""
+def send_to_running(message: bytes, timeout_ms: int = 1000) -> bool:
+    """Deliver a command to an already-running assistant and wait for its "ok".
+
+    Waiting for the reply matters on Windows: with named pipes, a client that
+    disconnects right after writing can lose its message.
+    """
     sock = QLocalSocket()
     sock.connectToServer(server_name())
     if not sock.waitForConnected(timeout_ms):
         return False
     sock.write(message + b"\n")
     sock.waitForBytesWritten(timeout_ms)
+    got = b""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while b"\n" not in got and time.monotonic() < deadline:
+        if sock.waitForReadyRead(50):
+            got += bytes(sock.readAll().data())
     sock.disconnectFromServer()
-    return True
+    return got.startswith(b"ok")
+
+
+def serve_commands(server: QLocalServer, handlers: dict[bytes, Callable[[], None]]) -> None:
+    """Answer one-line commands from other launches (``toggle``, ``ping``) with ``ok``."""
+
+    def on_conn() -> None:
+        sock: QLocalSocket | None = server.nextPendingConnection()
+        if not sock:
+            return
+        buf = bytearray()
+
+        def handle() -> None:
+            buf.extend(bytes(sock.readAll().data()))
+            if b"\n" not in buf:
+                return
+            cmd = bytes(buf).split(b"\n", 1)[0].strip()
+            fn = handlers.get(cmd)
+            if fn is not None:
+                fn()
+            sock.write(b"ok\n" if fn is not None or cmd == b"ping" else b"unknown\n")
+            sock.flush()
+
+        sock.readyRead.connect(handle)
+        sock.disconnected.connect(sock.deleteLater)
+        if sock.bytesAvailable():
+            handle()
+
+    server.newConnection.connect(on_conn)
 
 
 def indexer_running(db_path: Path) -> bool:
@@ -125,18 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     QLocalServer.removeServer(server_name())
     server.listen(server_name())
 
-    def on_conn() -> None:
-        sock: QLocalSocket | None = server.nextPendingConnection()
-        if not sock:
-            return
-
-        def read() -> None:
-            if bytes(sock.readAll().data()).strip() == b"toggle":
-                bar.toggle()
-
-        sock.readyRead.connect(read)
-
-    server.newConnection.connect(on_conn)
+    serve_commands(server, {b"toggle": bar.toggle})
 
     tray = None
     if Tray.available():

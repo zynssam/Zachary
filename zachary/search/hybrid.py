@@ -157,14 +157,14 @@ def _raw(conn: sqlite3.Connection) -> sqlite3.Cursor:
     return cur
 
 
-def _fts_ids(conn: sqlite3.Connection, expr: str, limit: int) -> list[int]:
-    """Best ``limit`` matches by bm25."""
+def _fts_ids(conn: sqlite3.Connection, expr: str, limit: int) -> list[tuple[int, float]]:
+    """Best ``limit`` matches with their bm25 (lower is better)."""
     try:
         rows = _raw(conn).execute(
-            f"SELECT rowid FROM files_fts WHERE files_fts MATCH ? ORDER BY {BM25} LIMIT ?",
+            f"SELECT rowid, {BM25} AS s FROM files_fts WHERE files_fts MATCH ? ORDER BY s LIMIT ?",
             (expr, limit),
         )
-        return [r[0] for r in rows]
+        return [(r[0], float(r[1])) for r in rows]
     except sqlite3.OperationalError:
         return []
 
@@ -183,7 +183,11 @@ def _fts_in(conn: sqlite3.Connection, expr: str, allowed: set[int]) -> list[int]
 
 
 def _keyword_ids(
-    conn: sqlite3.Connection, terms: list[str], limit: int, allowed: set[int] | None = None
+    conn: sqlite3.Connection,
+    terms: list[str],
+    limit: int,
+    allowed: set[int] | None = None,
+    scores: dict[int, float] | None = None,
 ) -> dict[int, int]:
     """Matching file ids -> tier, best first (dict order = rank when ``allowed`` is None).
 
@@ -203,9 +207,15 @@ def _keyword_ids(
     out: dict[int, int] = {}
 
     def add(expr: str, tier: int) -> None:
-        ids = _fts_ids(conn, expr, limit) if allowed is None else _fts_in(conn, expr, allowed)
-        for rid in ids:
-            out.setdefault(rid, tier)
+        if allowed is not None:
+            for rid in _fts_in(conn, expr, allowed):
+                out.setdefault(rid, tier)
+            return
+        for rid, bm in _fts_ids(conn, expr, limit):
+            if rid not in out:
+                out[rid] = tier
+                if scores is not None:
+                    scores[rid] = bm
 
     add(fts_expression(terms, mode="and", prefix=False), 0)
     if len(terms[-1]) >= 2 and len(out) < limit:
@@ -346,6 +356,7 @@ def search(
 
     in_range: dict[int, str] = _ids_in_range(conn, tr, RANGE_LIMIT) if tr else {}
     allowed = set(in_range)
+    bm25: dict[int, float] = {}
     range_matched = True
     restricted = False
 
@@ -356,7 +367,7 @@ def search(
             if hit:
                 range_matched, restricted = True, True
                 return hit
-        hit = _keyword_ids(conn, ts, FTS_LIMIT)
+        hit = _keyword_ids(conn, ts, FTS_LIMIT, scores=bm25)
         restricted = False
         range_matched = tr is None or not hit
         return hit
@@ -396,7 +407,15 @@ def search(
         )
     else:
         order = [i for i in candidates if i in rows]
-    kw_rank = {fid: i for i, fid in enumerate(order)} if terms else {}
+    if terms and not restricted:
+        # Dense rank by (tier, bm25): files that match equally well share a rank, so
+        # recency decides between them instead of row-id order (which depends on the
+        # order the OS listed the folder).
+        keys = sorted({(kw[i], round(bm25.get(i, 0.0), 4)) for i in order})
+        dense_kw = {k: n for n, k in enumerate(keys)}
+        kw_rank = {i: dense_kw[(kw[i], round(bm25.get(i, 0.0), 4))] for i in order}
+    else:
+        kw_rank = {fid: i for i, fid in enumerate(order)} if terms else {}
     # Dense rank by recency (to the minute): equal times share a rank, so ties don't
     # get an arbitrary order that could outweigh keyword quality.
     minutes = sorted({int(r.last_seen // 60) for r in rows.values()}, reverse=True)

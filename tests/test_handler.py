@@ -76,7 +76,9 @@ def test_open_ambiguous_asks_and_then_follow_up(
 
 
 def test_older_newer_follow_ups(handler: Handler, fake_platform: FakePlatform) -> None:
-    handler.submit("open report")
+    r0 = handler.submit("open report")
+    # The newest report ranks first (equal keyword match -> recency decides).
+    assert r0.items[0].name == "report_v3.docx"
     top = handler.context.focused_item()
     assert top is not None
     r = handler.submit("the older one")
