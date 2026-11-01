@@ -42,8 +42,8 @@ EXACT_NAME_BONUS = 0.02
 # any term whole > any term prefix. Keeps "fees" -> "Fee Receipt" above "feedback".
 TIER_BONUS = (0.01, 0.006, 0.002, 0.0)
 IN_RANGE_BONUS = 0.05
-FTS_LIMIT = 200
-VEC_K = 100  # nearest neighbours taken from the vector index
+FTS_LIMIT = 120  # keyword candidates (we show ~10; RRF needs a margin, not hundreds)
+VEC_K = 30  # nearest neighbours taken from the vector index
 # Meaning matches: Model2Vec cosines for relevant files measured 0.25-0.73 while
 # unrelated ones mostly stay < 0.1 but can reach ~0.28, so a fixed cutoff can't
 # separate them. Keep a match if it is above an absolute floor AND within a
@@ -52,7 +52,8 @@ VEC_MIN_SIM = 0.15
 VEC_REL_SIM = 0.25
 VEC_WEIGHT = 0.9
 RANGE_KW_ENOUGH = 50  # in-range keyword matches after which looser tiers are skipped
-RANGE_LIMIT = 2000
+RANGE_LIMIT = 1000
+RANGE_VEC_LIMIT = 500  # in-range files scored by meaning (most recent first)
 # bm25 column weights: name, path_tokens, title, keywords
 BM25 = "bm25(files_fts, 10.0, 2.0, 6.0, 3.0)"
 
@@ -443,7 +444,8 @@ def search(
     if semantic is not None and terms:
         qvec = semantic.embedder.encode([" ".join(terms)])[0]
         if tr is not None and allowed:
-            hits = semantic.index.score_ids(qvec, allowed, min_sim=VEC_MIN_SIM)
+            recent_ids = set(list(in_range)[:RANGE_VEC_LIMIT])  # in_range is newest first
+            hits = semantic.index.score_ids(qvec, recent_ids, min_sim=VEC_MIN_SIM)
         else:
             hits = semantic.index.search(qvec, VEC_K, min_sim=VEC_MIN_SIM)
         if hits:

@@ -37,7 +37,7 @@ def test_embeds_everything_and_stores_passages(sem: SemanticIndexer, store: File
     assert st.files == 9 and st.extracted == 8 and st.name_only == 1  # the jpg
     c = store.conn
     assert sem.pending_count() == 0
-    assert _count(c, "SELECT count(*) FROM vec_files") == 9
+    assert _count(c, "SELECT count(*) FROM vec_files") == 0  # file vectors live in vec_ivf
     assert _count(c, "SELECT count(*) FROM vec_ivf") == 9
     assert _count(c, "SELECT count(*) FROM chunks") == _count(c, "SELECT count(*) FROM vec_chunks")
     title, kw = c.execute(
@@ -138,3 +138,16 @@ def test_quick_hash_and_keywords(home: Path) -> None:
     f.write_bytes(b"b" + b"a" * 299_999)
     assert quick_hash(str(f), 300_000) != h1
     assert keywords("the fee fee fee is due due tomorrow and the receipt").startswith("fee due")
+
+
+def test_future_mtime_is_not_reprocessed_forever(
+    sem: SemanticIndexer, store: FileStore, home: Path
+) -> None:
+    sem.run(64)
+    f = home / "Personal" / "paneer.txt"
+    future = time.time() + 3600  # clock skew / a file from a fast clock
+    os.utime(f, (future, future))
+    scan(store)
+    assert sem.pending_count() == 1
+    sem.run(64)
+    assert sem.pending_count() == 0  # embedded_at >= mtime, so it doesn't come back

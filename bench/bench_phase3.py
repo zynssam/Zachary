@@ -105,7 +105,7 @@ def part_a(corpus: Path, work: Path, models: Path) -> None:
         f"{st.chunks} passages, {st.extracted} with text"
     )
     # Re-save everything unchanged (mtime bump): nothing should be re-embedded.
-    later = time.time() + 10
+    later = time.time()  # "saved again now" (not in the future)
     for p in corpus.rglob("*"):
         if p.is_file():
             os.utime(p, (later, later))

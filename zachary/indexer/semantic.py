@@ -27,7 +27,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from zachary.core.config import Config
+from zachary.core.config import Config, is_under
 from zachary.core.db import get_state
 from zachary.indexer.chunker import chunk_text
 from zachary.indexer.embedder import Embedder, FloatArray, dequantize_many, normalize, quantize
@@ -149,22 +149,32 @@ class SemanticIndexer:
             _Job(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], rules.root_for(r[1]))
             for r in rows
         ]
+        name_only_dirs = self._name_only_dirs()
         for job in jobs:
-            self._prepare(job, max_bytes, stats)
+            self._prepare(job, max_bytes, stats, name_only_dirs)
         self._embed_and_store(jobs, stats)
         stats.files = len(jobs)
         stats.seconds = time.perf_counter() - t0
         return stats
 
-    def _name_only(self, job: _Job) -> bool:
+    def _name_only(self, job: _Job, name_only_dirs: tuple[str, ...]) -> bool:
         if not extractable(job.ext, job.kind):
             return True
-        return "name_only" in self.config.folder_rules_for(job.path)
+        return any(is_under(job.path, d) for d in name_only_dirs)
 
-    def _prepare(self, job: _Job, max_bytes: int, stats: EmbedStats) -> None:
+    def _name_only_dirs(self) -> tuple[str, ...]:
+        """Folders with the ``name_only`` rule (loaded once per batch, not per file)."""
+        return tuple(
+            r[0]
+            for r in self.conn.execute("SELECT path FROM folder_rules WHERE rule = 'name_only'")
+        )
+
+    def _prepare(
+        self, job: _Job, max_bytes: int, stats: EmbedStats, name_only_dirs: tuple[str, ...]
+    ) -> None:
         """Decide reuse vs extract, and extract text (no DB writes)."""
         stats.per_kind[job.kind] += 1
-        if self._name_only(job):
+        if self._name_only(job, name_only_dirs):
             stats.name_only += 1
             return
         content_moved = job.embedded_at is None or job.embedded_at < job.mtime
@@ -250,10 +260,22 @@ class SemanticIndexer:
                 if job.chunks:
                     chunk_vecs = vecs[i : i + len(job.chunks)]
                     i += len(job.chunks)
-                alive = self.conn.execute(
-                    "SELECT 1 FROM files WHERE id = ? AND path = ?", (job.id, job.path)
-                ).fetchone()
-                if alive is None:
+                # Never older than the file's mtime: a future mtime (clock skew) would
+                # otherwise keep the file "pending" and re-processed on every batch.
+                stamp = max(now, job.mtime)
+                if job.reuse:
+                    cur = self.conn.execute(
+                        "UPDATE files SET embedded_at = ?, embed_path = ?"
+                        " WHERE id = ? AND path = ?",
+                        (stamp, job.path, job.id, job.path),
+                    )
+                else:
+                    cur = self.conn.execute(
+                        "UPDATE files SET embedded_at = ?, embed_path = ?, title = ?,"
+                        " content_hash = coalesce(?, content_hash) WHERE id = ? AND path = ?",
+                        (stamp, job.path, job.title, job.new_hash, job.id, job.path),
+                    )
+                if cur.rowcount == 0:
                     continue  # deleted or moved while we worked; it will come back
                 if job.chunks:
                     assert chunk_vecs is not None
@@ -278,29 +300,12 @@ class SemanticIndexer:
                     fv = normalize(((1 - NAME_SHARE) * content + NAME_SHARE * name_vec)[None, :])[0]
                 else:
                     fv = name_vec
-                blob = quantize(fv)
-                self.conn.execute("DELETE FROM vec_files WHERE file_id = ?", (job.id,))
-                self.conn.execute(
-                    "INSERT INTO vec_files(file_id, embedding) VALUES (?, vec_int8(?))",
-                    (job.id, blob),
-                )
-                vectors.put(self.conn, job.id, blob, centroids)
-                if job.reuse:
+                vectors.put(self.conn, job.id, quantize(fv), centroids)
+                if not job.reuse and (job.title is not None or job.keywords or job.chunks):
                     self.conn.execute(
-                        "UPDATE files SET embedded_at = ?, embed_path = ? WHERE id = ?",
-                        (now, job.path, job.id),
+                        "UPDATE files_fts SET title = ?, keywords = ? WHERE rowid = ?",
+                        (" ".join(words(job.title or "")), job.keywords, job.id),
                     )
-                else:
-                    self.conn.execute(
-                        "UPDATE files SET embedded_at = ?, embed_path = ?, title = ?,"
-                        " content_hash = coalesce(?, content_hash) WHERE id = ?",
-                        (now, job.path, job.title, job.new_hash, job.id),
-                    )
-                    if job.title is not None or job.keywords or job.chunks:
-                        self.conn.execute(
-                            "UPDATE files_fts SET title = ?, keywords = ? WHERE rowid = ?",
-                            (" ".join(words(job.title or "")), job.keywords, job.id),
-                        )
             self.conn.execute("COMMIT")
         except BaseException:
             self.conn.execute("ROLLBACK")

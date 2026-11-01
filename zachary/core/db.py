@@ -224,8 +224,9 @@ CREATE TABLE state (
 #   refreshes the name/path part of the vector (content is not re-embedded).
 # - vec_ivf + ivf_centroids: an IVF (inverted file) index over the file vectors.
 #   sqlite-vec 0.1 only does brute-force kNN (measured 169 ms on 200k vectors); the
-#   IVF lets a query read only the nearest clusters. vec_files stays the canonical
-#   sqlite-vec store; vec_ivf holds a copy of each int8 vector plus its cluster.
+#   IVF lets a query read only the nearest clusters. File vectors live only in
+#   vec_ivf (vec_files from migration #1 is left empty: a second copy cost 55 MB per
+#   200k files and was never read). Chunk vectors stay in sqlite-vec's vec_chunks.
 _MIGRATION_3 = """
 ALTER TABLE files ADD COLUMN title TEXT;
 ALTER TABLE files ADD COLUMN embed_path TEXT;
@@ -241,7 +242,6 @@ CREATE TABLE ivf_centroids (
     id         INTEGER PRIMARY KEY,
     embedding  BLOB NOT NULL           -- float32[EMBED_DIM], L2-normalized
 );
-CREATE INDEX idx_relations_src_score ON relations(src_id, score DESC);
 """
 
 MIGRATIONS: tuple[str, ...] = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3)

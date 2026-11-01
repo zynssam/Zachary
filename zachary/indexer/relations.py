@@ -59,11 +59,35 @@ def _name_words(name: str) -> frozenset[str]:
     return frozenset(w for w in words(stem) if len(w) > 1 and not w.isdigit())
 
 
-def _location(a: str, b: str) -> float:
-    da, db = os.path.dirname(a), os.path.dirname(b)
+class _Facts:
+    """Per-file values reused across many candidate pairs (computed once, lazily)."""
+
+    def __init__(self) -> None:
+        self.words: dict[int, frozenset[str]] = {}
+        self.dirs: dict[int, tuple[str, str]] = {}
+
+    def name_words(self, fid: int, name: str) -> frozenset[str]:
+        w = self.words.get(fid)
+        if w is None:
+            w = self.words[fid] = _name_words(name)
+        return w
+
+    def folders(self, fid: int, path: str) -> tuple[str, str]:
+        d = self.dirs.get(fid)
+        if d is None:
+            parent = os.path.dirname(path)
+            d = self.dirs[fid] = (parent, os.path.dirname(parent))
+        return d
+
+
+def _location(
+    a: str, b: str, fa: tuple[str, str] | None = None, fb: tuple[str, str] | None = None
+) -> float:
+    da, pa = fa or (os.path.dirname(a), os.path.dirname(os.path.dirname(a)))
+    db, pb = fb or (os.path.dirname(b), os.path.dirname(os.path.dirname(b)))
     if da == db:
         return 1.0
-    if os.path.dirname(da) == os.path.dirname(db):
+    if pa == pb:
         return 0.5
     common = os.path.commonpath([da, db]) if da and db else ""
     depth = max(da.count(os.sep), 1)
@@ -92,6 +116,7 @@ def _coaccess(conn: sqlite3.Connection) -> dict[int, dict[int, float]]:
 class RelationBuilder:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
+        self._facts = _Facts()
 
     def _vectors(self, cluster_ids: list[int]) -> tuple[list[int], np.ndarray]:
         marks = ",".join("?" * len(cluster_ids))
@@ -172,17 +197,19 @@ class RelationBuilder:
         cands: dict[int, float] = {pool_ids[i]: float(sims[i]) for i in top if pool_ids[i] != fid}
         for partner in co.get(fid, {}):
             cands.setdefault(partner, 0.0)
-        my_words = _name_words(me[1])
+        facts = self._facts
+        my_words = facts.name_words(fid, me[1])
+        my_dirs = facts.folders(fid, me[0])
         scored: list[tuple[int, float, str]] = []
         for other, cos in cands.items():
             o = info.get(other)
             if o is None:
                 continue
-            ow = _name_words(o[1])
+            ow = facts.name_words(other, o[1])
             parts = {
                 "content": max(0.0, (cos - 0.2) / 0.8),
                 "name": len(my_words & ow) / len(my_words | ow) if my_words and ow else 0.0,
-                "location": _location(me[0], o[0]),
+                "location": _location(me[0], o[0], my_dirs, facts.folders(other, o[0])),
                 "coaccess": co.get(fid, {}).get(other, 0.0),
             }
             contrib = {k: WEIGHTS[k] * v for k, v in parts.items()}
