@@ -1030,7 +1030,8 @@ def test_player_keeps_the_speaker_awake_while_the_bar_is_open() -> None:
     p.keep_alive(True)
     time.sleep(0.3)
     assert out.opened == 1 and len(out.written) > 0 and not any(out.written)  # silence
-    assert p.first_audio_at is None  # silence isn't "the reply started"
+    before: float | None = p.first_audio_at
+    assert before is None  # silence isn't "the reply started"
     p.stop()
     p.play(b"\3\0" * 2400, 24000)
     p.end()
