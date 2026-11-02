@@ -38,6 +38,7 @@ TYPE_DEBOUNCE_MS = 25
 HIDE_AFTER_ACTION_MS = 700
 WIDTH = 720
 MAX_ROWS = 8
+SPACE_HOLD_MS = 400  # Space held this long while typing = talk (shorter = a space)
 
 
 class QuickBar(QWidget):
@@ -95,6 +96,13 @@ class QuickBar(QWidget):
         self._last_applied = 0
         self._explicit_selection = False  # user moved with arrows since the last reply
         self._holding_space = False
+        # In a box with text, Space is a space when tapped and talk when held longer
+        # than SPACE_HOLD_MS: the space waits until we know which.
+        self._space_pending = False
+        self._space_timer = QTimer(self)
+        self._space_timer.setSingleShot(True)
+        self._space_timer.setInterval(SPACE_HOLD_MS)
+        self._space_timer.timeout.connect(self._space_held)
         self._open_t0: float | None = None
         self._pending_initial = False
         self._resize_rows(0)
@@ -147,29 +155,52 @@ class QuickBar(QWidget):
             return self._key(ev)
         if obj is self.edit and ev.type() == QEvent.Type.KeyRelease:
             assert isinstance(ev, QKeyEvent)
-            if ev.key() == Qt.Key.Key_Space and self._holding_space:
+            if ev.key() == Qt.Key.Key_Space and (self._holding_space or self._space_pending):
                 if not ev.isAutoRepeat():
-                    self._holding_space = False
-                    self.hold_talk.emit(False)
+                    if self._space_pending:
+                        self._flush_space()  # a tap: just a space
+                    else:
+                        self._holding_space = False
+                        self.hold_talk.emit(False)
                 return True
-        if obj is self.edit and ev.type() == QEvent.Type.FocusOut and self._holding_space:
-            self._holding_space = False  # focus lost while holding: treat as released
-            self.hold_talk.emit(False)
+        if obj is self.edit and ev.type() == QEvent.Type.FocusOut:
+            if self._space_pending:
+                self._flush_space()
+            if self._holding_space:
+                self._holding_space = False  # focus lost while holding: treat as released
+                self.hold_talk.emit(False)
         if ev.type() == QEvent.Type.WindowDeactivate and obj is self:
             self._maybe_hide()
         return super().eventFilter(obj, ev)
 
+    def _flush_space(self) -> None:
+        self._space_timer.stop()
+        self._space_pending = False
+        self.edit.insert(" ")
+
+    def _space_held(self) -> None:
+        if self._space_pending:  # still down after SPACE_HOLD_MS: it's a talk
+            self._space_pending = False
+            self._holding_space = True
+            self.hold_talk.emit(True)
+
     def _key(self, ev: QKeyEvent) -> bool:
         key = ev.key()
         ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
-        if key == Qt.Key.Key_Space and (self._holding_space or (
-            not self.edit.text() and ev.modifiers() == Qt.KeyboardModifier.NoModifier
-        )):  # fmt: skip
-            # Hold Space in the empty box to talk; release to send. (A search never
-            # starts with a space, so typing is unaffected.)
-            if not ev.isAutoRepeat() and not self._holding_space:
+        if self._space_pending and key != Qt.Key.Key_Space:
+            self._flush_space()  # fast typing: next key before Space came up -> a space
+        plain = ev.modifiers() == Qt.KeyboardModifier.NoModifier
+        if key == Qt.Key.Key_Space and (self._holding_space or self._space_pending or plain):
+            # Hold Space to talk, release to send. Empty box: right away (a search
+            # never starts with a space). While typing: only a long press talks.
+            if ev.isAutoRepeat() or self._holding_space or self._space_pending:
+                return True
+            if not self.edit.text():
                 self._holding_space = True
                 self.hold_talk.emit(True)
+            else:
+                self._space_pending = True
+                self._space_timer.start()
             return True
         if key == Qt.Key.Key_Escape:
             self.hide()

@@ -198,6 +198,8 @@ def test_hold_space_in_empty_box_talks(qtbot: QtBot, bar: QuickBar) -> None:
     from PySide6.QtGui import QKeyEvent
     from PySide6.QtWidgets import QApplication
 
+    from zachary.ui import quickbar as QB
+
     events: list[bool] = []
     bar.hold_talk.connect(events.append)
     bar.edit.clear()
@@ -213,8 +215,21 @@ def test_hold_space_in_empty_box_talks(qtbot: QtBot, bar: QuickBar) -> None:
     assert events == [True] and bar.edit.text() == ""  # no spaces typed
     key(QEvent.Type.KeyRelease)
     assert events == [True, False]
-    # In a search with text, Space is just a space.
+    # In a search with text, a tap is just a space.
     bar.edit.setText("fee")
     bar.edit.setCursorPosition(3)
     qtbot.keyClick(bar.edit, Qt.Key.Key_Space)
     assert events == [True, False] and bar.edit.text() == "fee "
+    # Fast typing: the next letter goes down before Space comes up -> order kept.
+    key(QEvent.Type.KeyPress)
+    qtbot.keyClick(bar.edit, Qt.Key.Key_R)
+    key(QEvent.Type.KeyRelease)
+    assert bar.edit.text() == "fee  r" and events == [True, False]
+    # A long press while typing records instead of typing a space.
+    key(QEvent.Type.KeyPress)
+    qtbot.wait(QB.SPACE_HOLD_MS + 150)
+    key(QEvent.Type.KeyRelease, repeat=True)
+    key(QEvent.Type.KeyPress, repeat=True)
+    assert events == [True, False, True] and bar.edit.text() == "fee  r"
+    key(QEvent.Type.KeyRelease)
+    assert events == [True, False, True, False]

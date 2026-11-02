@@ -147,7 +147,7 @@ python -m zachary.assistant -v
 | Ctrl+Enter | show in Explorer |
 | Ctrl+R | related files |
 | Ctrl+1 … Ctrl+9 | open result N |
-| **hold Space** (box empty) | talk while held, release to send |
+| **hold Space** | talk while held, release to send (empty box: at once; while typing: hold > 0.4 s, a tap is a space) |
 | **Ctrl+M** | talk (voice; ends when you stop) |
 | Esc | hide |
 

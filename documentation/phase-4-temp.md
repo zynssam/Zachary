@@ -46,7 +46,7 @@ for working on the phase.
 
 **Hold-to-talk** (new): open the bar, **hold Space** while the box is empty, and talk. Pauses don't end
 the command. Let go to send it (a `commit`, then the text arrives in ~0.3 s). Space types a normal space
-once the box has text.
+once the box has text, unless you hold it longer than 0.4 s, which records too. The spoken text replaces what was typed.
 
 **Press-to-talk:** Super+Alt+Space, Ctrl+M, or `python -m zachary.assistant --talk`. It ends by itself
 350 ms after you stop talking, or when Gnani's VAD (400 ms) says so in a noisy room.
