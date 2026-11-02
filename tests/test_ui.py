@@ -190,3 +190,31 @@ def test_stale_reply_is_ignored(qtbot: QtBot, bar: QuickBar) -> None:
     old = Reply("stale", "results", [], r.intent)
     bar._on_reply(1, old)  # id 1 is long superseded
     assert bar.list.results.rowCount() == shown and bar.status.text() != "stale"
+
+
+def test_hold_space_in_empty_box_talks(qtbot: QtBot, bar: QuickBar) -> None:
+    """Hold Space (box empty) to talk, release to send; typing spaces still works."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    events: list[bool] = []
+    bar.hold_talk.connect(events.append)
+    bar.edit.clear()
+
+    def key(kind: QEvent.Type, repeat: bool = False) -> None:
+        ev = QKeyEvent(kind, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier, " ", repeat)
+        QApplication.sendEvent(bar.edit, ev)
+
+    key(QEvent.Type.KeyPress)
+    for _ in range(5):  # holding: the keyboard repeats press/release pairs
+        key(QEvent.Type.KeyRelease, repeat=True)
+        key(QEvent.Type.KeyPress, repeat=True)
+    assert events == [True] and bar.edit.text() == ""  # no spaces typed
+    key(QEvent.Type.KeyRelease)
+    assert events == [True, False]
+    # In a search with text, Space is just a space.
+    bar.edit.setText("fee")
+    bar.edit.setCursorPosition(3)
+    qtbot.keyClick(bar.edit, Qt.Key.Key_Space)
+    assert events == [True, False] and bar.edit.text() == "fee "

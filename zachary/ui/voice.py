@@ -107,14 +107,21 @@ class VoiceController(QObject):
             with contextlib.suppress(Exception):
                 close()
 
-    def push_to_talk(self) -> None:
-        log.info("voice: push-to-talk")
+    def push_to_talk(self, hold: bool = False) -> None:
+        log.info("voice: push-to-talk%s", " (hold)" if hold else "")
         self._cancel_speech()  # talking over the reply interrupts it
         if self.listener is None or not self.listener.is_alive():
             log.warning("voice: listener was not running; restarting it")
             self.start()
         assert self.listener is not None
-        self.listener.push_to_talk()
+        self.listener.push_to_talk(hold=hold)
+
+    def hold_talk(self, pressed: bool) -> None:
+        """Space held in the bar: record while held, send on release."""
+        if pressed:
+            self.push_to_talk(hold=True)
+        elif self.listener is not None:
+            self.listener.release()
 
     def _cancel_speech(self) -> None:
         self._say_gen += 1
@@ -127,7 +134,9 @@ class VoiceController(QObject):
         if state == "listening":
             if not self.bar.isVisible():
                 self.bar.show_bar()
-            self.bar.status.setText(STATE_TEXT[state])
+            held = self.listener is not None and self.listener._hold
+            self.bar.status.setText("Listening… (release Space to send)" if held
+                                    else STATE_TEXT[state])  # fmt: skip
         elif state == "thinking":
             self.bar.status.setText(STATE_TEXT[state])
         elif state.startswith("info"):

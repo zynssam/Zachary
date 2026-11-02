@@ -43,6 +43,7 @@ MAX_ROWS = 8
 class QuickBar(QWidget):
     opened = Signal(float)  # ms from hotkey to first results painted
     talk = Signal()  # Ctrl+M: push-to-talk
+    hold_talk = Signal(bool)  # Space held in an empty box: True = pressed, False = released
     reply_applied = Signal(object)
 
     def __init__(self, engine: Engine) -> None:
@@ -93,6 +94,7 @@ class QuickBar(QWidget):
 
         self._last_applied = 0
         self._explicit_selection = False  # user moved with arrows since the last reply
+        self._holding_space = False
         self._open_t0: float | None = None
         self._pending_initial = False
         self._resize_rows(0)
@@ -143,6 +145,16 @@ class QuickBar(QWidget):
         if obj is self.edit and ev.type() == QEvent.Type.KeyPress:
             assert isinstance(ev, QKeyEvent)
             return self._key(ev)
+        if obj is self.edit and ev.type() == QEvent.Type.KeyRelease:
+            assert isinstance(ev, QKeyEvent)
+            if ev.key() == Qt.Key.Key_Space and self._holding_space:
+                if not ev.isAutoRepeat():
+                    self._holding_space = False
+                    self.hold_talk.emit(False)
+                return True
+        if obj is self.edit and ev.type() == QEvent.Type.FocusOut and self._holding_space:
+            self._holding_space = False  # focus lost while holding: treat as released
+            self.hold_talk.emit(False)
         if ev.type() == QEvent.Type.WindowDeactivate and obj is self:
             self._maybe_hide()
         return super().eventFilter(obj, ev)
@@ -150,6 +162,15 @@ class QuickBar(QWidget):
     def _key(self, ev: QKeyEvent) -> bool:
         key = ev.key()
         ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if key == Qt.Key.Key_Space and (self._holding_space or (
+            not self.edit.text() and ev.modifiers() == Qt.KeyboardModifier.NoModifier
+        )):  # fmt: skip
+            # Hold Space in the empty box to talk; release to send. (A search never
+            # starts with a space, so typing is unaffected.)
+            if not ev.isAutoRepeat() and not self._holding_space:
+                self._holding_space = True
+                self.hold_talk.emit(True)
+            return True
         if key == Qt.Key.Key_Escape:
             self.hide()
             return True

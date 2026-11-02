@@ -42,7 +42,16 @@ for working on the phase.
 
 ---
 
-## 2. Two ways to start a command
+## 2. Ways to start a command
+
+**Hold-to-talk** (new): open the bar, **hold Space** while the box is empty, and talk. Pauses don't end
+the command. Let go to send it (a `commit`, then the text arrives in ~0.3 s). Space types a normal space
+once the box has text.
+
+**Press-to-talk:** Super+Alt+Space, Ctrl+M, or `python -m zachary.assistant --talk`. It ends by itself
+350 ms after you stop talking, or when Gnani's VAD (400 ms) says so in a noisy room.
+
+## 2b. Push-to-talk vs "Hey Zach"
 
 | Mode | Setting | Mic | Status |
 |---|---|---|---|

@@ -782,6 +782,42 @@ def test_a_pause_mid_command_keeps_both_halves(gnani: MockGnani) -> None:
     assert got[0].text == f"{gnani.transcript} 1 {gnani.transcript} 2"
 
 
+def test_hold_to_talk_records_until_release(gnani: MockGnani) -> None:
+    """Holding the key: pauses don't end the command; letting go sends it all."""
+    gnani.numbered_segments = True
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got)
+    try:
+        lis.push_to_talk(hold=True)
+        src.load(speech(0.8) + silence(1.2) + speech(0.8, seed=1) + silence(0.6))
+        time.sleep(3.0)  # long pause in the middle: still recording
+        assert got == []
+        lis.release()
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    h = got[0]
+    assert h.text == f"{gnani.transcript} 1 {gnani.transcript} 2"
+    assert h.timeline.info["ended_by"] == "release" and gnani.calls[0]["committed"]
+
+
+def test_hold_released_without_speech(gnani: MockGnani) -> None:
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got)
+    try:
+        lis.push_to_talk(hold=True)
+        time.sleep(0.5)
+        lis.release()
+        wait_until(lambda: got, timeout=5)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert got[0].error is not None and "didn't hear anything" in str(got[0].error)
+
+
 def test_second_press_commits(gnani: MockGnani) -> None:
     gnani.stream_vad = False  # the server never ends it by itself
     src = CountingSource()

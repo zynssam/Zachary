@@ -37,6 +37,7 @@ MAX_COMMAND_S = 12.0
 MIN_COMMAND_S = 0.35
 NO_SPEECH_S = 6.0  # push-to-talk: give up if nothing is said within this time
 SEGMENT_GRACE_S = 0.12  # after a transcript, wait this long for more speech
+MAX_HOLD_S = 28.0  # hold-to-talk cap (REST, the fallback, takes up to 30 s)
 LOCAL_END_MS = 350  # quiet that ends a command locally (then commit immediately)
 COMMIT_WAIT_S = 3.0  # after commit, wait at most this long for the transcript
 SERVER_LAG_S = 1.0  # local VAD heard speech end but the server never started: commit
@@ -176,6 +177,8 @@ class VoiceListener(threading.Thread):
         self.vad = vad or EnergyVAD()
         self._stop_ev = threading.Event()
         self._ptt = threading.Event()
+        self._hold = False
+        self._released = threading.Event()
         self._zero_frames = 0  # digital silence in a row: wrong input device or muted
         self._warned_silent = False
 
@@ -183,9 +186,16 @@ class VoiceListener(threading.Thread):
     def stop(self) -> None:
         self._stop_ev.set()
 
-    def push_to_talk(self) -> None:
-        """Start a command now (no wake word needed)."""
+    def push_to_talk(self, hold: bool = False) -> None:
+        """Start a command now (no wake word needed). ``hold``: record until
+        ``release()`` (hold-to-talk), however long the pauses."""
+        self._hold = hold
+        self._released.clear()
         self._ptt.set()
+
+    def release(self) -> None:
+        """Hold-to-talk: the key was let go, so send what was said."""
+        self._released.set()
 
     # -- thread ------------------------------------------------------------------------
     def run(self) -> None:
@@ -362,13 +372,23 @@ class VoiceListener(threading.Thread):
                 stream.close()
                 stream = None
 
+        hold = self._hold
+        released = False
         while not self._stop_ev.is_set():
             now = time.monotonic()
-            if self._ptt.is_set():  # pressed again: that's the end of the command
+            if self._ptt.is_set() and not hold:  # pressed again: that's the end
                 self._ptt.clear()
                 if stream is not None:
                     commit(now)
                 else:
+                    break
+            if hold and not released and self._released.is_set():
+                released = True  # key let go: send what was said
+                local_ended, local_end_at = True, now
+                if stream is not None:
+                    commit(now)
+                    tl.info["ended_by"] = "release"
+                elif stream_done or connecting is None:
                     break
             if not stream_done and connecting is not None and not connecting.is_alive():
                 stream_done = True
@@ -440,6 +460,7 @@ class VoiceListener(threading.Thread):
                         break
                 if (
                     texts
+                    and (released or not hold)  # holding: pauses don't end the command
                     and segments_open == 0
                     and last_text_at is not None
                     and now - last_text_at >= SEGMENT_GRACE_S
@@ -447,19 +468,33 @@ class VoiceListener(threading.Thread):
                     break  # done: every segment is transcribed and no new speech started
                 if commit_at is not None and now - commit_at > COMMIT_WAIT_S:
                     break
-                if local_ended and commit_at is None and not texts:
+                if local_ended and commit_at is None and not texts and not hold:
                     if server_started:
                         commit(now)  # you stopped talking: finalize now, don't wait
                         tl.info["ended_by"] = "local"
                     elif now - local_end_at > SERVER_LAG_S:
                         commit(now)  # we heard speech the server's VAD didn't: force it
-            elif stream_done and stream_err is not None and not texts and local_ended:
+            elif (
+                stream_done
+                and stream_err is not None
+                and not texts
+                and local_ended
+                and (released or not hold)
+            ):
                 break  # streaming failed: local endpointing, then REST
-            elif stream_done and stream_err is None and connecting is None and local_ended:
+            elif (
+                stream_done
+                and stream_err is None
+                and connecting is None
+                and local_ended
+                and (released or not hold)
+            ):
                 break  # no streaming configured
-            if not (server_started or local_started) and now - t0 > NO_SPEECH_S:
-                break
-            if now - t0 > MAX_COMMAND_S:
+            if not (server_started or local_started) and (
+                released or (not hold and now - t0 > NO_SPEECH_S)
+            ):
+                break  # nothing was said
+            if now - t0 > (MAX_HOLD_S if hold else MAX_COMMAND_S):
                 if stream is not None and commit_at is None:
                     commit(now)
                 elif stream is None or (commit_at is not None and now - commit_at > COMMIT_WAIT_S):
