@@ -1,6 +1,7 @@
 # Phase 4: Voice (report)
 
-Status: **redone after real-use testing (section 0); waiting for review.** Branch `phase-4`.
+Status: **complete; merged into `main`** (after real-use testing, section 0, and the follow-ups below).
+CI: Linux 3.11/3.12 389/392 passed; Windows 3.11/3.12 387 passed.
 
 ## 0. Redo after real use (2 Nov 2026)
 
@@ -37,6 +38,19 @@ headers. Real voices streamed correctly earlier. If recognition is poor with you
 `python -m zachary.cli set stt_streaming false` (REST: about +0.3–0.5 s, but full-clip accuracy).
 
 API calls used for the redo: 9 (smoke 3 + 3, debugging 3). Total for Phase 4: see `cli voice usage`.
+
+### Follow-ups from real use (after the redo)
+
+| Problem | Fix |
+|---|---|
+| Wired/USB earphones not used | the mic follows **the device you're listening on** (headset ↔ its mic), chosen again every command; dead mics remembered; virtual sources never picked |
+| First word cut off ("hackathon folders" → "folders") | while the bar is open the mic stays warm with a **0.6 s local pre-roll** (never sent before the press) |
+| "folders" alone → nothing | a kind word alone lists the most recent folders/photos/documents |
+| Wanted hold-to-talk | **hold Space** in the bar (empty box: at once; while typing: > 0.4 s, a tap is a space) |
+| Reply heard one command late | Gnani sends **two** `complete` messages per TTS reply; the client stopped at the first, so the persistent socket went out of step. Fixed + mock now does the same |
+| 3–4 s before hearing the reply on Bluetooth | software path measured at 0.6–1.2 s; the BT link sleeps when quiet. The speaker is kept awake while the bar is open |
+| Commands ended late | local end of speech (350 ms) commits immediately; Gnani VAD 400 ms as backup |
+| Voice hotkey not delivered sometimes | one portal session for both keys; `--talk` and Ctrl+M as fallbacks |
 
 ## 1. "Done when"
 
