@@ -153,16 +153,30 @@ Tunables at the top of `pipeline.py`:
   - Audio is written in 50 ms blocks, so stopping is near instant.
   - The output stream closes after 10 s of silence.
 
-### 4.5 Microphone and Bluetooth (`audio.py`)
-- `mic_device` setting: `""` follows the system default; it can also be a PipeWire source name, part of a name, or an index.
-- The default input is never a "monitor" (that's speaker output). If it is one, the first real mic is used,
-  preferring a Bluetooth headset.
-- Exact digital silence for 3 s means a dead mic (e.g. this laptop's built-in AMD mic has no Linux driver).
-  The listener then switches to the next mic.
+### 4.5 Microphone and Bluetooth (`audio.py`: `auto_input`; `pipeline.py`: `MicSource`)
+The mic is chosen **again at every command**, so it follows whatever you use. Plugging in wired or USB
+earphones, connecting Bluetooth earbuds, or unplugging them needs no setting. The rules, in order:
+
+1. **The mic of the device you're listening on.** The default output's own mic: earbuds → earbud mic;
+   a USB or wired headset → its mic; laptop speakers → laptop mic. Speaker and mic are paired by
+   `device_key()` (the Bluetooth MAC, or the USB/PCI card id).
+2. Otherwise **the system default input**, if it's a real mic.
+3. Otherwise any real mic, headsets first.
+
+Never picked: speaker monitors, virtual sources (e.g. the `zach_virtual_mic` test feed), and mics
+**found dead**. A mic that gives exact digital silence for 3 s is switched away from during the command and
+remembered, so it's skipped from then on. This laptop's built-in AMD mic is such a case.
+
+- **`mic_device` setting:** `""` (default) means automatic. A hand-picked mic that has since been unplugged
+  falls back to automatic instead of failing. `cli voice mics` lists mics with live levels, `[virtual]` and
+  `[selected]`; `cli voice mics default` goes back to automatic.
 - **Bluetooth earbuds:** their mic only works in headset (HFP) mode, which makes music sound like a call.
   - On press: switch to headset mode.
   - After the mic closes: switch back **8 s later**, so quick follow-ups don't flip it each time (a flip takes 1–3 s).
 - Routing env vars (`PIPEWIRE_NODE`, …) are set only while the input stream opens, so playback is never sent to a mic.
+- Playback goes to the system's default output; PipeWire moves it when you switch devices.
+- **Windows:** there's no PipeWire, so the mic is the Windows default input, which Windows switches by
+  itself when a headset connects. A device number from `voice mics` pins one.
 
 ### 4.6 Hotkeys (`linux_portal.py`)
 - GNOME binds only one portal session per app, so both shortcuts (`toggle` = Super+Space, `voice` =

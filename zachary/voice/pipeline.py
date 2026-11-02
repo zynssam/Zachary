@@ -64,42 +64,72 @@ class FrameSource(Protocol):
 
 
 class MicSource:
+    """The microphone for voice commands.
+
+    With no ``device`` setting it's automatic and re-decided at every command, so it
+    follows what you're using: plug in wired earphones, connect Bluetooth earbuds,
+    or unplug them, and the next command uses the right mic (``audio.auto_input``).
+    A mic that turns out dead (digital silence) is remembered and skipped. A mic
+    chosen by hand that has been unplugged falls back to automatic.
+    """
+
     def __init__(self, mic: MicStream | None = None, device: str = "") -> None:
+        self.device = device
         self.mic = mic or MicStream(device)
-        self.auto = mic is None and not device  # free to try other mics
-        self._tried: set[str] = set()
+        self.auto = mic is None and not device
+        self.fixed = mic is not None  # a stream given by the caller: never replaced
+        self.dead: set[str] = set()  # source names that gave only digital silence
+
+    def _auto_stream(self) -> MicStream:
+        from zachary.voice.audio import auto_input
+
+        if self.mic.active:
+            return self.mic
+        return MicStream(auto_input(exclude=self.dead))
+
+    def start(self) -> None:
+        if self.auto:
+            self.mic = self._auto_stream()
+            self.mic.start()
+            if self.mic.source_name:
+                log.info("voice: using microphone %s", self.mic.source_name)
+            return
+        try:
+            self.mic.start()
+        except Exception as e:
+            if self.fixed:
+                raise
+            log.warning("voice: microphone %r unavailable (%s); choosing automatically",
+                        self.device, e)  # fmt: skip
+            self.mic = self._auto_stream()
+            self.mic.start()
 
     def try_next(self) -> str | None:
         """The current mic gives digital silence (e.g. a laptop mic with no Linux
-        driver): switch to the next real microphone. Returns its name, or None."""
-        if not self.auto:
+        driver): remember it as dead and switch to the next real microphone."""
+        if self.fixed:
             return None
-        from zachary.voice.audio import list_inputs
+        from zachary.voice.audio import auto_input
 
-        self._tried.add(self.mic.source_name or self.mic.device or "<default>")
+        current = self.mic.source_name or self.mic.device
+        if current:
+            self.dead.add(current)
         try:
-            current_default = [d.id for d in list_inputs() if d.is_default]
-            self._tried.update(current_default if not self.mic.source_name else [])
-            # Real microphones only: a virtual source (e.g. a test feed) is never a fallback.
-            options = [d for d in list_inputs() if d.id not in self._tried and not d.virtual]
+            name = auto_input(exclude=self.dead)
         except Exception:
             return None
-        # Prefer a headset mic (what the user is wearing), then anything else.
-        options.sort(key=lambda d: not d.id.startswith("bluez_input"))
-        for d in options:
-            self._tried.add(d.id)
-            self.mic.stop()
-            self.mic.drain()
-            self.mic = MicStream(d.id)
-            try:
-                self.mic.start()
-            except Exception:
-                continue
-            return d.label
-        return None
-
-    def start(self) -> None:
-        self.mic.start()
+        if not name or name == current:
+            return None
+        self.mic.stop()
+        self.mic.drain()
+        self.mic = MicStream(name)
+        self.auto = True
+        try:
+            self.mic.start()
+        except Exception:
+            self.dead.add(name)
+            return None
+        return name
 
     def stop(self) -> None:
         self.mic.stop()

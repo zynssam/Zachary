@@ -189,6 +189,8 @@ Then press **Ctrl+Alt+M** (or Ctrl+M in the bar), say "open fee receipt", and pa
 end of your sentence, and the reply is spoken.
 
 ### Choosing the microphone
+By default Zachary uses the **Windows default input**, and Windows switches that by itself when you plug in
+earphones or connect Bluetooth earbuds. Usually there's nothing to set. Pin a mic only if Windows picks the wrong one:
 Windows lists each mic several times, once per audio system (MME, DirectSound, WASAPI…).
 `voice mics` shows each one with an **id (a number)** and a level bar.
 1. Run it and talk.

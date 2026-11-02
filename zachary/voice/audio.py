@@ -215,16 +215,64 @@ def list_inputs() -> list[InputDevice]:
     ]
 
 
+def _pactl_default_sink() -> str:
+    if not shutil.which("pactl"):
+        return ""
+    try:
+        return subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True,
+                              timeout=3).stdout.strip()  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def device_key(node: str) -> str:
+    """The physical device behind a PipeWire node name, so a headset's speaker and
+    mic match: ``bluez_output.88:D6:...`` / ``bluez_input.88:D6:...`` -> the MAC;
+    ``alsa_output.usb-JBL_...-00.analog-stereo`` / ``alsa_input.usb-JBL_...-00.mono-
+    fallback`` -> ``usb-JBL_...-00`` (also works for ``pci-0000_03_00.6``)."""
+    if node.startswith(("bluez_output.", "bluez_input.")):
+        return node.split(".")[1]
+    if node.startswith(("alsa_output.", "alsa_input.")) and node.count(".") >= 2:
+        return node[node.index(".") + 1 : node.rindex(".")]
+    return node
+
+
+def auto_input(exclude: set[str] | frozenset[str] = frozenset()) -> str:
+    """Pick the microphone the user is most likely talking into, right now.
+
+    1. the mic of the device they're *listening on* (Bluetooth earbuds, a USB or
+       wired headset: the default output's own mic);
+    2. otherwise the system's default input, if it's a real microphone;
+    3. otherwise any real mic, headsets first.
+    Virtual sources, speaker monitors and ``exclude`` (mics found dead) are never
+    picked. Returns a PipeWire/Pulse source name, or "" (let the system decide,
+    e.g. on Windows, where the default input already follows the active device).
+    """
+    sources, default = _pactl_sources()
+    real = [str(x["name"]) for x in sources if not _is_virtual(x)]
+    names = [n for n in real if n not in exclude]
+    if not names:
+        return ""
+    sink = _pactl_default_sink()
+    if sink:
+        key = device_key(sink)
+        same = [n for n in names if device_key(n) == key]
+        if same:
+            return same[0]
+    if default in names:
+        return default
+    names.sort(key=lambda n: (not n.startswith("bluez_input"), "usb" not in n))
+    return names[0]
+
+
 def resolve_input(choice: str) -> tuple[int | str | None, str]:
     """(sounddevice device, PipeWire/Pulse source name) for a mic_device setting.
 
-    "" follows the system's default input, except when that default is a *monitor*
-    (the sound going to speakers/earbuds, never a microphone; it happens when
-    Bluetooth earbuds connect): then the first real microphone is used, preferring
-    a Bluetooth headset mic, since that's what the user is wearing.
+    "" means automatic: see ``auto_input`` (the headset you're listening on, else
+    the default input; never a monitor or a virtual source).
     """
     choice = choice.strip()
-    sources, default = _pactl_sources()
+    sources, _default = _pactl_sources()
     names = [str(x["name"]) for x in sources]
     if choice in names:
         return None, choice
@@ -236,11 +284,8 @@ def resolve_input(choice: str) -> tuple[int | str | None, str]:
             if low in str(x["name"]).lower() or low in str(x.get("description", "")).lower():
                 return None, str(x["name"])
         return choice, ""  # sounddevice name match
-    if sources and (default.endswith(".monitor") or default not in names):
-        mics = [n for n in names if n.startswith(("alsa_input", "bluez_input"))] or names
-        pick = next((n for n in mics if n.startswith("bluez_input")), mics[0])
-        log.info("default input %r is not a microphone; using %r", default, pick)
-        return None, pick
+    if sources:
+        return None, auto_input()
     return None, ""
 
 

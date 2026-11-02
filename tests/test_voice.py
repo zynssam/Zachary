@@ -507,29 +507,137 @@ def test_silent_microphone_is_reported() -> None:
     lis.join(5)
 
 
-def test_input_device_choice(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A Bluetooth output *monitor* as the default input is never used as the mic."""
+LAPTOP_IN = "alsa_input.pci-0000_03_00.6.analog-stereo"
+LAPTOP_OUT = "alsa_output.pci-0000_03_00.6.analog-stereo"
+USB_IN = "alsa_input.usb-KTMICRO_JBL_TUNE_310C_USB-C_2020-02-20-00.mono-fallback"
+USB_OUT = "alsa_output.usb-KTMICRO_JBL_TUNE_310C_USB-C_2020-02-20-00.analog-stereo"
+BT_IN, BT_OUT = "bluez_input.88:D6:38:17:48:20", "bluez_output.88:D6:38:17:48:20.1"
+VIRTUAL = {"name": "zach_virtual_mic", "description": "VoiceSender_mic",
+           "properties": {"node.virtual": "true", "device.class": "filter"}}  # fmt: skip
+
+
+def _system(monkeypatch: pytest.MonkeyPatch, inputs: list[object], default_in: str,
+            default_out: str) -> None:  # fmt: skip
     from zachary.voice import audio
 
-    srcs = [{"name": "alsa_input.pci.analog-stereo", "description": "Internal Microphone"},
-            {"name": "bluez_input.88:D6", "description": "Bullets Z2"}]  # fmt: skip
-    monkeypatch.setattr(audio, "_pactl_sources", lambda: (srcs, "bluez_output.88:D6.monitor"))
-    assert audio.resolve_input("") == (None, "bluez_input.88:D6")  # headset mic preferred
-    assert audio.resolve_input("bullets") == (None, "bluez_input.88:D6")
-    assert audio.resolve_input("alsa_input.pci.analog-stereo") == (
-        None,
-        "alsa_input.pci.analog-stereo",
-    )
-    assert audio.resolve_input("3") == (3, "")
-    monkeypatch.setattr(audio, "_pactl_sources", lambda: (srcs, "alsa_input.pci.analog-stereo"))
-    assert audio.resolve_input("") == (None, "")  # a real default: follow the system
-    assert [d.is_default for d in audio.list_inputs()] == [True, False]
-    # A virtual source (null-sink remap, e.g. a test feed) is listed but never auto-picked.
-    virt = {"name": "zach_virtual_mic", "description": "VoiceSender_mic",
-            "properties": {"node.virtual": "true", "device.class": "filter"}}  # fmt: skip
-    monkeypatch.setattr(audio, "_pactl_sources", lambda: ([virt, *srcs], "bluez_output.x.monitor"))
-    assert audio.resolve_input("") == (None, "bluez_input.88:D6")
+    srcs = [x if isinstance(x, dict) else {"name": x, "description": x} for x in inputs]
+    monkeypatch.setattr(audio, "_pactl_sources", lambda: (srcs, default_in))
+    monkeypatch.setattr(audio, "_pactl_default_sink", lambda: default_out)
+
+
+def test_device_key_pairs_a_headsets_speaker_and_mic() -> None:
+    from zachary.voice.audio import device_key
+
+    assert device_key(BT_IN) == device_key(BT_OUT) == "88:D6:38:17:48:20"
+    assert device_key(USB_IN) == device_key(USB_OUT)
+    assert device_key(LAPTOP_IN) == device_key(LAPTOP_OUT) == "pci-0000_03_00.6"
+    assert device_key(USB_IN) != device_key(LAPTOP_IN)
+
+
+@pytest.mark.parametrize(
+    ("default_in", "default_out", "expect"),
+    [
+        (LAPTOP_IN, BT_OUT, BT_IN),  # earbuds connected: talk into the earbuds
+        (LAPTOP_IN, USB_OUT, USB_IN),  # wired/USB headset plugged in: its mic
+        (USB_IN, LAPTOP_OUT, LAPTOP_IN),  # listening on laptop speakers: laptop mic
+        ("bluez_output.x.monitor", "", BT_IN),  # default input is a monitor: a real mic
+        (USB_IN, "some_hdmi_output", USB_IN),  # output has no mic: the default input
+    ],
+)
+def test_auto_mic_follows_the_device_you_listen_on(
+    monkeypatch: pytest.MonkeyPatch, default_in: str, default_out: str, expect: str
+) -> None:
+    from zachary.voice import audio
+
+    _system(monkeypatch, [LAPTOP_IN, VIRTUAL, USB_IN, BT_IN], default_in, default_out)
+    assert audio.auto_input() == expect
+    assert audio.resolve_input("") == (None, expect)
+
+
+def test_auto_mic_never_picks_virtual_or_dead(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zachary.voice import audio
+
+    _system(monkeypatch, [VIRTUAL, LAPTOP_IN, USB_IN], "zach_virtual_mic", LAPTOP_OUT)
+    assert audio.auto_input() == LAPTOP_IN
+    assert audio.auto_input(exclude={LAPTOP_IN}) == USB_IN  # laptop mic found dead
+    assert audio.auto_input(exclude={LAPTOP_IN, USB_IN}) == ""  # nothing left: system default
     assert [d.virtual for d in audio.list_inputs()] == [True, False, False]
+
+
+def test_manual_mic_choice(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zachary.voice import audio
+
+    _system(monkeypatch, [LAPTOP_IN, BT_IN], LAPTOP_IN, LAPTOP_OUT)
+    assert audio.resolve_input("88:D6") == (None, BT_IN)  # part of a name
+    assert audio.resolve_input(LAPTOP_IN) == (None, LAPTOP_IN)
+    assert audio.resolve_input("3") == (3, "")  # a device number (Windows)
+
+
+def test_mic_is_chosen_again_for_every_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plug in a headset between two commands: the next command uses it. A dead mic
+    (digital silence) is skipped from then on."""
+    from zachary.voice import audio, pipeline
+
+    opened: list[str] = []
+
+    class FakeStream:
+        def __init__(self, device: str = "") -> None:
+            self.device = device
+            self.source_name = device
+            self.active = False
+            self.frames: queue.Queue[bytes] = queue.Queue()
+
+        def start(self) -> None:
+            self.active = True
+            opened.append(self.device)
+
+        def stop(self) -> None:
+            self.active = False
+
+        def drain(self) -> None: ...
+
+    monkeypatch.setattr(pipeline, "MicStream", FakeStream)
+    _system(monkeypatch, [LAPTOP_IN], LAPTOP_IN, LAPTOP_OUT)
+    src = pipeline.MicSource()
+    src.start()
+    src.stop()
+    _system(monkeypatch, [LAPTOP_IN, USB_IN], USB_IN, USB_OUT)  # JBL plugged in
+    src.start()
+    src.stop()
+    _system(monkeypatch, [LAPTOP_IN, BT_IN], LAPTOP_IN, BT_OUT)  # JBL out, earbuds on
+    src.start()
+    assert opened == [LAPTOP_IN, USB_IN, BT_IN]
+    _system(monkeypatch, [LAPTOP_IN, BT_IN], LAPTOP_IN, LAPTOP_OUT)
+    src.stop()
+    src.start()  # laptop speakers again -> laptop mic, but it's dead (zeros) ...
+    assert src.try_next() == BT_IN  # ... so it switches and remembers
+    src.stop()
+    src.start()
+    assert opened[-1] == BT_IN and src.dead == {LAPTOP_IN}
+    del audio
+
+
+def test_unplugged_manual_mic_falls_back_to_automatic(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zachary.voice import pipeline
+
+    class FakeStream:
+        def __init__(self, device: str = "") -> None:
+            self.device = self.source_name = device
+            self.active = False
+
+        def start(self) -> None:
+            if self.device == "gone-headset":
+                raise RuntimeError("no such device")
+            self.active = True
+
+        def stop(self) -> None:
+            self.active = False
+
+    monkeypatch.setattr(pipeline, "MicStream", FakeStream)
+    _system(monkeypatch, [LAPTOP_IN, USB_IN], USB_IN, USB_OUT)
+    src = pipeline.MicSource(device="gone-headset")
+    src.start()
+    assert src.mic.device == USB_IN and src.mic.active
 
 
 def test_silent_microphone_switches_to_another() -> None:
