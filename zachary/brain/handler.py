@@ -14,15 +14,19 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from typing import Protocol
 
+from zachary.brain import sessions as sess
 from zachary.brain.context import Context, Item
 from zachary.brain.intents import Intent, parse
 from zachary.brain.timeparse import parse_time
 from zachary.core.config import Config, PathRules
+from zachary.indexer import clustering
 from zachary.indexer.projects import list_projects
 from zachary.indexer.relations import related as related_files
-from zachary.search.hybrid import SearchResult, recent, search
+from zachary.search import feedback
+from zachary.search.hybrid import SearchResult, recent, search, search_terms
 from zachary.search.tokens import words
 from zachary.search.vectors import SemanticSearch
 
@@ -74,6 +78,27 @@ def _ago(ts: float, now: float) -> str:
     return "yesterday" if days == 1 else f"{days} days ago"
 
 
+def _span(s: sess.Session) -> str:
+    """ "Tue 9:10 pm" / "yesterday 9:10 pm" / "today 9:10 pm"."""
+    t = time.localtime(s.start)
+    d = date.fromtimestamp(s.start)
+    today = date.today()
+    day = (
+        "today" if d == today
+        else "yesterday" if d == today - timedelta(days=1)
+        else time.strftime("%a %d %b", t)
+    )  # fmt: skip
+    return f"{day} {time.strftime('%I:%M %p', t).lstrip('0').lower()}"
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def _minutes(m: int) -> str:
+    return f"{m // 60} h {m % 60} min" if m >= 60 else f"{m} min"
+
+
 def _item(r: SearchResult, conn: sqlite3.Connection | None = None) -> Item:
     it = Item(r.file_id, r.path, r.name, r.kind, r.is_dir, r.last_seen, list(r.why), r.score)
     if r.versions and conn is not None:
@@ -119,6 +144,9 @@ class Handler:
         self._semantic_provider = semantic
         self._semantic: SemanticSearch | None = None
         self._semantic_tried = 0.0
+        self._sessions: dict[int, sess.Session] = {}  # timeline rows -> sessions
+        # A proposal waiting for "yes": ("reopen", files, what). Only from submit().
+        self._pending: tuple[str, list[Item], str] | None = None
 
     @property
     def semantic(self) -> SemanticSearch | None:
@@ -216,6 +244,14 @@ class Handler:
                 else "No projects found yet."
             )
             reply = Reply(say, "projects", items, intent)
+        elif intent.kind == "topic":
+            reply = self._topics(intent, execute=execute)
+        elif intent.kind == "resume":
+            reply = self._resume(intent, execute=execute)
+        elif intent.kind == "timeline":
+            reply = self._timeline(intent)
+        elif intent.kind in {"confirm", "cancel"}:
+            reply = self._answer(intent, execute=execute)
         elif intent.kind == "recent":
             items = self._recent(intent.query)
             self.context.set_results(items, text, "recent")
@@ -253,6 +289,8 @@ class Handler:
                 target = items[0]
                 if execute:
                     ok = self.actions.open(target)
+                    if ok and view == "results":
+                        feedback.record(self.conn, search_terms(intent.query), target.file_id, 0)
                     say = f"Opening {target.name}." if ok else f"Couldn't open {target.name}."
                     return Reply(say, view, items, intent, "open" if ok else None, target, 0)
                 return Reply(
@@ -263,6 +301,118 @@ class Handler:
             return Reply(note or f"Which one? I found {len(items)} matches.", view, shown, intent)
         say = note or (f"Found {len(items)}." if len(items) < RESULT_LIMIT else "Top matches.")
         return Reply(say, view, items, intent, selected=0)
+
+    # -- Phase 5: topics, resume, timeline ---------------------------------------------
+    def _file_items(self, file_ids: list[int], why: str) -> list[Item]:
+        if not file_ids:
+            return []
+        marks = ",".join("?" * len(file_ids))
+        rows = {
+            r[0]: r
+            for r in self.conn.execute(
+                f"SELECT id, path, name, kind, is_dir, mtime FROM files WHERE id IN ({marks})",
+                file_ids,
+            )
+        }
+        rules = self.rules()
+        return [
+            Item(f, rows[f][1], rows[f][2], rows[f][3], bool(rows[f][4]), float(rows[f][5]), [why])
+            for f in file_ids
+            if f in rows and not rules.is_excluded(rows[f][1], bool(rows[f][4]))
+        ]
+
+    def _topics(self, intent: Intent, *, execute: bool) -> Reply:
+        topics = clustering.list_topics(self.conn)
+        if not topics:
+            return Reply("No topics yet. They're built overnight once your files are indexed.",
+                         "none", [], intent)  # fmt: skip
+        if intent.query:
+            want = set(words(intent.query))
+            scored = sorted(
+                ((len(want & set(words(t.label))) / max(1, len(want)), t) for t in topics),
+                key=lambda x: -x[0],
+            )
+            if scored and scored[0][0] >= 0.5:
+                return self._drill(self._topic_item(scored[0][1]), intent, execute=execute)
+            # No topic by that name: an ordinary search for it.
+            return self._find_or_open(Intent("find", query=intent.query), execute=execute)
+        items = [self._topic_item(t) for t in topics]
+        self.context.set_results(items, "", "topics")
+        top = ", ".join(t.label for t in topics[:3])
+        return Reply(f"{len(items)} topics. Most recent: {top}.", "topics", items, intent)
+
+    @staticmethod
+    def _topic_item(t: clustering.Topic) -> Item:
+        return Item(t.id, "", t.label, "topic", False, t.last_ts, [f"{t.size} files"], 0.0,
+                    "topic")  # fmt: skip
+
+    def _drill(self, target: Item, intent: Intent, *, execute: bool) -> Reply:
+        """Open a topic or a session: show what's in it."""
+        if target.kind == "topic":
+            items = self._file_items(clustering.topic_files(self.conn, target.file_id, 100),
+                                     f"topic: {target.name}")  # fmt: skip
+            self.context.set_results(items, target.name, "results")
+            return Reply(f"{target.name}: {len(items)} files.", "results", items, intent,
+                         selected=0)  # fmt: skip
+        s = self._sessions.get(target.file_id)
+        if s is None:
+            return Reply("That session is gone; ask for the timeline again.", "none", [], intent)
+        return self._session_reply(s, intent, execute=execute, lead=s.label)
+
+    def _session_reply(self, s: sess.Session, intent: Intent, *, execute: bool, lead: str) -> Reply:
+        files = sess.resume_files(s)
+        items = self._file_items([f.file_id for f in files], f"{_span(s)}")
+        items = [it for it in items if os.path.lexists(it.path)]
+        self.context.set_results(items, "", "session")
+        if not items:
+            return Reply(f"{lead}: nothing left to reopen.", "session", [], intent)
+        what = _count(len(items), "file")
+        if execute:
+            self._pending = ("reopen", items, what)
+        return Reply(f"{lead} ({_span(s)}, {s.minutes} min): {what}. Reopen them?", "session",
+                     items, intent, selected=0)  # fmt: skip
+
+    def _resume(self, intent: Intent, *, execute: bool) -> Reply:
+        s = sess.last_session(self.conn)
+        if s is None:
+            return Reply("I don't have a recent work session to resume yet.", "none", [], intent)
+        return self._session_reply(s, intent, execute=execute,
+                                   lead=f"Your last session, {s.label}")  # fmt: skip
+
+    def _timeline(self, intent: Intent) -> Reply:
+        now = time.time()
+        tr = parse_time(intent.query).range
+        start, end, label = (tr.start, tr.end, tr.label) if tr else (now - 86400, now, "today")
+        found = sess.sessions(self.conn, start, end)
+        self._sessions = dict(enumerate(found))
+        items = [
+            Item(i, "", s.label or "Session", "session", False, s.end,
+                 [_span(s), f"{s.minutes} min", _count(len(s.files), "file")], 0.0, "session")
+            for i, s in reversed(list(enumerate(found)))
+        ]  # fmt: skip
+        self.context.set_results(items, intent.query, "timeline")
+        if not items:
+            return Reply(f"Nothing worked on {label}.", "timeline", [], intent)
+        longest = sorted(found, key=lambda s: -(s.end - s.start))[:3]
+        parts = ", ".join(f"{s.label} {_minutes(s.minutes)}" for s in longest)
+        return Reply(f"{label.capitalize()}: {_count(len(found), 'session')}. {parts}.",
+                     "timeline", items, intent, selected=0)  # fmt: skip
+
+    def _answer(self, intent: Intent, *, execute: bool) -> Reply:
+        pending, self._pending = self._pending, None
+        if intent.kind == "cancel" or pending is None:
+            say = (
+                "Okay." if pending is not None or intent.kind == "cancel" else "Nothing to confirm."
+            )
+            return Reply(say, self.context.view, self.context.items, intent)
+        if not execute:
+            self._pending = pending  # preview: don't consume it
+            return Reply(f"Enter to reopen {pending[2]}.", "session", pending[1], intent)
+        _kind, items, what = pending
+        opened = sum(1 for it in items if self.actions.open(it))
+        say = f"Reopened {opened} of {len(items)} files." if opened < len(items) else (
+            f"Reopened {what}.")  # fmt: skip
+        return Reply(say, "session", items, intent, "open" if opened else None)
 
     def _related(self, intent: Intent) -> Reply:
         """Precomputed related files of a shown item or of the best match for a query."""
@@ -336,6 +486,8 @@ class Handler:
             target = ctx.focused_item()
             if target is None:
                 return Reply("Nothing selected.", ctx.view, ctx.items, intent)
+        if target.kind in {"topic", "session"}:
+            return self._drill(target, intent, execute=execute)
         action = "reveal" if intent.kind == "reveal" or intent.action == "reveal" else "open"
         idx = ctx.focused
         if not execute:
@@ -344,6 +496,8 @@ class Handler:
                 f"Enter to {verb}: {target.name}.", ctx.view, ctx.items, intent, action, target, idx
             )
         ok = self.actions.reveal(target) if action == "reveal" else self.actions.open(target)
+        if ok and ctx.view == "results" and idx is not None:
+            feedback.record(self.conn, search_terms(ctx.query), target.file_id, idx)
         if action == "reveal":
             say = f"Showing {target.name} in its folder." if ok else f"Couldn't show {target.name}."
         else:

@@ -1,7 +1,7 @@
 # Running and testing Zachary
 
 How to set up, run every part (indexer, CLI, quick bar), run all automated
-checks and benchmarks, and test everything by hand. Covers Phases 0–4.
+checks and benchmarks, and test everything by hand. Covers Phases 0–5.
 
 **On Windows?** See [windows.md](windows.md) for the full Windows setup.
 
@@ -307,6 +307,18 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 | 8 | Say "Hey Zach, open the <something vague> I opened yesterday" | if nothing matches by name, content or close meaning: "Which one?" with a list, **never** a guess |
 | 9 | Turn Wi-Fi off, say a command | it still works via local whisper (fallback) |
 | 10 | `tail -1 ~/.local/share/zachary/latency.jsonl` | per-stage timings: wake, speech_end, stt, intent_search, tts_first_audio, tts_done |
+
+### Phase 5: topics, timeline, resume, learning
+| # | Do | Expect |
+|---|---|---|
+| 1 | `python -m zachary.cli topics --rebuild` (or wait: the indexer does it nightly) | "N topics from M files"; then a list like `16 files  Fees`, `25 files  Machine Learning, …` |
+| 2 | Bar: "show my topics", Enter on one | the topic's files (spanning folders), each "topic: …" |
+| 3 | Bar or voice: "topic fees" | that topic's files directly |
+| 4 | "what was I working on yesterday" | timeline: one row per session (label, time, minutes, files); spoken summary |
+| 5 | Enter on a session → "Reopen them?" → type/say "yes" | its files open; "no" cancels; nothing opens without "yes" |
+| 6 | "resume where I left off" → "yes" | your last real work session's files reopen (max 8) |
+| 7 | Search "report", open the 3rd result twice (Enter on it / "open the third one"); search "report" again | it's now first, with "you chose this before" |
+| 8 | "open my resume" | still searches for a file called resume (not the resume command) |
 
 ---
 

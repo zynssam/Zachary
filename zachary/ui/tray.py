@@ -12,6 +12,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
+from zachary.ui import style
+
 
 def app_icon() -> QIcon:
     """A simple drawn icon (no asset files): a rounded square with a "Z"."""
@@ -19,7 +21,7 @@ def app_icon() -> QIcon:
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QColor("#3b82f6"))
+    p.setBrush(QColor(style.ACCENT))
     p.setPen(Qt.PenStyle.NoPen)
     p.drawRoundedRect(4, 4, 56, 56, 14, 14)
     f = QFont()

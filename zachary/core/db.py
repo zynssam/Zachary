@@ -244,7 +244,15 @@ CREATE TABLE ivf_centroids (
 );
 """
 
-MIGRATIONS: tuple[str, ...] = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3)
+# Migration #4 (Phase 5): feedback keeps the query's words, so a choice also helps
+# *similar* queries ("fee receipt" after choosing for "fee receipt sem 5"), and an
+# index for the per-file lookups of the boost.
+_MIGRATION_4 = """
+ALTER TABLE feedback ADD COLUMN terms TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_feedback_ts ON feedback(ts);
+"""
+
+MIGRATIONS: tuple[str, ...] = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3, _MIGRATION_4)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 

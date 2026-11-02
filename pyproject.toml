@@ -20,6 +20,7 @@ dependencies = [
     "websockets>=13",  # Gnani streaming STT / TTS
     "sounddevice>=0.4",  # microphone and speaker (PortAudio)
     "pywhispercpp>=1.2",  # local wake-word spotting and offline STT (whisper.cpp)
+    "scikit-learn>=1.5",  # HDBSCAN for topics (indexer only, loaded nightly)
     "watchdog>=4.0",
     "PySide6-Essentials>=6.6",
     "jeepney>=0.8; sys_platform == 'linux'",  # D-Bus: hotkey portal, file-manager reveal
@@ -80,7 +81,7 @@ disallow_untyped_calls = false
 [[tool.mypy.overrides]]
 module = ["sqlite_vec", "jeepney", "jeepney.*", "openpyxl", "openpyxl.*", "pptx", "pptx.*",
           "docx", "docx.*", "pymupdf", "model2vec", "model2vec.*", "huggingface_hub",
-          "sounddevice", "pywhispercpp", "pywhispercpp.*"]
+          "sounddevice", "pywhispercpp", "pywhispercpp.*", "sklearn", "sklearn.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

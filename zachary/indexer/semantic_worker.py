@@ -21,7 +21,7 @@ from pathlib import Path
 from zachary.core.config import Config
 from zachary.core.db import open_db, set_state
 from zachary.core.platform import Platform
-from zachary.indexer import relations, versions
+from zachary.indexer import clustering, relations, versions
 from zachary.indexer.embedder import Embedder, Model2VecEmbedder
 from zachary.indexer.semantic import SemanticIndexer
 from zachary.search import vectors
@@ -163,5 +163,12 @@ class SemanticWorker(threading.Thread):
         if self._versions_dirty.is_set():
             self._versions_dirty.clear()
             versions.rebuild(conn)
+        if clustering.due(conn):  # nightly: topics (virtual collections)
+            try:
+                roots = [str(r) for r in Config(conn, self.platform).index_roots()]
+                clustering.build(conn, roots)
+            except Exception as e:  # e.g. scikit-learn missing: topics just stay as they are
+                log.warning("topic clustering failed: %s", e)
+                set_state(conn, "topics.error", f"{type(e).__name__}: {e}")
         set_state(conn, "semantic.maintained_at", time.time())
         log.debug("semantic maintenance %.1fs", time.perf_counter() - t0)
