@@ -423,16 +423,30 @@ class MicStream:
         self.source_name = source
         self._buf = b""
         self.drain()
-        with _routed_to(source):
-            stream = sd.RawInputStream(
+
+        def open_input(dev: int | str | None) -> Any:
+            s = sd.RawInputStream(
                 samplerate=SAMPLE_RATE,
                 blocksize=FRAME_SAMPLES,
                 channels=1,
                 dtype="int16",
-                device=device,
+                device=dev,
                 callback=self._callback,
             )
-        stream.start()
+            s.start()
+            return s
+
+        try:
+            with _routed_to(source):
+                stream = open_input(device)
+        except Exception as e:
+            if not source and device is None:
+                raise
+            # Routing to that mic failed: take the system's default input instead.
+            log.warning("can't open microphone %r (%s); using the system default",
+                        source or device, e)  # fmt: skip
+            self.source_name = ""
+            stream = open_input(None)
         self._stream = stream
 
     def stop(self) -> None:

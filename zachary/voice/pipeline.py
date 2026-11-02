@@ -36,7 +36,8 @@ COMMAND_WAIT_S = 5.0  # after a bare "Hey Zach", how long to wait for the comman
 MAX_COMMAND_S = 12.0
 MIN_COMMAND_S = 0.35
 NO_SPEECH_S = 6.0  # push-to-talk: give up if nothing is said within this time
-SEGMENT_GRACE_S = 0.2  # after a transcript, wait this long for more speech
+SEGMENT_GRACE_S = 0.12  # after a transcript, wait this long for more speech
+LOCAL_END_MS = 350  # quiet that ends a command locally (then commit immediately)
 COMMIT_WAIT_S = 3.0  # after commit, wait at most this long for the transcript
 SERVER_LAG_S = 1.0  # local VAD heard speech end but the server never started: commit
 SILENT_FRAMES = int(3.0 * SAMPLE_RATE / 512)  # 3 s of exact zeros
@@ -280,6 +281,8 @@ class VoiceListener(threading.Thread):
                 self.source.start()
                 opened_here = True
         except Exception as e:
+            log.warning("voice: microphone unavailable: %s", e)
+            tl.info["error_detail"] = f"{type(e).__name__}: {e}"
             heard = Heard("", None, tl, VoiceError("config", f"microphone unavailable ({e})"))
             heard.via = "ptt"
             tl.mark("stt")
@@ -329,7 +332,9 @@ class VoiceListener(threading.Thread):
         stream_done = connecting is None  # finished connecting (or no streaming at all)
         backlog: collections.deque[bytes] = collections.deque()
         audio = bytearray()
-        vad = EnergyVAD(ratio=2.0, min_rms=0.003, end_silence_ms=self.vad.end_ms)
+        # Local end-of-speech after LOCAL_END_MS of quiet: we then commit at once instead
+        # of waiting for Gnani's own silence timer (saves ~0.3-0.5 s per command).
+        vad = EnergyVAD(ratio=2.0, min_rms=0.003, end_silence_ms=LOCAL_END_MS)
         vad.noise = min(self.vad.noise, 0.0015)
         peak = 0.0
         local_started = local_ended = False
@@ -349,6 +354,8 @@ class VoiceListener(threading.Thread):
                 return
             commit_at = now
             try:
+                while backlog:  # audio still queued from the connection catch-up
+                    stream.feed(backlog.popleft())
                 stream.commit()
             except Exception as e:
                 stream_err = VoiceError("network", f"stream broke: {type(e).__name__}")
@@ -406,11 +413,18 @@ class VoiceListener(threading.Thread):
                             tl.mark("speech_start")
                         server_started = True
                         segments_open += 1  # more speech: wait for its transcript too
+                        if commit_at is not None:  # you kept talking after a pause
+                            commit_at = None
+                            local_ended = False
                     elif kind == "processing":
                         if "speech_end" not in tl.stages():
                             tl.mark("speech_end")
                     elif kind == "transcript":
                         segments_open = max(0, segments_open - 1)
+                        if local_ended:  # you stopped talking LOCAL_END_MS before local_end_at
+                            tl.info["text_after_speech_ms"] = round(
+                                (now - local_end_at) * 1e3 + LOCAL_END_MS
+                            )
                         if msg.get("text"):
                             texts.append(str(msg["text"]).strip())
                             lang = msg.get("detected_language_code") or lang
@@ -433,13 +447,12 @@ class VoiceListener(threading.Thread):
                     break  # done: every segment is transcribed and no new speech started
                 if commit_at is not None and now - commit_at > COMMIT_WAIT_S:
                     break
-                if (
-                    local_ended
-                    and not server_started
-                    and now - local_end_at > SERVER_LAG_S
-                    and commit_at is None
-                ):
-                    commit(now)  # we heard speech the server's VAD didn't: force it
+                if local_ended and commit_at is None and not texts:
+                    if server_started:
+                        commit(now)  # you stopped talking: finalize now, don't wait
+                        tl.info["ended_by"] = "local"
+                    elif now - local_end_at > SERVER_LAG_S:
+                        commit(now)  # we heard speech the server's VAD didn't: force it
             elif stream_done and stream_err is not None and not texts and local_ended:
                 break  # streaming failed: local endpointing, then REST
             elif stream_done and stream_err is None and connecting is None and local_ended:

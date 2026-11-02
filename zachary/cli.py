@@ -297,6 +297,8 @@ def _voice_latency(path: Path, n: int) -> int:
         when = time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0)))
         cells = " ".join(f"{st[c]:>11.0f}" if c in st else f"{'-':>11}" for c in cols)
         note = r.get("error") or r.get("intent") or ""
+        if r.get("text_after_speech_ms") is not None:
+            note += f"  (text {r['text_after_speech_ms']} ms after you stopped)"
         print(f"{when}  {cells}  {note}")
     print("(each stage: ms since the previous one; speech_end -> tts_first_audio is the wait)")
     return 0

@@ -105,7 +105,7 @@ def test_streaming_stt_frames_and_commit(gnani: MockGnani, ledger: UsageLedger) 
     assert call["committed"] and call["headers"]["language_code"] == "en-IN"
     h = call["headers"]  # server-side VAD tuned for commands, model pinned both ways
     assert h["model"] == h["x-model"] == "prisma-v3.0"
-    assert h["x-vad-threshold"] == "0.5" and h["x-min-silence-ms"] == "450"
+    assert h["x-vad-threshold"] == "0.5" and h["x-min-silence-ms"] == "400"
     assert ledger.summary()["stt-stream"]["audio_s"] == pytest.approx(1.0, abs=0.05)
 
 
@@ -699,7 +699,8 @@ def _ptt_listener(
     return lis
 
 
-def test_server_vad_ends_the_command_without_commit(gnani: MockGnani) -> None:
+def test_command_ends_as_soon_as_you_stop(gnani: MockGnani) -> None:
+    """Local end of speech (350 ms quiet) commits at once: no waiting for Gnani's timer."""
     src = CountingSource()
     got: list[Heard] = []
     lis = _ptt_listener(gnani, src, got)
@@ -714,13 +715,36 @@ def test_server_vad_ends_the_command_without_commit(gnani: MockGnani) -> None:
     h = got[0]
     assert h.text == gnani.transcript and h.via == "ptt" and h.error is None
     call = gnani.calls[0]
-    assert "committed" not in call  # Gnani's VAD found the end of speech by itself
+    assert call["committed"] and h.timeline.info["ended_by"] == "local"
     assert call["bad_frames"] == 0
     assert src.starts == 1 and src.stops >= 1 and not src.active  # mic closed again
     stages = h.timeline.stages()
     assert stages[:2] == ["mic_open", "stream_open"] and "speech_start" in stages
     assert stages.index("speech_end") < stages.index("stt")
     assert h.timeline.info["gnani_latency_ms"] == [120]
+
+
+def noise(seconds: float, rms: float) -> bytes:
+    rng = np.random.default_rng(7)
+    return (
+        (rng.standard_normal(int(seconds * SAMPLE_RATE)) * rms * 32768).astype(np.int16).tobytes()
+    )
+
+
+def test_noisy_room_ends_by_gnanis_vad(gnani: MockGnani) -> None:
+    """Background noise keeps the local detector 'in speech': Gnani's VAD ends it."""
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got)
+    try:
+        lis.push_to_talk()
+        src.load(noise(0.3, 0.01) + speech(1.2) + noise(1.5, 0.01))
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert got[0].text == gnani.transcript
+    assert "committed" not in gnani.calls[0] and "ended_by" not in got[0].timeline.info
 
 
 def test_two_push_to_talk_commands_in_a_row(gnani: MockGnani) -> None:

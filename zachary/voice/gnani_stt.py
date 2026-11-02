@@ -146,7 +146,7 @@ class GnaniStreamingSTT:
         connect_timeout: float = 5.0,
         result_timeout: float = 3.0,  # finals arrive in < 0.5 s after commit
         vad_threshold: float = 0.5,  # docs default 0.7; earbud/laptop mics are quiet
-        min_silence_ms: int = 450,  # end of speech after this much quiet
+        min_silence_ms: int = 400,  # server end of speech (docs: 300-400 for commands/IVR)
         max_speech_s: float = 15.0,
     ) -> None:
         if not api_key:
