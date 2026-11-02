@@ -144,6 +144,24 @@ def _kind_score(r: SearchResult, kinds: set[str]) -> float:
     return KIND_PRIOR.get(r.kind, 0.0)
 
 
+KIND_ONLY_LIMIT = 200
+
+
+def _recent_of_kinds(conn: sqlite3.Connection, kinds: set[str], limit: int) -> list[int]:
+    """Newest first: modified, or opened (access log), whichever is later."""
+    marks = ",".join("?" * len(kinds))
+    rows = _raw(conn).execute(
+        f"""SELECT f.id FROM files f
+            LEFT JOIN (SELECT file_id, max(ts) AS ts FROM access_log GROUP BY file_id) a
+              ON a.file_id = f.id
+            WHERE f.kind IN ({marks})
+              AND NOT (f.is_dir AND f.parent_id IS NULL)  -- an index root (e.g. home)
+            ORDER BY max(f.mtime, coalesce(a.ts, 0)) DESC LIMIT ?""",
+        [*sorted(kinds), limit],
+    )
+    return [r[0] for r in rows]
+
+
 def _kinds_of(conn: sqlite3.Connection, ids: list[int]) -> dict[int, str]:
     out: dict[int, str] = {}
     for i in range(0, len(ids), 900):
@@ -462,11 +480,18 @@ def search(
             # Nothing in range by keyword, but something in range by meaning.
             kw = {k: v for k, v in kw.items() if k in allowed}
             restricted, range_matched = True, True
-    if terms:
+    only_kind = bool(kinds) and all(t in KIND_HINTS for t in terms)
+    if terms and only_kind and not kw and tr is None:
+        # "photos" alone and no file is *named* photos: the most recent photos.
+        terms, vec = [], {}
+        candidates = _recent_of_kinds(conn, kinds, KIND_ONLY_LIMIT)
+    elif terms:
         candidates = list(kw) + [i for i in vec if i not in kw]
     elif kinds and in_range:  # "photos last month": time + kind only
         kind_of = _kinds_of(conn, list(in_range))
         candidates = [i for i in in_range if kind_of.get(i) in kinds] or list(in_range)
+    elif kinds and tr is None:  # just "folders" / "photos": the most recent of that kind
+        candidates = _recent_of_kinds(conn, kinds, KIND_ONLY_LIMIT)
     else:
         candidates = list(in_range)
 

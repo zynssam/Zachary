@@ -37,6 +37,7 @@ MAX_COMMAND_S = 12.0
 MIN_COMMAND_S = 0.35
 NO_SPEECH_S = 6.0  # push-to-talk: give up if nothing is said within this time
 SEGMENT_GRACE_S = 0.12  # after a transcript, wait this long for more speech
+PREROLL_WARM_S = 0.6  # audio kept from just before the press (covers the long-press wait)
 MAX_HOLD_S = 28.0  # hold-to-talk cap (REST, the fallback, takes up to 30 s)
 LOCAL_END_MS = 350  # quiet that ends a command locally (then commit immediately)
 COMMIT_WAIT_S = 3.0  # after commit, wait at most this long for the transcript
@@ -136,6 +137,15 @@ class MicSource:
     def stop(self) -> None:
         self.mic.stop()
 
+    def keep_last(self, n: int) -> None:
+        """Drop all but the newest ``n`` queued frames."""
+        q = self.mic.frames
+        while q.qsize() > n:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                return
+
     def get(self, timeout: float) -> bytes | None:
         try:
             return self.mic.frames.get(timeout=timeout)
@@ -179,6 +189,8 @@ class VoiceListener(threading.Thread):
         self._ptt = threading.Event()
         self._hold = False
         self._released = threading.Event()
+        self._warm = threading.Event()  # bar is open: keep the mic running locally
+        self._warmed = False
         self._zero_frames = 0  # digital silence in a row: wrong input device or muted
         self._warned_silent = False
 
@@ -192,6 +204,16 @@ class VoiceListener(threading.Thread):
         self._hold = hold
         self._released.clear()
         self._ptt.set()
+
+    def set_warm(self, on: bool) -> None:
+        """While the quick bar is open, keep the mic open and remember the last
+        PREROLL_WARM_S of audio *locally* (discarded continuously, never sent), so
+        the first word said right as the key goes down isn't cut off. Nothing goes to
+        Gnani until the key is pressed. Closed again when the bar hides."""
+        if on:
+            self._warm.set()
+        else:
+            self._warm.clear()
 
     def release(self) -> None:
         """Hold-to-talk: the key was let go, so send what was said."""
@@ -258,7 +280,7 @@ class VoiceListener(threading.Thread):
                 self.on_state("idle")
                 continue
             if not self.mic_always_open:
-                self._ptt.wait(0.2)  # mic closed: just wait for the key
+                self._idle_warm()
                 continue
             frame = self._frame()
             if frame is None:
@@ -287,6 +309,11 @@ class VoiceListener(threading.Thread):
         try:
             if self.mic_always_open:
                 self._drain()  # only what's said after the press counts
+            elif self._warmed:
+                # Already open (bar showing): keep the last moment before the press,
+                # the start of what you said.
+                self._keep_last(PREROLL_WARM_S)
+                tl.info["preroll_s"] = PREROLL_WARM_S
             else:
                 self.source.start()
                 opened_here = True
@@ -561,6 +588,31 @@ class VoiceListener(threading.Thread):
         return str(
             getattr(mic, "source_name", "") or getattr(mic, "device", "") or "system default"
         )
+
+    def _idle_warm(self) -> None:
+        """Push-to-talk idle: mic closed, or open (bar showing) with a short local buffer."""
+        if self._warm.is_set():
+            if not self._warmed:
+                try:
+                    self.source.start()
+                    self._warmed = True
+                except Exception as e:
+                    log.info("voice: can't pre-open the microphone (%s)", e)
+                    self._warm.clear()
+            else:
+                self._keep_last(PREROLL_WARM_S)
+            self._ptt.wait(0.1)
+            return
+        if self._warmed:
+            self._warmed = False
+            with contextlib.suppress(Exception):
+                self.source.stop()
+        self._ptt.wait(0.2)
+
+    def _keep_last(self, seconds: float) -> None:
+        trim = getattr(self.source, "keep_last", None)
+        if trim is not None:
+            trim(max(1, int(seconds * SAMPLE_RATE * 2 / FRAME_BYTES)))
 
     def _drain(self) -> None:
         drain = getattr(self.source, "drain", None)

@@ -818,6 +818,43 @@ def test_hold_released_without_speech(gnani: MockGnani) -> None:
     assert got[0].error is not None and "didn't hear anything" in str(got[0].error)
 
 
+def test_warm_mic_keeps_the_first_word(gnani: MockGnani) -> None:
+    """Bar open: mic warm, last 0.6 s kept locally. The word said as the key goes down
+    is sent; nothing at all goes to Gnani before the press."""
+
+    class WarmSource(CountingSource):
+        def keep_last(self, n: int) -> None:
+            while self.q.qsize() > n:
+                self.q.get_nowait()
+
+    src = WarmSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got)
+    try:
+        lis.set_warm(True)  # the bar opened
+        wait_until(lambda: src.active)
+        src.load(silence(2.0))  # the bar sits open for a while
+        time.sleep(0.4)
+        assert gnani.calls == []  # privacy: warm audio stays on the machine
+        assert src.q.qsize() <= 20  # only ~0.6 s is kept
+        first = speech(0.3, seed=3)
+        src.load(first)  # "hackathon", said right as the key goes down
+        lis.push_to_talk(hold=True)
+        src.load(speech(0.6, seed=4) + silence(0.4))
+        time.sleep(0.6)
+        lis.release()
+        wait_until(lambda: got, timeout=10)
+        assert src.active and src.starts == 1  # still warm: the bar is still open
+        lis.set_warm(False)  # the bar hid
+        wait_until(lambda: not src.active)
+    finally:
+        lis.stop()
+        lis.join(3)
+    h = got[0]
+    assert h.text == gnani.transcript and h.timeline.info["preroll_s"] == 0.6
+    assert gnani.count("stt-stream") == 1
+
+
 def test_second_press_commits(gnani: MockGnani) -> None:
     gnani.stream_vad = False  # the server never ends it by itself
     src = CountingSource()

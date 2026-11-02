@@ -116,6 +116,11 @@ class VoiceController(QObject):
         assert self.listener is not None
         self.listener.push_to_talk(hold=hold)
 
+    def bar_visible(self, shown: bool) -> None:
+        """Keep the mic warm (local buffer only) while the bar is open."""
+        if self.listener is not None and not self.wake_word:
+            self.listener.set_warm(shown)
+
     def hold_talk(self, pressed: bool) -> None:
         """Space held in the bar: record while held, send on release."""
         if pressed:

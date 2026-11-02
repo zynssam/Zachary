@@ -207,3 +207,23 @@ def test_split_kind_hints() -> None:
         ["fee"],
         {"document"},
     )
+
+
+def test_kind_word_alone_lists_the_most_recent_of_that_kind(store: FileStore, home: Path) -> None:
+    """Voice heard only "folders" (or you typed it): recent folders, not "Nothing found"."""
+    now = time.time()
+    for name, age in (("old_course", 400), ("hackathon", 2), ("Screenshots", 30)):
+        write(home / name / "x.txt", mtime=now - age * 86400)
+    write(home / "pics" / "a.png", mtime=now - 3 * 86400)
+    write(home / "pics" / "b.jpg", mtime=now - 1 * 86400)
+    scan(store)
+    for name, age in (("old_course", 400), ("hackathon", 2), ("Screenshots", 30), ("pics", 5)):
+        import os
+
+        os.utime(home / name, (now - age * 86400, now - age * 86400))
+    scan(store)
+    dirs = [r.name for r in search(store.conn, "folders", limit=10).results]
+    assert dirs[:3] == ["hackathon", "pics", "Screenshots"] and "old_course" in dirs
+    assert all(r.is_dir for r in search(store.conn, "folders", limit=10).results)
+    photos = [r.name for r in search(store.conn, "photos").results]
+    assert photos[:2] == ["b.jpg", "a.png"]

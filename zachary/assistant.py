@@ -242,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         talk_handlers.append(voice.push_to_talk)
         bar.talk.connect(voice.push_to_talk)
         bar.hold_talk.connect(voice.hold_talk)
+        bar.visibility.connect(voice.bar_visible)
         vbridge = _HotkeyBridge()
         vbridge.pressed.connect(lambda _tok, _t0: voice.push_to_talk())
         if not args.no_hotkey:

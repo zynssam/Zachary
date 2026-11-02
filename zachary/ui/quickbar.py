@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import time
+from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -45,6 +46,7 @@ class QuickBar(QWidget):
     opened = Signal(float)  # ms from hotkey to first results painted
     talk = Signal()  # Ctrl+M: push-to-talk
     hold_talk = Signal(bool)  # Space held in an empty box: True = pressed, False = released
+    visibility = Signal(bool)  # shown / hidden (voice keeps the mic warm while shown)
     reply_applied = Signal(object)
 
     def __init__(self, engine: Engine) -> None:
@@ -235,6 +237,14 @@ class QuickBar(QWidget):
         if ev.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
             self._maybe_hide()
         super().changeEvent(ev)
+
+    def showEvent(self, ev: Any) -> None:
+        super().showEvent(ev)
+        self.visibility.emit(True)
+
+    def hideEvent(self, ev: Any) -> None:
+        super().hideEvent(ev)
+        self.visibility.emit(False)
 
     def _maybe_hide(self) -> None:
         if self.isVisible() and not self.list.menu_open:
