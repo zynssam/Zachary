@@ -127,7 +127,7 @@ def test_tts_rest_and_ws(gnani: MockGnani, ledger: UsageLedger) -> None:
     assert all(len(c.pcm) % 2 == 0 for c in chunks)  # whole samples despite odd splits
     assert not joined.startswith(b"RIFF")
     assert gnani.calls[-1]["request"]["audio_config"]["container"] == "raw"
-    assert abs(len(joined) - len(a.pcm)) < 100  # same audio as the REST call
+    assert len(joined) == int((0.3 + 0.1 * len("Hello".split())) * 24000) * 2
     assert set(ledger.summary()) == {"tts-rest", "tts-ws"}
 
 
@@ -147,6 +147,32 @@ def test_tts_reuses_one_connection(gnani: MockGnani, ledger: UsageLedger) -> Non
     assert len(conns) == 1 and conns[0]["requests"] == 2
     assert ledger.summary()["tts-ws"]["calls"] == 2  # one ledger row per reply
     tts.close()
+
+
+def test_tts_replies_never_shift_by_one(gnani: MockGnani) -> None:
+    """Real bug: Gnani ends each reply with *two* "complete" messages. Stopping at the
+    first left one on the socket; the next reply read it (silence) and the reply after
+    played the previous answer. Each reply must get exactly its own audio."""
+    tts = GnaniWsTTS(KEY, url=gnani.tts_ws)
+    texts = ["Found three.", "Opening fee receipt sem five now.", "Two projects."]
+    lengths = [len(b"".join(c.pcm for c in tts.stream(t))) for t in texts * 2]
+    expect = [int((0.3 + 0.1 * len(speakable(t).split())) * 24000) * 2 for t in texts * 2]
+    assert lengths == expect and tts.connects == 1
+
+
+def test_tts_ignores_stale_messages_before_start(gnani: MockGnani) -> None:
+    import json as _json
+
+    tts = GnaniWsTTS(KEY, url=gnani.tts_ws)
+    tts.warm()
+    # Something left over on the socket (e.g. an interrupted earlier exchange).
+    gnani_stale = {"type": "audio", "data": {"audio": "AAAA", "chunk_index": 9}}
+    tts._ws.send(_json.dumps({"text": "x", "voice": "Shivani", "model": "timbre-v3.0",
+                              "language": "en-IN", "audio_config": {"container": "raw"}}))  # fmt: skip
+    time.sleep(0.3)  # its reply is now waiting unread
+    out = b"".join(c.pcm for c in tts.stream("Found three."))
+    assert len(out) == int((0.3 + 0.1 * 2) * 24000) * 2  # only this reply's audio
+    del gnani_stale
 
 
 def test_tts_reconnects_when_the_server_closed_it(gnani: MockGnani) -> None:

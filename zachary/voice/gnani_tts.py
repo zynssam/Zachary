@@ -153,6 +153,20 @@ def _strip_wav_header(chunk: bytes) -> bytes:
     return chunk
 
 
+END_GRACE_S = 0.3  # after the audio's "complete", wait this long for the closing one
+
+
+def _drain(ws: Any) -> int:
+    """Discard messages already waiting on the socket. Returns how many."""
+    n = 0
+    while True:
+        try:
+            ws.recv(timeout=0)
+        except TimeoutError:
+            return n
+        n += 1
+
+
 class GnaniWsTTS(_Base):
     """WebSocket TTS on one persistent connection (docs: a connection serves many
     requests in sequence), so a reply skips the TCP + TLS + upgrade handshake.
@@ -265,24 +279,38 @@ class GnaniWsTTS(_Base):
                 for attempt in (1, 2):
                     ws = self._alive() or self._connect()
                     try:
+                        _drain(ws)  # anything left from an earlier reply is stale
                         ws.send(request)
                         first = True
                         carry = b""
+                        audio_done = False
                         deadline = time.monotonic() + self.timeout
                         while True:
                             left = deadline - time.monotonic()
+                            if audio_done:
+                                left = min(left, END_GRACE_S)
                             if left <= 0:
+                                if audio_done:
+                                    done = True  # no closing message: fine, drained next time
+                                    return
                                 status = "timeout"
                                 raise VoiceError("network", "Gnani TTS timed out")
-                            raw = ws.recv(timeout=left)
+                            try:
+                                raw = ws.recv(timeout=left)
+                            except TimeoutError:
+                                if audio_done:
+                                    done = True
+                                    return
+                                raise
                             if isinstance(raw, bytes):
                                 continue
                             msg = json.loads(raw)
                             kind = msg.get("type")
                             if kind == "start":
                                 started = True
+                            elif not started:
+                                continue  # before our "start": left over from an earlier reply
                             elif kind == "audio":
-                                started = True
                                 data = base64.b64decode(msg.get("data", {}).get("audio") or b"")
                                 if first:
                                     data = _strip_wav_header(data)
@@ -293,8 +321,14 @@ class GnaniWsTTS(_Base):
                                 if cut:
                                     yield SpeechAudio(data[:cut], SAMPLE_RATE)
                             elif kind == "complete":
-                                done = True
-                                return
+                                # Gnani sends two: {"data": {..., "is_final": true}} and
+                                # then {"message", "request_id"}. Stop at the second, or
+                                # the next reply would read it first (and get silence,
+                                # then play *this* reply's leftovers: replies one late).
+                                if "request_id" in msg or audio_done:
+                                    done = True
+                                    return
+                                audio_done = True
                             elif kind == "error":
                                 status = "error"
                                 done = True  # the connection stays usable

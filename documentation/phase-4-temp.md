@@ -152,6 +152,12 @@ Tunables at the top of `pipeline.py`:
 - **One socket for all replies.** `warm()` connects at startup, and each reply reuses it. If the server closed it,
   it reconnects once, but only if nothing was synthesized yet, so you're never charged twice.
 - If a reply is interrupted midway, the socket is dropped; otherwise its leftover audio would play with the next reply.
+- **Gnani ends every reply with two `complete` messages** (one with `data.is_final`, then one with
+  `request_id`). This is undocumented, and was seen on 2 Nov. Stopping at the first one left the second
+  on the socket, so every later reply was off by one (silence, then the previous answer). The client now:
+  - waits for the closing message;
+  - discards anything left on the socket before a request;
+  - ignores messages that arrive before its own `start`.
 - Chunks are cut to whole 16-bit samples.
 - `speakable()` turns file names into speech: "Fee_Receipt_Sem5.pdf" becomes "Fee Receipt Sem five".
 

@@ -183,7 +183,7 @@ def _ws_handler(mock: MockGnani):  # type: ignore[no-untyped-def]
             if mock.fail_status:
                 ws.send(json.dumps({"type": "error", "message": "insufficient credits"}))
                 continue
-            wav = tone_wav()
+            wav = tone_wav(0.3 + 0.1 * len(str(req.get("text", "")).split()))  # length ~ text
             container = req.get("audio_config", {}).get("container", "wav")
             data = wav if container == "wav" else wav[44:]
             ws.send(json.dumps({"type": "start", "message": "ok", "request_id": "t-1"}))
@@ -193,6 +193,9 @@ def _ws_handler(mock: MockGnani):  # type: ignore[no-untyped-def]
                     "audio": base64.b64encode(part).decode(), "is_final": False}}))  # fmt: skip
             ws.send(json.dumps({"type": "complete", "data": {"chunk_index": 3, "audio": "",
                                                              "is_final": True}}))  # fmt: skip
+            # The real server then sends a second "complete" (seen 2 Nov 2026).
+            ws.send(json.dumps({"type": "complete", "message": "done",
+                                "request_id": f"t-{call['requests']}"}))  # fmt: skip
             if mock.tts_close_after_request:
                 ws.close()
                 return
