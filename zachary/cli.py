@@ -309,8 +309,10 @@ def _voice_mics(args: argparse.Namespace, cfg: Config) -> int:
     from zachary.voice.audio import AudioUnavailable, MicStream, list_inputs, pcm_to_float
 
     if args.text:
-        cfg.set_setting("mic_device", args.text)
-        print(f"mic_device = {args.text!r} (restart the assistant to use it)")
+        choice = "" if args.text.strip().strip("'\"").lower() in ("", "default") else args.text
+        cfg.set_setting("mic_device", choice)
+        shown = repr(choice) if choice else "the system default input"
+        print(f"mic_device = {shown} (restart the assistant to use it)")
     current = str(cfg.get_setting("mic_device"))
     try:
         devices = list_inputs()
@@ -336,7 +338,7 @@ def _voice_mics(args: argparse.Namespace, cfg: Config) -> int:
             " [selected]" if current and current == d.id else ""
         )
         print(f"  {d.label}{tags}\n    id: {d.id}\n    level: {meter}")
-    print('\nPick one:  python -m zachary.cli voice mics <id>   ("" = follow the system default)')
+    print("\nPick one:  python -m zachary.cli voice mics <id>   (default = the system's input)")
     return 0
 
 

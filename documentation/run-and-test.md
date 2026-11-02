@@ -3,6 +3,8 @@
 How to set up, run every part (indexer, CLI, quick bar), run all automated
 checks and benchmarks, and test everything by hand. Covers Phases 0–4.
 
+**On Windows?** See [windows.md](windows.md) for the full Windows setup.
+
 All commands run from the repo root: `~/Documents/PROJECTS/Zachary`.
 Windows equivalents are shown where they differ.
 
