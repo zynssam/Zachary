@@ -524,6 +524,12 @@ def test_input_device_choice(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(audio, "_pactl_sources", lambda: (srcs, "alsa_input.pci.analog-stereo"))
     assert audio.resolve_input("") == (None, "")  # a real default: follow the system
     assert [d.is_default for d in audio.list_inputs()] == [True, False]
+    # A virtual source (null-sink remap, e.g. a test feed) is listed but never auto-picked.
+    virt = {"name": "zach_virtual_mic", "description": "VoiceSender_mic",
+            "properties": {"node.virtual": "true", "device.class": "filter"}}  # fmt: skip
+    monkeypatch.setattr(audio, "_pactl_sources", lambda: ([virt, *srcs], "bluez_output.x.monitor"))
+    assert audio.resolve_input("") == (None, "bluez_input.88:D6")
+    assert [d.virtual for d in audio.list_inputs()] == [True, False, False]
 
 
 def test_silent_microphone_switches_to_another() -> None:

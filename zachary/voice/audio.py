@@ -160,6 +160,7 @@ class InputDevice:
     id: str  # what goes in the mic_device setting
     label: str
     is_default: bool = False
+    virtual: bool = False  # software source (e.g. a null-sink remap), not a microphone
 
 
 def _pactl_sources() -> tuple[list[dict[str, Any]], str]:
@@ -183,13 +184,25 @@ def _pactl_sources() -> tuple[list[dict[str, Any]], str]:
     return real, default
 
 
+def _is_virtual(source: dict[str, Any]) -> bool:
+    props = source.get("properties") or {}
+    return (
+        str(props.get("node.virtual", "")).lower() == "true"
+        or props.get("device.class") == "filter"
+        or not str(source.get("name", "")).startswith(("alsa_input", "bluez_input"))
+    )
+
+
 def list_inputs() -> list[InputDevice]:
     """Microphones the user can pick, by stable name where the system has one."""
     sources, default = _pactl_sources()
     if sources:
         return [
             InputDevice(
-                str(x["name"]), str(x.get("description") or x["name"]), x["name"] == default
+                str(x["name"]),
+                str(x.get("description") or x["name"]),
+                x["name"] == default,
+                _is_virtual(x),
             )
             for x in sources
         ]
@@ -224,7 +237,8 @@ def resolve_input(choice: str) -> tuple[int | str | None, str]:
                 return None, str(x["name"])
         return choice, ""  # sounddevice name match
     if sources and (default.endswith(".monitor") or default not in names):
-        pick = next((n for n in names if n.startswith("bluez_input")), names[0])
+        mics = [n for n in names if n.startswith(("alsa_input", "bluez_input"))] or names
+        pick = next((n for n in mics if n.startswith("bluez_input")), mics[0])
         log.info("default input %r is not a microphone; using %r", default, pick)
         return None, pick
     return None, ""

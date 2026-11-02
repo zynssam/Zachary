@@ -80,7 +80,8 @@ class MicSource:
         try:
             current_default = [d.id for d in list_inputs() if d.is_default]
             self._tried.update(current_default if not self.mic.source_name else [])
-            options = [d for d in list_inputs() if d.id not in self._tried]
+            # Real microphones only: a virtual source (e.g. a test feed) is never a fallback.
+            options = [d for d in list_inputs() if d.id not in self._tried and not d.virtual]
         except Exception:
             return None
         # Prefer a headset mic (what the user is wearing), then anything else.

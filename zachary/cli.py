@@ -334,8 +334,10 @@ def _voice_mics(args: argparse.Namespace, cfg: Config) -> int:
             meter = "silent (no signal)" if level == 0 else "#" * max(1, min(30, int(level * 300)))
         except Exception as e:
             meter = f"can't open ({type(e).__name__})"
-        tags = (" [system default]" if d.is_default else "") + (
-            " [selected]" if current and current == d.id else ""
+        tags = (
+            (" [system default]" if d.is_default else "")
+            + (" [virtual]" if d.virtual else "")
+            + (" [selected]" if current and current == d.id else "")
         )
         print(f"  {d.label}{tags}\n    id: {d.id}\n    level: {meter}")
     print("\nPick one:  python -m zachary.cli voice mics <id>   (default = the system's input)")
