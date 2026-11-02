@@ -50,6 +50,9 @@ VEC_K = 30  # nearest neighbours taken from the vector index
 # fraction of the best match for this query.
 VEC_MIN_SIM = 0.15
 VEC_REL_SIM = 0.25
+# Meaning alone is strong enough to act on (open without asking) from this cosine.
+# Measured on a real 9.5k-file index: right answers 0.44-0.61, wrong picks 0.18-0.27.
+STRONG_SIM = 0.40
 VEC_WEIGHT = 0.9
 RANGE_KW_ENOUGH = 50  # in-range keyword matches after which looser tiers are skipped
 RANGE_LIMIT = 1000
@@ -87,6 +90,9 @@ class SearchResult:
     score: float
     why: list[str] = field(default_factory=list)
     versions: list[int] = field(default_factory=list)  # older versions (file ids), newest first
+    # A keyword/name hit, an exact name, or a close meaning: safe to act on without
+    # asking. Time or recency alone never is.
+    strong: bool = False
 
     @property
     def last_seen(self) -> float:
@@ -136,6 +142,24 @@ def _kind_score(r: SearchResult, kinds: set[str]) -> float:
     if kinds:
         return KIND_BONUS if r.kind in kinds else 0.0
     return KIND_PRIOR.get(r.kind, 0.0)
+
+
+KIND_ONLY_LIMIT = 200
+
+
+def _recent_of_kinds(conn: sqlite3.Connection, kinds: set[str], limit: int) -> list[int]:
+    """Newest first: modified, or opened (access log), whichever is later."""
+    marks = ",".join("?" * len(kinds))
+    rows = _raw(conn).execute(
+        f"""SELECT f.id FROM files f
+            LEFT JOIN (SELECT file_id, max(ts) AS ts FROM access_log GROUP BY file_id) a
+              ON a.file_id = f.id
+            WHERE f.kind IN ({marks})
+              AND NOT (f.is_dir AND f.parent_id IS NULL)  -- an index root (e.g. home)
+            ORDER BY max(f.mtime, coalesce(a.ts, 0)) DESC LIMIT ?""",
+        [*sorted(kinds), limit],
+    )
+    return [r[0] for r in rows]
 
 
 def _kinds_of(conn: sqlite3.Connection, ids: list[int]) -> dict[int, str]:
@@ -456,11 +480,18 @@ def search(
             # Nothing in range by keyword, but something in range by meaning.
             kw = {k: v for k, v in kw.items() if k in allowed}
             restricted, range_matched = True, True
-    if terms:
+    only_kind = bool(kinds) and all(t in KIND_HINTS for t in terms)
+    if terms and only_kind and not kw and tr is None:
+        # "photos" alone and no file is *named* photos: the most recent photos.
+        terms, vec = [], {}
+        candidates = _recent_of_kinds(conn, kinds, KIND_ONLY_LIMIT)
+    elif terms:
         candidates = list(kw) + [i for i in vec if i not in kw]
     elif kinds and in_range:  # "photos last month": time + kind only
         kind_of = _kinds_of(conn, list(in_range))
         candidates = [i for i in in_range if kind_of.get(i) in kinds] or list(in_range)
+    elif kinds and tr is None:  # just "folders" / "photos": the most recent of that kind
+        candidates = _recent_of_kinds(conn, kinds, KIND_ONLY_LIMIT)
     else:
         candidates = list(in_range)
 
@@ -523,6 +554,12 @@ def search(
     results = _collapse_versions(conn, ranked, rows, limit)
     # Explanations only for what is shown.
     for r in results:
+        r.strong = (
+            not terms  # "what I opened yesterday": time/kind is the whole question
+            or r.file_id in kw
+            or r.file_id in exact
+            or vec.get(r.file_id, 0.0) >= STRONG_SIM
+        )
         if r.file_id in exact:
             r.why.append("exact name")
         in_r = range_matched and r.file_id in in_range

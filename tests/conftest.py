@@ -16,6 +16,25 @@ from zachary.core.db import open_db
 from zachary.indexer.store import FileStore
 
 
+@pytest.fixture(autouse=True)
+def _no_real_gnani(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Gnani API has a paid quota: tests use the local mock only. Any attempt to
+    resolve the real host fails, and no real key is visible to the code under test."""
+    import socket
+
+    real = socket.getaddrinfo
+
+    def guarded(host, *args, **kw):  # type: ignore[no-untyped-def]
+        if isinstance(host, str) and host.endswith("vachana.ai"):
+            raise OSError("tests must not call the real Gnani API")
+        return real(host, *args, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", guarded)
+    monkeypatch.delenv("GNANI_API_KEY", raising=False)
+    monkeypatch.setattr("zachary.core.env.get_secret", lambda *_a, **_k: None)
+    monkeypatch.setattr("zachary.voice.factory.get_secret", lambda *_a, **_k: None)
+
+
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     return tmp_path / "data" / "zachary.db"

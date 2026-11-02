@@ -190,3 +190,46 @@ def test_stale_reply_is_ignored(qtbot: QtBot, bar: QuickBar) -> None:
     old = Reply("stale", "results", [], r.intent)
     bar._on_reply(1, old)  # id 1 is long superseded
     assert bar.list.results.rowCount() == shown and bar.status.text() != "stale"
+
+
+def test_hold_space_in_empty_box_talks(qtbot: QtBot, bar: QuickBar) -> None:
+    """Hold Space (box empty) to talk, release to send; typing spaces still works."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    from zachary.ui import quickbar as QB
+
+    events: list[bool] = []
+    bar.hold_talk.connect(events.append)
+    bar.edit.clear()
+
+    def key(kind: QEvent.Type, repeat: bool = False) -> None:
+        ev = QKeyEvent(kind, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier, " ", repeat)
+        QApplication.sendEvent(bar.edit, ev)
+
+    key(QEvent.Type.KeyPress)
+    for _ in range(5):  # holding: the keyboard repeats press/release pairs
+        key(QEvent.Type.KeyRelease, repeat=True)
+        key(QEvent.Type.KeyPress, repeat=True)
+    assert events == [True] and bar.edit.text() == ""  # no spaces typed
+    key(QEvent.Type.KeyRelease)
+    assert events == [True, False]
+    # In a search with text, a tap is just a space.
+    bar.edit.setText("fee")
+    bar.edit.setCursorPosition(3)
+    qtbot.keyClick(bar.edit, Qt.Key.Key_Space)
+    assert events == [True, False] and bar.edit.text() == "fee "
+    # Fast typing: the next letter goes down before Space comes up -> order kept.
+    key(QEvent.Type.KeyPress)
+    qtbot.keyClick(bar.edit, Qt.Key.Key_R)
+    key(QEvent.Type.KeyRelease)
+    assert bar.edit.text() == "fee  r" and events == [True, False]
+    # A long press while typing records instead of typing a space.
+    key(QEvent.Type.KeyPress)
+    qtbot.wait(QB.SPACE_HOLD_MS + 150)
+    key(QEvent.Type.KeyRelease, repeat=True)
+    key(QEvent.Type.KeyPress, repeat=True)
+    assert events == [True, False, True] and bar.edit.text() == "fee  r"
+    key(QEvent.Type.KeyRelease)
+    assert events == [True, False, True, False]

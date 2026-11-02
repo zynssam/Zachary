@@ -6,13 +6,15 @@ on screen" doesn't wait for a query. All queries go to the Engine thread.
 
 Keys: type to search; Enter = do what the text says (open / follow-up) or open
 the row you moved to with the arrows; Ctrl+Enter = show in folder; Ctrl+R =
-related files; Ctrl+1..9 = open that row; Up/Down = move; Esc = hide.
+related files; Ctrl+M = talk (voice); Ctrl+1..9 = open that row; Up/Down = move;
+Esc = hide.
 """
 
 from __future__ import annotations
 
 import os
 import time
+from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -20,9 +22,11 @@ from PySide6.QtGui import (
     QFont,
     QGuiApplication,
     QKeyEvent,
+    QKeySequence,
     QPainter,
     QPaintEvent,
     QScreen,
+    QShortcut,
 )
 from PySide6.QtWidgets import QLabel, QLineEdit, QVBoxLayout, QWidget
 
@@ -35,10 +39,14 @@ TYPE_DEBOUNCE_MS = 25
 HIDE_AFTER_ACTION_MS = 700
 WIDTH = 720
 MAX_ROWS = 8
+SPACE_HOLD_MS = 400  # Space held this long while typing = talk (shorter = a space)
 
 
 class QuickBar(QWidget):
     opened = Signal(float)  # ms from hotkey to first results painted
+    talk = Signal()  # Ctrl+M: push-to-talk
+    hold_talk = Signal(bool)  # Space held in an empty box: True = pressed, False = released
+    visibility = Signal(bool)  # shown / hidden (voice keeps the mic warm while shown)
     reply_applied = Signal(object)
 
     def __init__(self, engine: Engine) -> None:
@@ -78,6 +86,10 @@ class QuickBar(QWidget):
         self._debounce.timeout.connect(self._send_preview)
         self.edit.textChanged.connect(lambda _t: self._debounce.start())
         self.edit.installEventFilter(self)
+        # Ctrl+M talks wherever the focus is inside the bar (edit, results list...).
+        talk = QShortcut(QKeySequence("Ctrl+M"), self)
+        talk.setContext(Qt.ShortcutContext.WindowShortcut)
+        talk.activated.connect(self.talk.emit)
         self.list.chosen.connect(self._choose)
         self.list.painted.connect(self._on_painted)
         engine.replied.connect(self._on_reply)
@@ -85,6 +97,14 @@ class QuickBar(QWidget):
 
         self._last_applied = 0
         self._explicit_selection = False  # user moved with arrows since the last reply
+        self._holding_space = False
+        # In a box with text, Space is a space when tapped and talk when held longer
+        # than SPACE_HOLD_MS: the space waits until we know which.
+        self._space_pending = False
+        self._space_timer = QTimer(self)
+        self._space_timer.setSingleShot(True)
+        self._space_timer.setInterval(SPACE_HOLD_MS)
+        self._space_timer.timeout.connect(self._space_held)
         self._open_t0: float | None = None
         self._pending_initial = False
         self._resize_rows(0)
@@ -135,13 +155,55 @@ class QuickBar(QWidget):
         if obj is self.edit and ev.type() == QEvent.Type.KeyPress:
             assert isinstance(ev, QKeyEvent)
             return self._key(ev)
+        if obj is self.edit and ev.type() == QEvent.Type.KeyRelease:
+            assert isinstance(ev, QKeyEvent)
+            if ev.key() == Qt.Key.Key_Space and (self._holding_space or self._space_pending):
+                if not ev.isAutoRepeat():
+                    if self._space_pending:
+                        self._flush_space()  # a tap: just a space
+                    else:
+                        self._holding_space = False
+                        self.hold_talk.emit(False)
+                return True
+        if obj is self.edit and ev.type() == QEvent.Type.FocusOut:
+            if self._space_pending:
+                self._flush_space()
+            if self._holding_space:
+                self._holding_space = False  # focus lost while holding: treat as released
+                self.hold_talk.emit(False)
         if ev.type() == QEvent.Type.WindowDeactivate and obj is self:
             self._maybe_hide()
         return super().eventFilter(obj, ev)
 
+    def _flush_space(self) -> None:
+        self._space_timer.stop()
+        self._space_pending = False
+        self.edit.insert(" ")
+
+    def _space_held(self) -> None:
+        if self._space_pending:  # still down after SPACE_HOLD_MS: it's a talk
+            self._space_pending = False
+            self._holding_space = True
+            self.hold_talk.emit(True)
+
     def _key(self, ev: QKeyEvent) -> bool:
         key = ev.key()
         ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if self._space_pending and key != Qt.Key.Key_Space:
+            self._flush_space()  # fast typing: next key before Space came up -> a space
+        plain = ev.modifiers() == Qt.KeyboardModifier.NoModifier
+        if key == Qt.Key.Key_Space and (self._holding_space or self._space_pending or plain):
+            # Hold Space to talk, release to send. Empty box: right away (a search
+            # never starts with a space). While typing: only a long press talks.
+            if ev.isAutoRepeat() or self._holding_space or self._space_pending:
+                return True
+            if not self.edit.text():
+                self._holding_space = True
+                self.hold_talk.emit(True)
+            else:
+                self._space_pending = True
+                self._space_timer.start()
+            return True
         if key == Qt.Key.Key_Escape:
             self.hide()
             return True
@@ -175,6 +237,14 @@ class QuickBar(QWidget):
         if ev.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
             self._maybe_hide()
         super().changeEvent(ev)
+
+    def showEvent(self, ev: Any) -> None:
+        super().showEvent(ev)
+        self.visibility.emit(True)
+
+    def hideEvent(self, ev: Any) -> None:
+        super().hideEvent(ev)
+        self.visibility.emit(False)
 
     def _maybe_hide(self) -> None:
         if self.isVisible() and not self.list.menu_open:

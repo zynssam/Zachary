@@ -115,3 +115,35 @@ def test_default_hotkey_is_super_space() -> None:
     assert str(hk) == "super+space"
     assert hk.portal_trigger() == "LOGO+space"
     assert modifier_mask(hk) == 64  # X11 Mod4
+
+
+def test_portal_binds_all_shortcuts_in_one_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GNOME binds one portal session per app: two sessions meant one key never fired."""
+    import threading
+
+    from zachary.core.hotkeys import parse_hotkey
+    from zachary.core.platform import linux_portal as lp
+
+    sessions: list[list[str]] = []
+    bound = threading.Event()
+
+    def fake_session(self, handles):  # type: ignore[no-untyped-def]
+        sessions.append([sid for sid, _props in lp.shortcuts_body(handles)])
+        for h in handles:
+            h.ready.set()
+        bound.set()
+
+    monkeypatch.setattr(lp._PortalSession, "_session", fake_session)
+    mgr = lp._PortalSession()
+    monkeypatch.setattr(lp, "_manager", lambda: mgr)
+    toggle = lp.PortalHotkey(parse_hotkey("super+space"), lambda _t: None, "Open", "toggle")
+    voice = lp.PortalHotkey(parse_hotkey("super+alt+space"), lambda _t: None, "Talk", "voice")
+    toggle.start()
+    voice.start()
+    assert bound.wait(3) and voice.ready.wait(3)
+    assert sessions == [["toggle", "voice"]] and mgr.runs == 1
+    body = dict(lp.shortcuts_body(mgr.handles))
+    assert body["voice"]["preferred_trigger"] == ("s", "ALT+LOGO+space")
+    toggle.stop()
+    voice.stop()
+    assert mgr.handles == []

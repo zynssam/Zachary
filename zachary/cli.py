@@ -9,6 +9,7 @@ a few seconds, and search hides newly excluded paths immediately.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sqlite3
@@ -16,6 +17,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from zachary.brain.timeparse import parse_time
 from zachary.core.config import Config, ExcludeKind, default_db_path
@@ -203,6 +205,209 @@ def cmd_related(args: argparse.Namespace) -> int:
     return 0 if rels else 1
 
 
+def cmd_voice(args: argparse.Namespace) -> int:
+    """Voice tools. Calls that use the paid Gnani API say so and are logged in the ledger."""
+    from zachary.voice.audio import resample, seconds, wav_to_pcm
+    from zachary.voice.factory import build_voice
+    from zachary.voice.types import VoiceError
+
+    conn, cfg = _open(args)
+    data_dir = Path(args.db or default_db_path()).parent
+    kit = build_voice(cfg, data_dir)
+    if args.action == "usage":
+        summary = kit.ledger.summary()
+        if not summary:
+            print(f"no Gnani calls recorded ({kit.ledger.path})")
+            return 0
+        print(f"Gnani calls ({kit.ledger.path}):")
+        for ep, d in sorted(summary.items()):
+            extra = f"{d['audio_s']:.1f}s audio" if d["audio_s"] else f"{int(d['chars'])} chars"
+            print(f"  {ep:<11} {int(d['calls']):>4} calls  {extra:>14}  {int(d['errors'])} failed")
+        return 0
+    if args.action == "setup":
+        print(f"Gnani key: {'found' if kit.has_key else 'missing (set GNANI_API_KEY or .env)'}")
+        t = time.perf_counter()
+        kit.offline_stt.transcribe(b"\0\0" * 16000)  # downloads the model once
+        print(f"local speech model ready ({time.perf_counter() - t:.1f}s)")
+        try:
+            import sounddevice as sd
+
+            print(f"microphone: {sd.query_devices(kind='input')['name']}")
+        except Exception as e:
+            print(f"microphone: unavailable ({e})")
+        return 0
+    if args.action == "transcribe":
+        pcm, sr = wav_to_pcm(Path(args.text).read_bytes())
+        pcm = resample(pcm, sr)
+        stt = kit.offline_stt if args.offline or kit.rest_stt is None else kit.rest_stt
+        if stt is not kit.offline_stt:
+            print(f"(uses 1 Gnani STT call, {seconds(pcm):.1f}s of audio)")
+        try:
+            tr = stt.transcribe(pcm)
+        except VoiceError as e:
+            print(f"error ({e.kind}): {e}")
+            return 1
+        print(f"[{tr.provider}, {tr.latency_ms:.0f} ms] {tr.text}")
+        return 0
+    if args.action == "say":
+        if kit.tts is None:
+            print("no Gnani key: nothing to speak with")
+            return 1
+        from zachary.voice.audio import Player
+
+        print("(uses 1 Gnani TTS call)")
+        player = Player()
+        t0 = time.perf_counter()
+        first = None
+        try:
+            for chunk in kit.tts.stream(args.text):
+                first = first or time.perf_counter()
+                player.play(chunk.pcm, chunk.sample_rate)
+        except VoiceError as e:
+            print(f"error ({e.kind}): {e}")
+            return 1
+        player.end()
+        player.wait()
+        if first:
+            print(f"first audio after {(first - t0) * 1e3:.0f} ms")
+        return 0
+    if args.action == "listen":
+        return _voice_listen(args, kit, conn, cfg)
+    if args.action == "mics":
+        return _voice_mics(args, cfg)
+    if args.action == "latency":
+        return _voice_latency(data_dir / "latency.jsonl", int(args.text or 10))
+    return 1
+
+
+def _voice_latency(path: Path, n: int) -> int:
+    """The last N voice commands, one row each, stage times in ms."""
+    if not path.exists():
+        print(f"no voice commands logged yet ({path})")
+        return 0
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines()[-n:]:
+        with contextlib.suppress(ValueError):
+            rows.append(json.loads(line))
+    cols = ["mic_open", "stream_open", "speech_start", "speech_end", "stt", "intent_search",
+            "tts_first_audio", "tts_done"]  # fmt: skip
+    print("when      " + " ".join(f"{c[:11]:>11}" for c in cols) + "  heard / error")
+    for r in rows:
+        st = r.get("stages_ms", {})
+        when = time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0)))
+        cells = " ".join(f"{st[c]:>11.0f}" if c in st else f"{'-':>11}" for c in cols)
+        note = r.get("error") or r.get("intent") or ""
+        if r.get("text_after_speech_ms") is not None:
+            note += f"  (text {r['text_after_speech_ms']} ms after you stopped)"
+        print(f"{when}  {cells}  {note}")
+    print("(each stage: ms since the previous one; speech_end -> tts_first_audio is the wait)")
+    return 0
+
+
+def _voice_mics(args: argparse.Namespace, cfg: Config) -> int:
+    """List microphones with a live level, or pick one: ``voice mics NAME``."""
+    import numpy as np
+
+    from zachary.voice.audio import AudioUnavailable, MicStream, list_inputs, pcm_to_float
+
+    if args.text:
+        choice = "" if args.text.strip().strip("'\"").lower() in ("", "default") else args.text
+        cfg.set_setting("mic_device", choice)
+        shown = repr(choice) if choice else "the system default input"
+        print(f"mic_device = {shown} (restart the assistant to use it)")
+    current = str(cfg.get_setting("mic_device"))
+    try:
+        devices = list_inputs()
+    except AudioUnavailable as e:
+        print(e)
+        return 1
+    print("Speak while this runs (1.5 s per microphone):")
+    for d in devices:
+        m = MicStream(d.id)
+        try:
+            m.start()
+            time.sleep(1.5)
+            m.stop()
+            fr = []
+            while not m.frames.empty():
+                fr.append(m.frames.get_nowait())
+            x = pcm_to_float(b"".join(fr))
+            level = float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
+            meter = "silent (no signal)" if level == 0 else "#" * max(1, min(30, int(level * 300)))
+        except Exception as e:
+            meter = f"can't open ({type(e).__name__})"
+        tags = (
+            (" [system default]" if d.is_default else "")
+            + (" [virtual]" if d.virtual else "")
+            + (" [selected]" if current and current == d.id else "")
+        )
+        print(f"  {d.label}{tags}\n    id: {d.id}\n    level: {meter}")
+    print("\nPick one:  python -m zachary.cli voice mics <id>   (default = the system's input)")
+    return 0
+
+
+def _voice_listen(args: argparse.Namespace, kit: Any, conn: Any, cfg: Config) -> int:
+    """One spoken command: press Enter, speak, pause. Then search/open like the bar."""
+    import threading
+
+    from zachary.actions.safe_actions import SafeActions
+    from zachary.brain.handler import Handler
+    from zachary.search.semantic import local_semantic
+    from zachary.voice.pipeline import Heard, MicSource, VoiceListener
+
+    done = threading.Event()
+    result: list[Heard] = []
+
+    def got(h: Heard) -> None:
+        result.append(h)
+        done.set()
+
+    listener = VoiceListener(
+        MicSource(device=kit.mic_device),
+        on_heard=got,
+        on_state=lambda st: print(f"  [{st}]") if st != "idle" else None,
+        rest_stt=None if args.offline else kit.rest_stt,
+        stream_stt=None if args.offline else kit.stream_stt,
+        offline_stt=kit.offline_stt,
+        spotter=kit.spotter,
+        wake_word=False,
+    )
+    listener.start()
+    input("Press Enter, then speak your command (it stops when you pause)… ")
+    listener.push_to_talk()
+    done.wait(30)
+    listener.stop()
+    if not result or not result[0].text:
+        print(f"nothing heard ({result[0].error if result and result[0].error else 'timeout'})")
+        return 1
+    h = result[0]
+    print(f"heard ({h.transcript.provider if h.transcript else '?'}): {h.text!r}")
+    handler = Handler(conn, SafeActions(conn, cfg.platform), cfg, lambda: local_semantic(conn, cfg))
+    reply = handler.submit(h.text)
+    h.timeline.mark("intent_search")
+    print(f"zach: {reply.say}")
+    for i, it in enumerate(reply.items[:5], 1):
+        print(f"  {i}. {it.name}  ({_short(os.path.dirname(it.path))})")
+    if kit.tts is not None and not args.no_speak and reply.say:
+        from zachary.voice.audio import Player
+
+        player = Player()
+        first = True
+        for chunk in kit.tts.stream(reply.say):
+            if first:
+                h.timeline.mark("tts_first_audio")
+                first = False
+            player.play(chunk.pcm, chunk.sample_rate)
+        player.end()
+        player.wait()
+        h.timeline.mark("tts_done")
+    rec = h.timeline.finish(str(Path(args.db or default_db_path()).parent / "latency.jsonl"))
+    stages = h.timeline.durations()
+    print("latency: " + "  ".join(f"{k} {v:.0f} ms" for k, v in stages.items()))
+    del rec
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     conn, cfg = _open(args)
     files, dirs = conn.execute("SELECT count(*), coalesce(sum(is_dir), 0) FROM files").fetchone()
@@ -353,6 +558,18 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("related", help="files related to a file")
     s.add_argument("path")
     s.set_defaults(fn=cmd_related)
+
+    s = sub.add_parser(
+        "voice",
+        help="voice: usage | setup | mics [ID] | latency [N] | transcribe WAV | say TEXT | listen",
+    )
+    s.add_argument(
+        "action", choices=["usage", "setup", "mics", "latency", "transcribe", "say", "listen"]
+    )
+    s.add_argument("text", nargs="?", default=None, help="WAV path, text to say, or a mic id")
+    s.add_argument("--offline", action="store_true", help="local speech recognition only")
+    s.add_argument("--no-speak", action="store_true", help="don't speak the reply (listen)")
+    s.set_defaults(fn=cmd_voice)
 
     s = sub.add_parser("status", help="index and indexer status")
     s.set_defaults(fn=cmd_status)

@@ -51,6 +51,9 @@ class Reply:
 
 
 def clear_winner(results: list[SearchResult] | list[Item]) -> bool:
+    """Act without asking only on a strong top match that clearly beats the rest."""
+    if results and isinstance(results[0], SearchResult) and not results[0].strong:
+        return False
     if len(results) == 1:
         return True
     if len(results) < 2:
@@ -239,7 +242,8 @@ class Handler:
             results, note = self._search(intent.query, RESULT_LIMIT)
             items = [_item(r, self.conn) for r in results]
             view = "results"
-            winner = clear_winner(results)
+            # A note (typo corrected, nothing in the time range) means we guessed: ask.
+            winner = clear_winner(results) and not note
         self.context.set_results(items, intent.query, view)
         q = intent.query.strip()
         if not items:

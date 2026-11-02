@@ -117,7 +117,11 @@ class Platform(Protocol):
         ...
 
     def global_hotkey(
-        self, hotkey: Hotkey, callback: HotkeyCallback, description: str
+        self,
+        hotkey: Hotkey,
+        callback: HotkeyCallback,
+        description: str,
+        shortcut_id: str = "toggle",
     ) -> HotkeyBackend:
         """A not-yet-started global hotkey listener for this OS/session."""
         ...

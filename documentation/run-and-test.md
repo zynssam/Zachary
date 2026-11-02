@@ -1,7 +1,9 @@
 # Running and testing Zachary
 
 How to set up, run every part (indexer, CLI, quick bar), run all automated
-checks and benchmarks, and test everything by hand. Covers Phases 0–3.
+checks and benchmarks, and test everything by hand. Covers Phases 0–4.
+
+**On Windows?** See [windows.md](windows.md) for the full Windows setup.
 
 All commands run from the repo root: `~/Documents/PROJECTS/Zachary`.
 Windows equivalents are shown where they differ.
@@ -34,6 +36,9 @@ The rest of this file assumes the venv is active.
 |---|---|---|
 | Database | Linux `~/.local/share/zachary/zachary.db`, Windows `%LOCALAPPDATA%\Zachary\zachary.db` | `--db PATH` on every command, or env `ZACHARY_DB=PATH` |
 | Desktop entry (Wayland hotkey) | `~/.local/share/applications/ai.zachary.Zachary.desktop` | written on first start of the assistant |
+| Gnani key | `.env` in the repo root: `GNANI_API_KEY=...` (copy `.env.example`; git-ignored) | env `GNANI_API_KEY` |
+| Gnani usage ledger / voice latency log | `<data dir>/gnani_usage.jsonl`, `<data dir>/latency.jsonl` | |
+| Whisper model (offline STT + wake word) | `<data dir>/models/whisper` | |
 | Benchmark tree + DBs | `~/.cache/zachary-bench/` | created by the bench scripts |
 
 **Safe sandbox:** to try things without touching your real index, point everything at a test DB:
@@ -123,6 +128,37 @@ On Windows, Win+Space is reserved by the OS; use e.g. `--hotkey ctrl+alt+space` 
 | click | open (projects open their folder); right-click: Open / Show in folder / Related files / Copy path |
 | Esc | hide |
 
+### 3.4 Voice (Phase 4)
+Voice uses **paid Gnani credits**: every real call is logged; nothing is retried automatically.
+```bash
+sudo dnf install portaudio espeak-ng           # apt: libportaudio2 espeak-ng (espeak only for tests)
+python -m zachary.cli voice setup              # key found? downloads whisper tiny (75 MB) once; shows the mic
+python -m zachary.cli set voice_enabled true    # voice is off by default
+python -m zachary.assistant -v                  # restart the assistant to pick it up
+```
+| Key / phrase | Action |
+|---|---|
+| **Super+Alt+Space** (global) or **Ctrl+M** (in the bar) | push-to-talk (default): the mic opens, you speak, it ends when you stop; press again to stop early |
+| **hold Space** in the bar | hold-to-talk: records while held (pauses are fine), release to send; while typing, hold > 0.4 s (a tap is a space) |
+| "Hey Zach, open the fee receipt" | only with `cli set wake_word true` (runs whisper locally, ~300 MB; mic always open) |
+
+Other voice commands (the ones that use credits say so):
+```bash
+python -m zachary.cli voice usage                       # Gnani calls so far (free)
+python -m zachary.cli voice latency                     # last 10 commands, ms per stage (free)
+python -m zachary.cli set stt_streaming false           # REST instead of streaming (if accuracy is poor)
+python -m zachary.cli voice mics                        # microphones with a live level (free)
+python -m zachary.cli voice mics bluez_input.XX         # use that mic ("" = system default)
+python -m zachary.cli voice listen --offline            # press Enter, speak; local whisper only (free)
+python -m zachary.cli voice listen                      # same with Gnani (1 STT + 1 TTS call)
+python -m zachary.cli voice transcribe clip.wav --offline   # free
+python -m zachary.cli voice say "Opening your file."    # 1 TTS call
+python -m zachary.cli set speak_replies false           # text replies only (saves TTS credits)
+python -m zachary.cli set wake_word false               # push-to-talk only
+python -m zachary.cli set stt_language hi-IN            # default en-IN (handles Hinglish in Latin script)
+```
+Real-API smoke test (deliberate, costs credits): `python bench/gnani_smoke.py --yes` (3 calls).
+
 ---
 
 ## 4. Automated checks
@@ -137,6 +173,12 @@ pytest                                     # ~330 tests, ~20 s
 ```
 Expected: no lint/type issues; on Linux about `320 passed, 7 skipped` (skips are Windows-only tests
 and the real-model test).
+
+Tests never call the real Gnani API: it's mocked, and a guard in `tests/conftest.py` blocks the real host.
+Real local wake-word/whisper tests (free; downloads whisper tiny once; needs espeak-ng):
+```bash
+ZACHARY_TEST_WHISPER=1 pytest tests/test_voice.py
+```
 
 Real-model test (downloads the 30 MB model once):
 ```bash
@@ -252,6 +294,20 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 | 7 | In the bar: search, highlight a result, **Ctrl+R** | related files list; then "open the first one" |
 | 8 | Have `report.docx`, `report_final.docx`, `report_final_v2.docx`; search `report` | one entry "latest of 3 versions"; "the older one" opens the previous version |
 
+### Phase 4: voice
+| # | Do | Expect |
+|---|---|---|
+| 1 | `cli voice setup` | "Gnani key: found", "local speech model ready", your mic name |
+| 2 | `cli voice listen --offline`, say "open fee receipt" | the text (whisper), then the file opens, no credits used |
+| 3 | `cli voice listen`, say "open fee receipt" | Gnani text, the file opens, the reply is spoken; `cli voice usage` shows +1 STT, +1 TTS |
+| 4 | With voice on: say "Hey Zach, open the fee receipt" | the bar shows the transcript and opens the file; spoken "Opening …" |
+| 5 | Say a sentence without "Hey Zach" | nothing happens and nothing is sent (`cli voice usage` unchanged) |
+| 6 | Super+Alt+Space, say "show my projects" | the projects list (push-to-talk, no wake word) |
+| 7 | Say "Hey Zach, kal wali fees file kholo" | Hinglish works like typing it |
+| 8 | Say "Hey Zach, open the <something vague> I opened yesterday" | if nothing matches by name, content or close meaning: "Which one?" with a list, **never** a guess |
+| 9 | Turn Wi-Fi off, say a command | it still works via local whisper (fallback) |
+| 10 | `tail -1 ~/.local/share/zachary/latency.jsonl` | per-stage timings: wake, speech_end, stt, intent_search, tts_first_audio, tts_done |
+
 ---
 
 ## 7. Troubleshooting
@@ -269,3 +325,7 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 | Meaning search not working | `cli status` shows "semantic: 0/…" or an error: the model downloads on first `cli embed` / indexer run (needs internet once); check `semantic.error` in status |
 | Other apps complain about file watching (Linux) | an old indexer (before Phase 3) watched excluded folders too: `pkill -f zachary.indexer` and restart the assistant |
 | Start completely fresh | stop everything, then delete the DB (`rm ~/.local/share/zachary/zachary.db*`) and run `cli scan` |
+| Voice: "microphone unavailable" | install PortAudio (`sudo dnf install portaudio`), check the input device in system sound settings, run `cli voice setup` |
+| Voice: "Gnani credits are used up" / "rejected the API key" | replies still work through local whisper; check the key in `.env` and your Gnani dashboard |
+| Voice: "Hey Zach" not recognised | speak a little slower; or use push-to-talk (Super+Alt+Space); `cli voice listen --offline` shows what whisper hears |
+| Watcher/inotify tests fail locally while the indexer runs | the indexer uses most inotify watches; raise the limit (first row) |

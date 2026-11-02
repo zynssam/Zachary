@@ -336,13 +336,17 @@ class LinuxPlatform:
             log.warning("could not write %s: %s", target, e)
 
     def global_hotkey(
-        self, hotkey: Hotkey, callback: HotkeyCallback, description: str
+        self,
+        hotkey: Hotkey,
+        callback: HotkeyCallback,
+        description: str,
+        shortcut_id: str = "toggle",
     ) -> HotkeyBackend:
         """Wayland: XDG GlobalShortcuts portal. X11: XGrabKey."""
         if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
             from zachary.core.platform.linux_portal import PortalHotkey
 
-            return PortalHotkey(hotkey, callback, description)
+            return PortalHotkey(hotkey, callback, description, shortcut_id)
         from zachary.core.platform.linux_x11 import X11Hotkey
 
         return X11Hotkey(hotkey, callback)

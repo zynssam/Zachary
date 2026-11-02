@@ -16,6 +16,7 @@ from zachary.indexer import projects
 from zachary.indexer.recent import ingest_recent
 from zachary.indexer.scanner import scan
 from zachary.indexer.store import FileStore
+from zachary.search.hybrid import SearchResult
 
 OLD = time.time() - 86400 * 200
 
@@ -140,6 +141,43 @@ def test_clear_winner_rule() -> None:
     assert not clear_winner([a, b])
     assert clear_winner([a, c])
     assert not clear_winner([])
+
+
+def test_clear_winner_needs_a_strong_match() -> None:
+    def res(fid: int, score: float, strong: bool) -> SearchResult:
+        return SearchResult(
+            fid, f"/{fid}", str(fid), "other", False, 0.0, None, score, strong=strong
+        )
+
+    assert clear_winner([res(1, 0.08, True), res(2, 0.03, True)])
+    # Time/recency alone made it the top result: ask, never act.
+    assert not clear_winner([res(1, 0.08, False), res(2, 0.03, True)])
+    assert not clear_winner([res(1, 0.08, False)])
+
+
+def test_weak_match_asks_instead_of_opening(
+    store: FileStore, home: Path, fake_platform: FakePlatform
+) -> None:
+    """Real smoke-test bug: "the fees document I opened yesterday" opened an unrelated
+    spec, because it was the only thing opened yesterday."""
+    write(home / "Projects" / "Roommate_Spec.docx", mtime=OLD)
+    write(home / "Projects" / "budget.xlsx", mtime=OLD)
+    scan(store)
+    y = (datetime.now() - timedelta(days=1)).replace(hour=14).timestamp()
+    fake_platform.recent = [RecentItem(home / "Projects" / "Roommate_Spec.docx", y)]
+    ingest_recent(store, fake_platform)
+    h = Handler(store.conn, SafeActions(store.conn, fake_platform), store.config)
+    r = h.submit("open the invoice document I opened yesterday")
+    assert r.action is None and not fake_platform.opened
+
+
+def test_corrected_typo_asks_instead_of_opening(
+    handler: Handler, fake_platform: FakePlatform
+) -> None:
+    r = handler.submit("open reciept")
+    assert r.action is None and not fake_platform.opened
+    assert r.items and r.items[0].name == "Fee Receipt Sem 5.pdf"  # still shown first
+    assert r.say.startswith("Did you mean")
 
 
 def test_safe_actions_refuse_unindexed_or_missing(

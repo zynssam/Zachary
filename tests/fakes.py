@@ -79,7 +79,11 @@ class FakePlatform:
     def ensure_app_registration(self, exec_argv: list[str]) -> None: ...
 
     def global_hotkey(
-        self, hotkey: Hotkey, callback: HotkeyCallback, description: str
+        self,
+        hotkey: Hotkey,
+        callback: HotkeyCallback,
+        description: str,
+        shortcut_id: str = "toggle",
     ) -> HotkeyBackend:
         return FakeHotkey(callback)
 
