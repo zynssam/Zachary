@@ -1020,6 +1020,30 @@ def test_player_stop_drops_the_old_reply() -> None:
     assert out.written.endswith(b"\2\0" * 2400)  # and the new one played in full
 
 
+def test_player_keeps_the_speaker_awake_while_the_bar_is_open() -> None:
+    """Bluetooth sleeps after a few quiet seconds and takes 1-3 s to wake: while the
+    bar is open the player writes silence, so a reply starts on the open stream."""
+    from zachary.voice.audio import Player
+
+    out = FakeOut()
+    p = Player(open_stream=out.open)
+    p.keep_alive(True)
+    time.sleep(0.3)
+    assert out.opened == 1 and len(out.written) > 0 and not any(out.written)  # silence
+    assert p.first_audio_at is None  # silence isn't "the reply started"
+    p.stop()
+    p.play(b"\3\0" * 2400, 24000)
+    p.end()
+    assert p.wait(5) and p.first_audio_at is not None
+    time.sleep(0.1)
+    assert bytes(out.written).count(b"\3\0") == 2400 and out.opened == 1  # same stream
+    p.keep_alive(False)
+    time.sleep(0.1)  # a silence block already in flight may still finish
+    n = len(out.written)
+    time.sleep(0.3)
+    assert len(out.written) == n  # no more silence once the bar is closed
+
+
 def test_mic_routing_does_not_leak_to_playback(monkeypatch: pytest.MonkeyPatch) -> None:
     import os
 

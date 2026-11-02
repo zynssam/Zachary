@@ -120,6 +120,9 @@ class VoiceController(QObject):
         """Keep the mic warm (local buffer only) while the bar is open."""
         if self.listener is not None and not self.wake_word:
             self.listener.set_warm(shown)
+        keep = getattr(self.player, "keep_alive", None)
+        if self.speak and keep is not None:
+            keep(shown)  # speaker awake while the bar is open: replies start at once
 
     def hold_talk(self, pressed: bool) -> None:
         """Space held in the bar: record while held, send on release."""

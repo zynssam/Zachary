@@ -480,6 +480,7 @@ class Player:
 
     IDLE_CLOSE_S = 10.0
     BLOCK_S = 0.05  # written in small blocks so stop() takes effect within ~50 ms
+    KEEPALIVE_RATE = 24_000  # the TTS rate, so a reply never has to reopen the stream
 
     def __init__(self, open_stream: Any = None) -> None:
         self._q: queue.Queue[tuple[int, bytes | None, int]] = queue.Queue()
@@ -491,6 +492,18 @@ class Player:
         self._open = open_stream
         self.first_audio_at: float | None = None
         self.played_bytes = 0
+        # While the quick bar is open, keep the output device awake by writing silence:
+        # Bluetooth earbuds (and some USB devices) put the link to sleep after a few
+        # quiet seconds and take 1-3 s to wake up, which delayed every reply.
+        self._keep_alive = threading.Event()
+
+    def keep_alive(self, on: bool) -> None:
+        if on:
+            self._keep_alive.set()
+            with self._lock:
+                self._ensure_thread()
+        else:
+            self._keep_alive.clear()
 
     # -- any thread -------------------------------------------------------------------
     def play(self, pcm: bytes, sample_rate: int) -> None:
@@ -546,16 +559,35 @@ class Player:
         stream: Any = None
         rate = 0
         try:
+            quiet_since = time.monotonic()
             while True:
+                warm = self._keep_alive.is_set()
                 try:
-                    gen, pcm, sr = self._q.get(timeout=self.IDLE_CLOSE_S)
+                    gen, pcm, sr = self._q.get(timeout=self.BLOCK_S if warm else 1.0)
                 except queue.Empty:
-                    if stream is not None:  # release the device when quiet
-                        with contextlib.suppress(Exception):
+                    if warm:
+                        if stream is None or rate != self.KEEPALIVE_RATE:
+                            if stream is not None:
+                                with contextlib.suppress(Exception):
+                                    stream.stop()
+                                    stream.close()
+                            try:
+                                stream = self._open_stream(self.KEEPALIVE_RATE)
+                                rate = self.KEEPALIVE_RATE
+                            except Exception as e:
+                                log.info("can't keep the speaker awake: %s", e)
+                                self._keep_alive.clear()
+                                continue
+                        # ~50 ms of silence: keeps the link awake, ~50 ms worst-case delay
+                        stream.write(b"\0\0" * int(rate * self.BLOCK_S))
+                        quiet_since = time.monotonic()
+                    elif stream is not None and time.monotonic() - quiet_since > self.IDLE_CLOSE_S:
+                        with contextlib.suppress(Exception):  # release the device when quiet
                             stream.stop()
                             stream.close()
                         stream = None
                     continue
+                quiet_since = time.monotonic()
                 if gen != self._gen:
                     continue  # cancelled
                 if pcm is None:
