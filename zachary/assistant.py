@@ -126,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="zachary.assistant", description="Zachary quick bar")
     ap.add_argument("--db", default=None)
     ap.add_argument("--toggle", action="store_true", help="toggle a running quick bar")
+    ap.add_argument("--talk", action="store_true", help="push-to-talk in a running assistant")
     ap.add_argument("--hotkey", default=None, help='e.g. "super+space" (default from settings)')
     ap.add_argument("--no-hotkey", action="store_true")
     ap.add_argument("--no-indexer", action="store_true", help="don't start the indexer")
@@ -148,8 +149,11 @@ def main(argv: list[str] | None = None) -> int:
     app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(app_icon())
 
-    if send_to_running(b"toggle"):
+    if send_to_running(b"talk" if args.talk else b"toggle"):
         return 0  # another instance owns the quick bar
+    if args.talk:
+        log.warning("no running assistant to talk to")
+        return 1
 
     platform = get_platform()
     db_path = Path(args.db) if args.db else default_db_path(platform)
@@ -170,7 +174,15 @@ def main(argv: list[str] | None = None) -> int:
     QLocalServer.removeServer(server_name())
     server.listen(server_name())
 
-    serve_commands(server, {b"toggle": bar.toggle})
+    talk_handlers: list[Callable[[], None]] = []
+
+    def talk() -> None:
+        if talk_handlers:
+            talk_handlers[0]()
+        else:
+            log.warning("voice is off: python -m zachary.cli set voice_enabled true")
+
+    serve_commands(server, {b"toggle": bar.toggle, b"talk": talk})
 
     tray = None
     if Tray.available():
@@ -227,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             latency_path=data_dir / "latency.jsonl",
         )
         voice.start()
+        talk_handlers.append(voice.push_to_talk)
         bar.talk.connect(voice.push_to_talk)
         vbridge = _HotkeyBridge()
         vbridge.pressed.connect(lambda _tok, _t0: voice.push_to_talk())
