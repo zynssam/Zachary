@@ -247,9 +247,14 @@ CREATE TABLE ivf_centroids (
 # Migration #4 (Phase 5): feedback keeps the query's words, so a choice also helps
 # *similar* queries ("fee receipt" after choosing for "fee receipt sem 5"), and an
 # index for the per-file lookups of the boost.
+# Topics also store their size and last activity, so listing them is a lookup, not
+# an aggregate over every member (106 ms on 200k files).
 _MIGRATION_4 = """
 ALTER TABLE feedback ADD COLUMN terms TEXT NOT NULL DEFAULT '';
 CREATE INDEX idx_feedback_ts ON feedback(ts);
+ALTER TABLE topics ADD COLUMN size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE topics ADD COLUMN last_ts REAL NOT NULL DEFAULT 0;
+CREATE INDEX idx_topics_last ON topics(last_ts DESC);
 """
 
 MIGRATIONS: tuple[str, ...] = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3, _MIGRATION_4)

@@ -45,6 +45,58 @@ def record(
         )
 
 
+class _Index:
+    """Past choices in memory, indexed by word; new rows are pulled in incrementally."""
+
+    def __init__(self) -> None:
+        self.last_id = 0
+        self.rows: list[tuple[int, float, frozenset[str]]] = []
+        self.by_word: dict[str, list[int]] = {}
+
+    def refresh(self, conn: sqlite3.Connection, now: float) -> None:
+        for rid, fid, ts, terms in conn.execute(
+            "SELECT id, file_id, ts, terms FROM feedback WHERE id > ? AND chosen = 1 "
+            "AND ts > ? ORDER BY id",
+            (self.last_id, now - MAX_AGE_S),
+        ):
+            self.last_id = rid
+            t = frozenset(str(terms).split())
+            if not t:
+                continue
+            i = len(self.rows)
+            self.rows.append((fid, ts, t))
+            for w in t:
+                self.by_word.setdefault(w, []).append(i)
+        if len(self.rows) > 2 * SCAN_LIMIT:  # keep the most recent choices only
+            self.__init__()  # type: ignore[misc]
+            self.last_id = 0
+            self._reload_recent(conn, now)
+
+    def _reload_recent(self, conn: sqlite3.Connection, now: float) -> None:
+        rows = conn.execute(
+            "SELECT id, file_id, ts, terms FROM feedback WHERE chosen = 1 AND ts > ? "
+            "ORDER BY id DESC LIMIT ?",
+            (now - MAX_AGE_S, SCAN_LIMIT),
+        ).fetchall()
+        for rid, fid, ts, terms in reversed(rows):
+            self.last_id = max(self.last_id, rid)
+            t = frozenset(str(terms).split())
+            if t:
+                i = len(self.rows)
+                self.rows.append((fid, ts, t))
+                for w in t:
+                    self.by_word.setdefault(w, []).append(i)
+
+
+_INDEXES: dict[tuple[int, str], _Index] = {}
+
+
+def _index_for(conn: sqlite3.Connection) -> _Index:
+    # The file path too: Python may reuse a closed connection's id for a new one.
+    path = str(conn.execute("PRAGMA database_list").fetchone()[2])
+    return _INDEXES.setdefault((id(conn), path), _Index())
+
+
 def boosts(
     conn: sqlite3.Connection, terms: list[str], now: float | None = None
 ) -> dict[int, float]:
@@ -52,19 +104,21 @@ def boosts(
     if not terms:
         return {}
     now = time.time() if now is None else now
+    idx = _index_for(conn)
+    idx.refresh(conn, now)
     q = {t.lower() for t in terms}
+    seen: set[int] = set()
     out: dict[int, float] = {}
-    for fid, ts, row_terms in conn.execute(
-        "SELECT file_id, ts, terms FROM feedback WHERE chosen = 1 AND ts > ? "
-        "ORDER BY ts DESC LIMIT ?",
-        (now - MAX_AGE_S, SCAN_LIMIT),
-    ):
-        t = set(str(row_terms).split())
-        if not t:
-            continue
-        sim = len(q & t) / len(q | t)
-        if sim < MIN_SIM:
-            continue
-        decay = 0.5 ** (max(0.0, now - ts) / HALF_LIFE_S)
-        out[fid] = out.get(fid, 0.0) + sim * decay
+    for w in q:
+        for i in idx.by_word.get(w, ()):
+            if i in seen:
+                continue
+            seen.add(i)
+            fid, ts, t = idx.rows[i]
+            if now - ts > MAX_AGE_S:
+                continue
+            sim = len(q & t) / len(q | t)
+            if sim < MIN_SIM:
+                continue
+            out[fid] = out.get(fid, 0.0) + sim * 0.5 ** (max(0.0, now - ts) / HALF_LIFE_S)
     return {k: min(v, MAX_SCORE) for k, v in out.items()}

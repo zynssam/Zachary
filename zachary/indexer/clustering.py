@@ -29,7 +29,7 @@ from pathlib import PurePath
 
 import numpy as np
 
-from zachary.core.db import get_state, set_state
+from zachary.core.db import EMBED_DIM, get_state, set_state
 from zachary.search.hybrid import STOPWORDS
 from zachary.search.tokens import words
 
@@ -37,12 +37,17 @@ log = logging.getLogger(__name__)
 
 CLUSTER_KINDS = ("document",)  # subjects come from notes/docs; code is covered by projects
 JOIN_KINDS = ("document", "code")  # ...but code joins a topic it clearly belongs to
-MAX_CLUSTER_FILES = 40_000  # HDBSCAN sample; the rest is assigned to the nearest topic
+# HDBSCAN on the newest MAX_CLUSTER_FILES documents; the rest joins the nearest topic.
+# Measured on 200k files: 15k docs in 16-d = 9 s (40k in 32-d took 2 min).
+MAX_CLUSTER_FILES = 15_000
 MIN_FILES = 30  # don't bother below this
-PCA_DIM = 32
+PCA_DIM = 16  # big collections (speed); small ones use PCA_DIM_SMALL (precision)
+PCA_DIM_SMALL = 32
+SMALL_N = 5_000
 MIN_CLUSTER = 8
 MIN_SAMPLES = 4
 ASSIGN_SIM = 0.6  # cosine to a topic centroid for documents outside the sample / noise
+LABEL_SAMPLE = 300  # members per topic used to name it
 MEMBER_SIM = 0.35  # in full dimensions, a member must be at least this close to its topic
 CODE_JOIN_SIM = 0.75  # code must be much closer to join a topic of notes
 CODE_JOIN_MAX = 2.0  # at most this many code files per document in a topic
@@ -92,22 +97,38 @@ def _load(
     conn: sqlite3.Connection, kinds: tuple[str, ...], exclude: set[int] | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
     marks = ",".join("?" * len(kinds))
-    rows = [
-        r
+    # Sort just the ids (sorting rows *with* their vectors peaked at ~580 MB on 200k).
+    order = [
+        r[0]
         for r in conn.execute(
-            f"""SELECT v.file_id, v.embedding FROM vec_ivf v JOIN files f ON f.id = v.file_id
+            f"""SELECT f.id FROM files f JOIN vec_ivf v ON v.file_id = f.id
                 WHERE f.kind IN ({marks}) ORDER BY f.mtime DESC""",
             kinds,
         )
         if not exclude or r[0] not in exclude
     ]
-    if not rows:
-        return np.zeros(0, dtype=np.int64), np.zeros((0, 0), dtype=np.float32)
-    ids = np.array([r[0] for r in rows], dtype=np.int64)
-    m = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.int8).reshape(len(rows), -1)
-    x = m.astype(np.float32)
-    x /= np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-6)
+    if not order:
+        return np.zeros(0, dtype=np.int64), np.zeros((0, EMBED_DIM), dtype=np.int8)
+    ids = np.array(order, dtype=np.int64)
+    pos = {fid: i for i, fid in enumerate(order)}
+    # Kept as int8 (1 byte per number; float32 would be 150 MB on 200k files) and
+    # turned into unit float vectors in batches by ``_unit``.
+    x = np.zeros((len(order), EMBED_DIM), dtype=np.int8)
+    for i in range(0, len(order), 900):
+        chunk = order[i : i + 900]
+        q = ",".join("?" * len(chunk))
+        for fid, blob in conn.execute(
+            f"SELECT file_id, embedding FROM vec_ivf WHERE file_id IN ({q})", chunk
+        ):
+            x[pos[fid]] = np.frombuffer(blob, dtype=np.int8)
     return ids, x
+
+
+def _unit(q: np.ndarray) -> np.ndarray:
+    """int8 rows -> unit-length float32 rows."""
+    x = q.astype(np.float32)
+    x /= np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-6)
+    return x
 
 
 def _pca(x: np.ndarray, dim: int) -> np.ndarray:
@@ -124,7 +145,7 @@ def cluster(x: np.ndarray) -> np.ndarray:
     """HDBSCAN labels (-1 = noise) for unit vectors ``x``."""
     from sklearn.cluster import HDBSCAN  # only the indexer needs scikit-learn
 
-    z = _pca(x, PCA_DIM)
+    z = _pca(x, PCA_DIM_SMALL if len(x) <= SMALL_N else PCA_DIM)
     z /= np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1e-6)
     labels: np.ndarray = HDBSCAN(
         min_cluster_size=MIN_CLUSTER,
@@ -241,7 +262,8 @@ def build(conn: sqlite3.Connection, roots: list[str] | None = None) -> TopicStat
         ids = np.concatenate([ids[:n], code_ids, ids[n:]])
         x = np.concatenate([x[:n], code_x, x[n:]])
     st.files = len(ids)
-    labels = cluster(x[:n])
+    xs = _unit(x[:n])  # the clustered sample, as floats
+    labels = cluster(xs)
     clusters = sorted(set(labels.tolist()) - {-1})
     groups: dict[int, list[int]] = {}
     cents: dict[int, np.ndarray] = {}
@@ -249,14 +271,14 @@ def build(conn: sqlite3.Connection, roots: list[str] | None = None) -> TopicStat
         idx = np.flatnonzero(labels == c)
         if n >= 500 and len(idx) > MAX_TOPIC_SHARE * n:
             continue  # a catch-all blob, not a topic (only meaningful in big collections)
-        v = x[idx].mean(axis=0)
+        v = xs[idx].mean(axis=0)
         v /= max(float(np.linalg.norm(v)), 1e-6)
         # PCA can make unrelated files look close: keep members that really are.
-        idx = idx[(x[idx] @ v) >= MEMBER_SIM]
+        idx = idx[(xs[idx] @ v) >= MEMBER_SIM]
         if len(idx) < MIN_CLUSTER:
             continue
         groups[c] = ids[idx].tolist()
-        v = x[idx].mean(axis=0)
+        v = xs[idx].mean(axis=0)
         cents[c] = v / max(float(np.linalg.norm(v)), 1e-6)
     # Noise and files beyond the sample join the closest topic if they clearly belong.
     if cents:
@@ -267,14 +289,17 @@ def build(conn: sqlite3.Connection, roots: list[str] | None = None) -> TopicStat
         docs_in = {k: len(groups[k]) for k in keys}
         joined_code: Counter[int] = Counter()
         rest = np.concatenate([np.flatnonzero(labels == -1), np.arange(n, len(ids))])
+        best = np.zeros(len(rest), dtype=np.int64)
+        best_sim = np.zeros(len(rest), dtype=np.float32)
+        for b in range(0, len(rest), 20_000):  # batches: bounded memory
+            sims = _unit(x[rest[b : b + 20_000]]) @ cmat.T
+            best[b : b + 20_000] = sims.argmax(axis=1)
+            best_sim[b : b + 20_000] = sims.max(axis=1)
         if len(rest):
-            sims = x[rest] @ cmat.T
-            best = sims.argmax(axis=1)
-            order = np.argsort(-sims[np.arange(len(rest)), best])  # closest first
-            for j in order.tolist():
+            for j in np.argsort(-best_sim).tolist():  # closest first
                 i = int(rest[j])
                 k = keys[int(best[j])]
-                sim = float(sims[j, best[j]])
+                sim = float(best_sim[j])
                 if is_code[i]:
                     if sim < CODE_JOIN_SIM or joined_code[k] >= CODE_JOIN_MAX * docs_in[k]:
                         continue
@@ -284,18 +309,23 @@ def build(conn: sqlite3.Connection, roots: list[str] | None = None) -> TopicStat
                 groups[k].append(int(ids[i]))
     st.noise = len(ids) - sum(len(g) for g in groups.values())
 
-    paths = dict(
-        conn.execute(
-            "SELECT id, path FROM files WHERE id IN (SELECT file_id FROM vec_ivf)"
-        ).fetchall()
-    )
-    toks = _tokens(conn, [fid for g in groups.values() for fid in g])
-    kw_labels = _keyword_labels(groups, toks)
+    del xs
+    # Names come from a sample of each topic (newest notes first): plenty for words
+    # and folders, and it keeps memory flat on big collections.
+    sample = {c: m[:LABEL_SAMPLE] for c, m in groups.items()}
+    sample_ids = [f for m in sample.values() for f in m]
+    paths: dict[int, str] = {}
+    for i in range(0, len(sample_ids), 900):
+        chunk = sample_ids[i : i + 900]
+        q = ",".join("?" * len(chunk))
+        paths.update(conn.execute(f"SELECT id, path FROM files WHERE id IN ({q})", chunk))
+    toks = _tokens(conn, sample_ids)
+    kw_labels = _keyword_labels(sample, toks)
     root_list = [str(r) for r in (roots or [])]
     final: list[tuple[str, list[int], np.ndarray]] = []
     chosen: dict[int, str] = {}
-    for c, members in groups.items():
-        label = _folder_label([paths[f] for f in members if f in paths], root_list)
+    for c in groups:
+        label = _folder_label([paths[f] for f in sample[c] if f in paths], root_list)
         chosen[c] = label or kw_labels[c]
     dupes = Counter(chosen.values())
     for c, members in groups.items():
@@ -320,6 +350,12 @@ def _write(conn: sqlite3.Connection, topics: list[tuple[str, list[int], np.ndarr
         old.setdefault(tid, set()).add(fid)
     now = time.time()
     used: set[int] = set()
+    mtimes: dict[int, float] = {}
+    all_ids = [f for _l, m, _c in topics for f in m]
+    for i in range(0, len(all_ids), 900):
+        chunk = all_ids[i : i + 900]
+        q = ",".join("?" * len(chunk))
+        mtimes.update(conn.execute(f"SELECT id, mtime FROM files WHERE id IN ({q})", chunk))
     with conn:
         conn.execute("DELETE FROM topic_members")
         keep: list[int] = []
@@ -332,14 +368,19 @@ def _write(conn: sqlite3.Connection, topics: list[tuple[str, list[int], np.ndarr
                 j = len(mset & oset) / max(1, len(mset | oset))
                 if j > best_j:
                     best, best_j = tid, j
+            last = mtimes.get(max(members, key=lambda f: mtimes.get(f, 0.0)), 0.0)
             if best is not None and best_j >= STABLE_JACCARD:
                 tid = best
-                conn.execute("UPDATE topics SET label = ?, updated_at = ? WHERE id = ?",
-                             (label, now, tid))  # fmt: skip
+                conn.execute(
+                    "UPDATE topics SET label = ?, updated_at = ?, size = ?, last_ts = ? "
+                    "WHERE id = ?",
+                    (label, now, len(members), last, tid),
+                )
             else:
                 tid = int(
                     conn.execute(
-                        "INSERT INTO topics(label, updated_at) VALUES (?, ?)", (label, now)
+                        "INSERT INTO topics(label, updated_at, size, last_ts) VALUES (?, ?, ?, ?)",
+                        (label, now, len(members), last),
                     ).lastrowid
                     or 0
                 )
@@ -364,9 +405,7 @@ class Topic:
 
 def list_topics(conn: sqlite3.Connection, limit: int = 50) -> list[Topic]:
     rows = conn.execute(
-        """SELECT t.id, t.label, count(*), max(f.mtime) FROM topics t
-           JOIN topic_members m ON m.topic_id = t.id JOIN files f ON f.id = m.file_id
-           GROUP BY t.id ORDER BY max(f.mtime) DESC LIMIT ?""",
+        "SELECT id, label, size, last_ts FROM topics WHERE size > 0 ORDER BY last_ts DESC LIMIT ?",
         (limit,),
     ).fetchall()
     return [Topic(r[0], r[1], r[2], r[3] or 0.0) for r in rows]
