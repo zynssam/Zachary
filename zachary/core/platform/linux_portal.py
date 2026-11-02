@@ -207,6 +207,7 @@ class _PortalSession:
                 if msg_session != session or sid not in by_id:
                     continue
                 token = opts.get("activation_token", ("s", None))[1]
+                log.info("hotkey pressed: %s", sid)
                 try:
                     by_id[sid].callback(token or None)
                 except Exception:

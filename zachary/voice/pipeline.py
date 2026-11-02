@@ -256,6 +256,7 @@ class VoiceListener(threading.Thread):
             self.on_heard(heard)
             return
         tl.mark("mic_open")
+        log.info("voice: mic open (%s)", self._mic_name())
         try:
             heard = self._ptt_listen(tl)
         finally:
@@ -338,6 +339,9 @@ class VoiceListener(threading.Thread):
                 stream_err = box.get("err")  # type: ignore[assignment]
                 if stream is not None:
                     tl.mark("stream_open")
+                    log.info("voice: Gnani stream open")
+                elif stream_err is not None:
+                    log.warning("voice: Gnani stream unavailable: %s", stream_err)
             f = self._frame(0.03)
             if f is not None:
                 audio += f

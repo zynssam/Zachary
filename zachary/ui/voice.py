@@ -108,6 +108,7 @@ class VoiceController(QObject):
                 close()
 
     def push_to_talk(self) -> None:
+        log.info("voice: push-to-talk")
         self._cancel_speech()  # talking over the reply interrupts it
         if self.listener is None or not self.listener.is_alive():
             log.warning("voice: listener was not running; restarting it")
@@ -121,6 +122,8 @@ class VoiceController(QObject):
 
     # -- UI thread -------------------------------------------------------------------
     def _on_state(self, state: str) -> None:
+        if state in ("listening", "thinking"):
+            log.info("voice: %s", state)
         if state == "listening":
             if not self.bar.isVisible():
                 self.bar.show_bar()
@@ -145,6 +148,7 @@ class VoiceController(QObject):
             {"via": h.via, "audio_s": h.audio_s,
              "stt": h.transcript.provider if h.transcript else None}
         )  # fmt: skip
+        log.info("voice: heard %r via %s", h.text, h.transcript.provider if h.transcript else "?")
         if not self.bar.isVisible():
             self.bar.show_bar()
         self.bar.edit.blockSignals(True)
