@@ -95,6 +95,7 @@ class Engine(QObject):
             self.platform,
         )
         _ = self.handler.semantic  # load the model now, not on the first keystroke
+        self.handler._correct_names("warm up")  # build the name vocabulary now (~0.15 s)
 
     @Slot(int, str, object)
     def _on_request(self, rid: int, op: str, payload: Any) -> None:

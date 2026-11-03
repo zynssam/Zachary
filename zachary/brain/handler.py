@@ -38,6 +38,7 @@ from zachary.brain.intents import (
 )
 from zachary.brain.llm import LLM, Excerpt, LLMError
 from zachary.brain.timeparse import parse_time
+from zachary.brain.vocab import Vocabulary
 from zachary.core.config import Config, PathRules
 from zachary.core.platform import Platform
 from zachary.core.platform import apps as app_index
@@ -217,6 +218,24 @@ class Dictation:
         return ("…" + t[-n:]) if len(t) > n else t
 
 
+# A question is about *your* things when it says so ("my fee", "mera result", "in my
+# notes", "which file ..."; not just "I": "how do I reverse a string" is general): then
+# it's answered from your files only. Otherwise it's a
+# general question, and only the question goes to the LLM.
+MY_WORDS = frozenset(
+    """
+    my mine our ours myself mera meri mere maine hamara hamari hamare apna apni apne nanna
+    nanage
+    file files document documents doc docs notes note pdf folder folders project projects
+    receipt receipts assignment assignments
+    """.split()
+)
+
+
+def about_my_files(question: str) -> bool:
+    return any(t in MY_WORDS for t in tokenize(question))
+
+
 def _inside(path: str, folder: str) -> bool:
     f = folder.rstrip("/\\")
     return path.startswith(f + "/") or path.startswith(f + "\\")
@@ -257,6 +276,7 @@ class Handler:
         self._last_strong = False  # did the last search have a strong top match?
         self._open_with: App | None = None  # "which one?" for "open X in <app>"
         self._clipboard: str | None = None
+        self._vocab: Vocabulary | None = None
         self.dictation: Dictation | None = None
         self._sessions: dict[int, sess.Session] = {}  # timeline rows -> sessions
         # A proposal waiting for "yes": ("reopen", files, what). Only from submit().
@@ -352,7 +372,10 @@ class Handler:
             reply = self._dictation_input(text, execute=execute)
             reply.ms = (time.perf_counter() - t0) * 1e3
             return reply
+        text, fixed = self._correct_names(text)
         intent = parse(text)
+        if fixed:
+            log.info("names corrected: %s", fixed)
         if intent.kind == "related":  # before follow-ups: "related to the first one"
             reply = self._related(intent)
         elif intent.is_followup:
@@ -408,7 +431,23 @@ class Handler:
                 if routed_reply is not None:
                     reply = routed_reply
         reply.ms = (time.perf_counter() - t0) * 1e3
+        if fixed:
+            reply.timings["names_corrected"] = float(len(fixed))
         return reply
+
+    def _correct_names(self, text: str) -> tuple[str, dict[str, str]]:
+        """Misheard/misspelled names -> your project/app/topic/folder names (local only)."""
+        if self._vocab is None:
+            self._vocab = Vocabulary(
+                self.conn,
+                lambda: [str(r) for r in self.config.index_roots()],
+                lambda: [a.name for a in self._apps()],
+            )
+        try:
+            return self._vocab.correct(text)
+        except Exception:
+            log.debug("name correction failed", exc_info=True)
+            return text, {}
 
     # -- Phase 6: ask your files, and the LLM for unclear commands ----------------------
     def _unclear(self, text: str, intent: Intent, reply: Reply) -> bool:
@@ -588,9 +627,30 @@ class Handler:
         return Reply(ans.text or fallback, "answer", items, intent, selected=0,
                      detail=f"From: {used}")  # fmt: skip
 
+    def _general(self, question: str, intent: Intent, *, execute: bool) -> Reply:
+        """A question that isn't about your files ("how many planets are there"): only
+        the question goes to the LLM; nothing from your files."""
+        llm = self.llm()
+        self.context.set_results([], question, "answer")
+        if llm is None:
+            return Reply("That's a general question: turn on the LLM to answer it "
+                         "(cli set llm_enabled true).", "answer", [], intent)  # fmt: skip
+        if not execute:
+            return Reply("Enter to ask.", "answer", [], intent)
+        try:
+            text = llm.general(question)
+        except LLMError as e:
+            return Reply(f"Couldn't ask the LLM ({e}).", "answer", [], intent)
+        return Reply(text or "I don't know.", "answer", [], intent,
+                     detail=f"Answered by {llm.model} (not from your files).")  # fmt: skip
+
     def _ask(self, intent: Intent, *, execute: bool) -> Reply:
         question = intent.query.strip()
+        personal = about_my_files(question)
         passages = qa.retrieve(self.conn, question, semantic=self.semantic, rules=self.rules())
+        # Not "my ..." and nothing in your files clearly about it: a general question.
+        if not qa.about_files(question, passages, personal):
+            return self._general(question, intent, execute=execute)
         items: list[Item] = []
         for p in passages:
             if any(it.file_id == p.file_id for it in items):
@@ -615,6 +675,11 @@ class Handler:
         except LLMError as e:
             return Reply(f"Couldn't ask the LLM ({e}). Best match: {best.name}.", "answer",
                          items, intent, selected=0, detail=quote)  # fmt: skip
+        if not ans.found and not personal:
+            # Your files don't say, and it wasn't about your things: answer it generally.
+            general = self._general(question, intent, execute=True)
+            general.items, general.detail = items, general.detail + "\n\n" + quote
+            return general
         src = passages[ans.sources[0]] if ans.sources else best
         if ans.found and ans.sources:
             # The cited file first.
@@ -631,6 +696,18 @@ class Handler:
                 return app_reply
         items: list[Item]
         note = ""
+        if intent.kind == "open" and not intent.project_hint:
+            # "open zachary": a project with exactly that name wins over files inside it.
+            q = " ".join(words(intent.query))
+            exact = [p for p in self._projects() if " ".join(words(p.name)) == q]
+            if len(exact) == 1:
+                self.context.set_results(exact, intent.query, "projects")
+                if not execute:
+                    return Reply(f"Enter to open {exact[0].name}.", "projects", exact, intent,
+                                 "open", exact[0], 0)  # fmt: skip
+                ok = self.actions.open(exact[0])
+                say = f"Opening {exact[0].name}." if ok else f"Couldn't open {exact[0].name}."
+                return Reply(say, "projects", exact, intent, "open" if ok else None, exact[0], 0)
         if intent.project_hint:
             items = self._projects(intent.query)
             if not items:

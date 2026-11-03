@@ -69,7 +69,7 @@ STOPWORDS = frozenset(
     about and or is was were be been am are do did does please can could you your
     open opened find show search get give look looking locate where which what file
     files document documents doc docs folder folders thing stuff some any one ones
-    zach zachary hey ok okay everything anything all things related regarding forgot forget
+    hey ok okay everything anything all things related regarding forgot forget
     remember name named called opening opens it
     mera meri mere mujhe maine humne wo woh vo voh jo ye yeh kya kahan kidhar wala
     wali wale waala waali ka ki ke ko se mein me hai tha thi the hain kholi khola kholo

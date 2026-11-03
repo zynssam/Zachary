@@ -22,6 +22,7 @@ import logging
 import queue
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -63,6 +64,22 @@ def classify(status: int, body: Any) -> VoiceError:
     return VoiceError(kind, f"{msg}{': ' + detail if detail else ''}")
 
 
+MAX_KEYTERMS = 200  # Prisma v3 limit
+
+
+def keyterms_value(provider: Callable[[], list[str]] | None) -> str:
+    """Names Gnani should favour (your projects, apps, topics...), as the JSON array its
+    v3 API takes (ASCII-escaped: it travels in a WebSocket header). "" = none."""
+    if provider is None:
+        return ""
+    try:
+        terms = [t for t in provider() if t and "<|" not in t and "|>" not in t]
+    except Exception:
+        log.debug("keyterms unavailable", exc_info=True)
+        return ""
+    return json.dumps(terms[:MAX_KEYTERMS], ensure_ascii=True) if terms else ""
+
+
 class GnaniRestSTT:
     name = "gnani-rest"
 
@@ -75,6 +92,7 @@ class GnaniRestSTT:
         url: str = REST_URL,
         ledger: UsageLedger | None = None,
         timeout: float = 20.0,
+        keyterms: Callable[[], list[str]] | None = None,
     ) -> None:
         if not api_key:
             raise VoiceError("config", "GNANI_API_KEY is not set")
@@ -84,6 +102,14 @@ class GnaniRestSTT:
         self.url = url
         self.ledger = ledger or UsageLedger(None)
         self.timeout = timeout
+        self.keyterms = keyterms
+
+    def _form(self) -> dict[str, str]:
+        form = {"language_code": self.language, "model": self.model}
+        terms = keyterms_value(self.keyterms)
+        if terms and self.model.startswith("prisma-v3"):
+            form["keyterms"] = terms
+        return form
 
     def transcribe(self, pcm: bytes, sample_rate: int = SAMPLE_RATE) -> Transcript:
         dur = seconds(pcm, sample_rate)
@@ -95,7 +121,7 @@ class GnaniRestSTT:
                 self.url,
                 headers={"X-API-Key-ID": self._key},
                 files={"audio_file": ("speech.wav", pcm_to_wav(pcm, sample_rate), "audio/wav")},
-                data={"language_code": self.language, "model": self.model},
+                data=self._form(),
                 timeout=self.timeout,
             )
         except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
@@ -148,6 +174,7 @@ class GnaniStreamingSTT:
         vad_threshold: float = 0.5,  # docs default 0.7; earbud/laptop mics are quiet
         min_silence_ms: int = 400,  # server end of speech (docs: 300-400 for commands/IVR)
         max_speech_s: float = 15.0,
+        keyterms: Callable[[], list[str]] | None = None,
     ) -> None:
         if not api_key:
             raise VoiceError("config", "GNANI_API_KEY is not set")
@@ -161,6 +188,7 @@ class GnaniStreamingSTT:
         self.vad_threshold = vad_threshold
         self.min_silence_ms = min_silence_ms
         self.max_speech_s = max_speech_s
+        self.keyterms = keyterms
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.server_config: dict[str, Any] = {}
         self._ws: Any = None
@@ -182,7 +210,9 @@ class GnaniStreamingSTT:
             "x-vad-threshold": f"{self.vad_threshold:g}",
             "x-min-silence-ms": str(self.min_silence_ms),
             "x-max-speech-s": f"{self.max_speech_s:g}",
-        }
+            **({"keyterms": terms} if (terms := keyterms_value(self.keyterms))
+               and self.model.startswith("prisma-v3") else {}),
+        }  # fmt: skip
 
     def open(self) -> None:
         from websockets.exceptions import InvalidStatus

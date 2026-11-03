@@ -108,6 +108,8 @@ class LLM(Protocol):
 
     def name_folder(self, excerpt: str, existing: Sequence[str]) -> str: ...
 
+    def general(self, question: str) -> str: ...
+
 
 ANSWER_SYSTEM = """You answer questions about the user's own files, using only the \
 numbered excerpts from those files given in the message.
@@ -131,6 +133,18 @@ markdown, lists or file paths: what it is, and what they were working on recentl
 the recent files or excerpts show it.
 - If the excerpts say too little, say what you can and set found to false.
 - sources: the numbers of the excerpts you used."""
+
+GENERAL_SYSTEM = """You are a voice assistant answering a general question (not about the \
+user's files). Reply in one or two short sentences (at most 40 words), spoken aloud, so \
+no markdown or lists. If you don't know or it depends on live data you don't have \
+(today's news, weather, prices), say so briefly."""
+
+GENERAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
 
 FOLDER_SYSTEM = """You file a new note into one of the user's folders. Given the start \
 of the note and the existing folder names, reply with the existing folder it belongs in, \
@@ -277,6 +291,12 @@ class _JsonLLM:
             bool(data.get("found", False)),
             [s for s in dict.fromkeys(sources) if 0 <= s < n],
         )
+
+    def general(self, question: str) -> str:
+        """Sends only the question."""
+        data = self._call("general", GENERAL_SYSTEM, f"Today is {date.today().isoformat()}."
+                          f"\nQuestion: {question}", GENERAL_SCHEMA, ANSWER_MAX_TOKENS)  # fmt: skip
+        return str(data.get("answer", "")).strip()
 
     def name_folder(self, excerpt: str, existing: Sequence[str]) -> str:
         """Sends the first <= 800 characters of the note and the folder names only."""

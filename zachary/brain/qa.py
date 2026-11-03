@@ -20,6 +20,8 @@ from zachary.search.hybrid import STOPWORDS, search
 from zachary.search.tokens import words
 from zachary.search.vectors import SemanticSearch
 
+GROUNDED_MIN = 0.3  # all question words in a passage this relevant: about your files
+NAMED_MIN = 0.4  # ... or a question word in the best file's name
 CANDIDATE_FILES = 12  # from hybrid search (plus older versions of the top ones)
 MAX_FILES = 30
 TOP_PASSAGES = 4  # sent to the LLM / shown
@@ -55,6 +57,7 @@ class Passage:
     text: str  # the whole chunk (<= ~1,000 characters)
     snippet: str  # the part to show
     score: float
+    coverage: float = 0.0  # share of the question's words found in this passage
 
 
 def question_terms(question: str) -> list[str]:
@@ -178,12 +181,11 @@ def retrieve(
             excluded[fid] = rules is not None and rules.is_excluded(path, False)
         if excluded[fid]:
             continue
+        cov = _word_hits(text, patterns)
         s = (
-            W_MEANING * float(meaning[i])
-            + W_WORDS * _word_hits(text, patterns)
-            + W_RANK * (1.0 - rank[fid] / len(ids))
+            W_MEANING * float(meaning[i]) + W_WORDS * cov + W_RANK * (1.0 - rank[fid] / len(ids))
         ) * (1.0 if code_q else KIND_WEIGHT.get(kind, 0.9))
-        scored.append(Passage(fid, path, name, kind, float(mtime), cid, text, "", s))
+        scored.append(Passage(fid, path, name, kind, float(mtime), cid, text, "", s, cov))
     scored.sort(key=lambda p: -p.score)
     # Several files before a second passage from the same file: one file that happens
     # to repeat the question's words mustn't crowd out the others.
@@ -204,3 +206,22 @@ def retrieve(
             out.append(p)
     out.sort(key=lambda p: -p.score)
     return out
+
+
+def name_hit(question: str, passage: Passage) -> bool:
+    """A question word in the file's name ("hackfest pitch" -> hackfest-pitch-deck.pptx)."""
+    name = words(passage.name.rsplit(".", 1)[0])
+    return any(any(n.startswith(_stem(t)) for n in name) for t in question_terms(question)
+               if len(t) >= 3)  # fmt: skip
+
+
+def about_files(question: str, passages: list[Passage], personal: bool) -> bool:
+    """Answer from the user's files (else it's a general question for the LLM)."""
+    if personal:
+        return True
+    if not passages:
+        return False
+    top = passages[0]
+    return (top.coverage >= 0.99 and top.score >= GROUNDED_MIN) or (
+        top.score >= NAMED_MIN and name_hit(question, top)
+    )
