@@ -41,6 +41,7 @@ HIDE_AFTER_ACTION_MS = 700
 WIDTH = 720
 MAX_ROWS = 8
 SPACE_HOLD_MS = 400  # Space held this long while typing = talk (shorter = a space)
+THINKING_AFTER_MS = 300
 
 
 class QuickBar(QWidget):
@@ -72,13 +73,21 @@ class QuickBar(QWidget):
         self.edit.setFrame(False)
         self.edit.setMinimumHeight(44)
         self.status = QLabel(self)
+        self.status.setWordWrap(True)  # answers/explanations can be two or three sentences
         self.status.setStyleSheet("color: palette(placeholder-text); padding: 2px 4px;")
+        # An answer's source passage ("ask your files"); hidden otherwise.
+        self.answer = QLabel(self)
+        self.answer.setWordWrap(True)
+        self.answer.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.answer.setStyleSheet(style.ANSWER_CSS)
+        self.answer.setVisible(False)
         self.list = ResultsView(self)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 14, 18, 14)
         lay.setSpacing(6)
         lay.addWidget(self.edit)
         lay.addWidget(self.status)
+        lay.addWidget(self.answer)
         lay.addWidget(self.list)
 
         self._debounce = QTimer(self)
@@ -220,7 +229,9 @@ class QuickBar(QWidget):
                 self._choose(row, "open")
             else:
                 self._debounce.stop()
-                self.engine.ask("submit", self.edit.text())
+                rid = self.engine.ask("submit", self.edit.text())
+                # Questions can take a second or two (LLM): say so if it isn't instant.
+                QTimer.singleShot(THINKING_AFTER_MS, lambda: self._thinking(rid))
             return True
         if ctrl and key == Qt.Key.Key_R:
             row = self.list.selected_row()
@@ -230,6 +241,10 @@ class QuickBar(QWidget):
             self._choose(key - Qt.Key.Key_1, "open")
             return True
         return False
+
+    def _thinking(self, rid: int) -> None:
+        if self._last_applied < rid:
+            self.status.setText("Thinking…")
 
     def _choose(self, row: int, action: str) -> None:
         self.engine.ask("act", (row, action))
@@ -257,6 +272,8 @@ class QuickBar(QWidget):
             return  # an older reply arrived late
         self._last_applied = rid
         self.status.setText(reply.say)
+        self.answer.setText(reply.detail)
+        self.answer.setVisible(bool(reply.detail))
         self.list.set_items(reply.items, reply.selected)
         self._resize_rows(len(reply.items))
         self._explicit_selection = False

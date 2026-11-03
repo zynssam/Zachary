@@ -17,9 +17,9 @@ from zachary.indexer.store import FileStore
 
 
 @pytest.fixture(autouse=True)
-def _no_real_gnani(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The Gnani API has a paid quota: tests use the local mock only. Any attempt to
-    resolve the real host fails, and no real key is visible to the code under test."""
+def _no_real_apis(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gnani and the LLM providers are real APIs (paid or rate-limited): tests use mocks only. Any attempt to resolve
+    the real hosts fails, and no real key is visible to the code under test."""
     import socket
 
     real = socket.getaddrinfo
@@ -27,12 +27,21 @@ def _no_real_gnani(monkeypatch: pytest.MonkeyPatch) -> None:
     def guarded(host, *args, **kw):  # type: ignore[no-untyped-def]
         if isinstance(host, str) and host.endswith("vachana.ai"):
             raise OSError("tests must not call the real Gnani API")
+        if isinstance(host, str) and host.endswith(
+            ("anthropic.com", "groq.com", "generativelanguage.googleapis.com")
+        ):
+            raise OSError(f"tests must not call a real LLM API ({host})")
         return real(host, *args, **kw)
 
     monkeypatch.setattr(socket, "getaddrinfo", guarded)
     monkeypatch.delenv("GNANI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    for key in ("GROQ_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr("zachary.core.env.get_secret", lambda *_a, **_k: None)
     monkeypatch.setattr("zachary.voice.factory.get_secret", lambda *_a, **_k: None)
+    monkeypatch.setattr("zachary.brain.llm.get_secret", lambda *_a, **_k: None)
 
 
 @pytest.fixture

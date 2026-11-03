@@ -187,11 +187,17 @@ class GnaniWsTTS(_Base):
         url: str = WS_URL,
         timeout: float = 15.0,
         keep_alive: bool = True,
+        first_audio_timeout: float = 4.0,
+        connect_timeout: float = 5.0,
         **kw: Any,
     ) -> None:
         super().__init__(api_key, **kw)
         self.url = url
         self.timeout = timeout
+        # On a bad network a reply spoken many seconds late (after the next command,
+        # even) is worse than none: the text is already on screen. Give up instead.
+        self.first_audio_timeout = first_audio_timeout
+        self.connect_timeout = connect_timeout
         self.keep_alive = keep_alive
         self._lock = threading.Lock()
         self._ws: Any = None
@@ -205,7 +211,7 @@ class GnaniWsTTS(_Base):
 
         stack = contextlib.ExitStack()
         try:
-            sock = net.ws_socket(self.url, self.timeout)
+            sock = net.ws_socket(self.url, self.connect_timeout)
             extra: dict[str, Any] = {"sock": sock} if sock is not None else {}
             if sock is not None and self.url.startswith("wss"):
                 extra["server_hostname"] = urlparse(self.url).hostname
@@ -216,7 +222,7 @@ class GnaniWsTTS(_Base):
                         "X-API-Key-ID": self._key,
                         "Content-Type": "application/json",
                     },
-                    open_timeout=self.timeout,
+                    open_timeout=self.connect_timeout,
                     close_timeout=1.0,
                     **extra,
                 )
@@ -284,7 +290,7 @@ class GnaniWsTTS(_Base):
                         first = True
                         carry = b""
                         audio_done = False
-                        deadline = time.monotonic() + self.timeout
+                        deadline = time.monotonic() + self.first_audio_timeout
                         while True:
                             left = deadline - time.monotonic()
                             if audio_done:
@@ -293,15 +299,19 @@ class GnaniWsTTS(_Base):
                                 if audio_done:
                                     done = True  # no closing message: fine, drained next time
                                     return
-                                status = "timeout"
-                                raise VoiceError("network", "Gnani TTS timed out")
+                                status = "timeout" if not first else "late"
+                                raise VoiceError(
+                                    "network",
+                                    "Gnani TTS timed out" if not first
+                                    else "Gnani TTS too slow (no audio in time); not spoken",
+                                )  # fmt: skip
                             try:
                                 raw = ws.recv(timeout=left)
                             except TimeoutError:
                                 if audio_done:
                                     done = True
                                     return
-                                raise
+                                continue  # the deadline check above decides
                             if isinstance(raw, bytes):
                                 continue
                             msg = json.loads(raw)
@@ -315,6 +325,7 @@ class GnaniWsTTS(_Base):
                                 if first:
                                     data = _strip_wav_header(data)
                                     first = False
+                                    deadline = time.monotonic() + self.timeout  # streaming
                                 data = carry + data
                                 cut = len(data) - len(data) % 2  # whole 16-bit samples
                                 carry = data[cut:]

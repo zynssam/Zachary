@@ -75,6 +75,29 @@ CONFIRM_WORDS = CONFIRM_ALL | frozenset(
 NO_WORDS = frozenset("no nope nah cancel stop dont don't nahi na beda illa".split())
 WORK_WORDS = frozenset("working worked work doing do kaam busy".split())
 WHAT_WORDS = frozenset("what kya enu".split())
+# Questions answered from file contents (Phase 6): "when is my fee due?", "fee kab hai".
+QUESTION_LEAD = frozenset(
+    """
+    when what whats how who whom whose which why is are was were does do did can should
+    will kab kitna kitni kitne kaun kaunsa kaunsi kyun kyon yaavaga yenu eshtu
+""".split()
+)
+QUESTION_ANYWHERE = frozenset("kab kitna kitni kitne kaunsa kaunsi kyun yaavaga eshtu".split())
+# "which file has my marks" / "where is my resume" look for a file, not an answer.
+FILE_ASK_WORDS = frozenset(
+    "file files folder folders document documents doc docs pdf pdfs where kahan kidhar elli".split()
+)
+# "explain the last project I was working on", "summarize my dsa notes", "tell me about it"
+EXPLAIN_WORDS = frozenset(
+    "explain summarize summarise summary describe overview recap samjhao samjha samjhana".split()
+)
+EXPLAIN_FILLER = frozenset(
+    """
+    explain summarize summarise summary describe overview recap samjhao samjha samjhana
+    tell about give me a an the of my mine i was were am been on what is it this that
+    briefly quickly short please kya hai ke ki ka mujhe
+    """.split()
+)
 RELATED_WORDS = frozenset("related similar relevant sambandhit sambandhita sambandhisida".split())
 _JAISA = frozenset("jaisa jaise jaisi".split())
 RELATED_FILLER = frozenset(
@@ -129,7 +152,7 @@ _FUZZY_VOCAB = sorted(
     {"open", "launch", "find", "search", "locate", "show", "list", "display", "projects",
      "project", "repository", "repositories", "recent", "recently", "folder", "directory",
      "first", "second", "third", "fourth", "fifth", "older", "newer", "latest",
-     "related", "similar"}
+     "related", "similar", "explain", "summarize", "describe"}
 )  # fmt: skip
 _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show", "list", "display"})
 
@@ -137,7 +160,7 @@ _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show",
 @dataclass(frozen=True, slots=True)
 class Intent:
     kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|topic|
-    #            resume|timeline|confirm|cancel|none
+    #            resume|timeline|confirm|cancel|ask|explain|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
@@ -220,8 +243,13 @@ def _ordinal(tokens: list[str]) -> tuple[int | None, set[int]]:
     return None, set()
 
 
+_QUESTION_TYPOS = {"whn": "when", "wen": "when", "wat": "what", "wht": "what", "hw": "how"}
+
+
 def parse(text: str) -> Intent:
     raw = tokenize(text)
+    if raw and raw[0] in _QUESTION_TYPOS:
+        raw[0] = _QUESTION_TYPOS[raw[0]]
     raw = raw[_lead_fillers(raw) :]  # "hey zach, ..." / "please ..."
     corrected: dict[str, str] = {}
     toks: list[str] = []
@@ -233,6 +261,9 @@ def parse(text: str) -> Intent:
     conf = 0.8 if corrected else 1.0
     if not toks:
         return Intent("none", confidence=1.0)
+    if toks[0] in {"ask", "question", "puchho", "pucho"} and len(toks) > 1:
+        # "ask when is my fee due": always a question (also what the LLM router sends).
+        return Intent("ask", query=" ".join(raw[1:]), confidence=conf, corrected=corrected)
 
     has_open = any(t in OPEN_VERBS for t in toks)
     has_find = any(t in FIND_VERBS for t in toks)
@@ -288,10 +319,24 @@ def parse(text: str) -> Intent:
     ):
         return Intent("cancel", confidence=conf, corrected=corrected)
 
+    # --- explain / summarize a project, topic or the shown item ---------------------------
+    tell_about = "tell" in toks and "about" in toks
+    if any(t in EXPLAIN_WORDS for t in toks) or tell_about:
+        rest = [t for t in toks if t not in EXPLAIN_FILLER]
+        # "explain the second one" refers to a shown result; "the last project" doesn't.
+        pick = [t for i, t in enumerate(rest) if toks.index(t) not in ord_idx]
+        if ordinal is not None and not [t for t in pick if t not in {"one", "result", "file"}]:
+            return Intent("explain", ordinal=ordinal, confidence=conf, corrected=corrected)
+        if has_pronoun and not rest:
+            return Intent("explain", confidence=conf, corrected=corrected)
+        return Intent("explain", query=" ".join(rest), confidence=conf,
+                      project_hint=any(t in PROJECT_WORDS for t in toks),
+                      corrected=corrected)  # fmt: skip
+
     # --- resume where I left off -------------------------------------------------------
     joined = " ".join(toks)
     # ("resume" alone is also a file: "open my resume" must stay a search.)
-    resume_ctx = {"where", "session", "work", "working", "last", "from", "left", "off"}
+    resume_ctx = {"session", "work", "working", "last", "from", "left", "off"}
     if (
         ("resume" in toks and any(t in resume_ctx for t in toks))
         or "left off" in joined
@@ -351,7 +396,8 @@ def parse(text: str) -> Intent:
     # --- projects -------------------------------------------------------------------
     if any(t in PROJECT_WORDS for t in toks):
         rest = [t for t in toks if t not in PROJECT_WORDS and t not in PROJECT_FILLER
-                and t not in verbs and t not in FILLER]  # fmt: skip
+                and t not in verbs and t not in FILLER
+                and t not in {"what", "which", "are", "were", "have", "do"}]  # fmt: skip
         if not rest:
             return Intent("show_projects", confidence=conf, corrected=corrected)
         query = " ".join(t for t in raw if corrected.get(t, t) not in verbs and t not in FILLER)
@@ -367,6 +413,19 @@ def parse(text: str) -> Intent:
     if (tp.range is not None or any(t in RECENT_WORDS for t in toks)) and not leftover:
         # The handler re-parses the time phrase from the query.
         return Intent("recent", query=" ".join(toks), confidence=conf, corrected=corrected)
+
+    # --- ask: a question answered from file contents -------------------------------
+    question = text.strip().endswith("?") and len(toks) >= 3
+    lead_q = toks[0] in QUESTION_LEAD and len(toks) >= 3
+    if (
+        (lead_q or question or any(t in QUESTION_ANYWHERE for t in toks))
+        and not any(t in FILE_ASK_WORDS for t in toks)
+        and toks[0] not in verbs
+        and not has_open
+        and len([t for t in toks if t not in FILLER and t not in QUESTION_LEAD]) >= 1
+    ):
+        return Intent("ask", query=_strip_lead(" ".join(raw)), confidence=conf,
+                      corrected=corrected)  # fmt: skip
 
     # --- open / find ----------------------------------------------------------------
     query = _strip_lead(" ".join(t for t, f in zip(raw, toks, strict=True) if f not in verbs))

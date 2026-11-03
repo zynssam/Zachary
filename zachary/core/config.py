@@ -136,7 +136,12 @@ class Settings:
     indexing_paused: bool = False
     quickbar_hotkey: str = "super+space"  # chosen in Phase 2 review
     language_code: str = "en-IN"
+    # Optional LLM (Phase 6, Claude API): Q&A from passages + unclear commands. Off by
+    # default; needs ANTHROPIC_API_KEY. Only the question and a few passages are sent.
     llm_enabled: bool = False
+    llm_provider: str = "groq"  # groq (free tier) | gemini (free tier) | claude (paid)
+    llm_model: str = ""  # "" = the provider's default (see brain/llm.py)
+    llm_effort: str = "low"  # low | medium | high: lower is faster
     embed_max_kb: int = 64  # "embed less": first N KB per document by default
     # Hidden folders (~/.config, ~/.vscode, ~/.local, ...) hold app data, not user
     # files. Project markers such as .git are still seen.

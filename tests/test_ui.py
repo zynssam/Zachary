@@ -233,3 +233,26 @@ def test_hold_space_in_empty_box_talks(qtbot: QtBot, bar: QuickBar) -> None:
     assert events == [True, False, True] and bar.edit.text() == "fee  r"
     key(QEvent.Type.KeyRelease)
     assert events == [True, False, True, False]
+
+
+def test_answer_panel_shows_the_passage_and_hides_after(qtbot: QtBot, bar: QuickBar) -> None:
+    from zachary.brain.context import Item
+    from zachary.brain.intents import Intent
+
+    bar.show_bar()
+    r = _type(qtbot, bar, "fees")
+    assert not bar.answer.isVisible()
+    item = Item(1, "/x/receipt.pdf", "receipt.pdf", "document", False, OLD, ["“due 15 June”"])
+    ans = Reply(
+        "Due on 15 June.",
+        "answer",
+        [item],
+        Intent("ask", query="when is my fee due"),
+        selected=0,
+        detail="Due on 15 June.\n\n“…due on 15 June 2026.”\n— receipt.pdf",
+    )
+    bar._on_reply(10_000, ans)
+    assert bar.answer.isVisible() and "15 June 2026" in bar.answer.text()
+    assert bar.status.text() == "Due on 15 June."
+    bar._on_reply(10_001, Reply("Top matches.", "results", [], r.intent))
+    assert not bar.answer.isVisible()

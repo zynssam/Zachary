@@ -36,8 +36,10 @@ def build_voice(config: Config, data_dir: Path, *, api_key: str | None = None) -
     stream: Callable[[], StreamingSTT] | None = None
     tts: TTS | None = None
     if key:
+        # A spoken command is a few seconds of audio, answered in < 1 s by the server:
+        # 10 s total (both connection tries) is plenty; past that, local whisper is faster.
         rest = gnani_stt.GnaniRestSTT(
-            key, language=s.stt_language, model=s.stt_model, ledger=ledger
+            key, language=s.stt_language, model=s.stt_model, ledger=ledger, timeout=10.0
         )
         if s.stt_streaming:
 

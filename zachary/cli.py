@@ -382,7 +382,12 @@ def _voice_listen(args: argparse.Namespace, kit: Any, conn: Any, cfg: Config) ->
         return 1
     h = result[0]
     print(f"heard ({h.transcript.provider if h.transcript else '?'}): {h.text!r}")
-    handler = Handler(conn, SafeActions(conn, cfg.platform), cfg, lambda: local_semantic(conn, cfg))
+    from zachary.brain import llm
+
+    provider = llm.Provider(cfg, _data_dir(args))
+    handler = Handler(
+        conn, SafeActions(conn, cfg.platform), cfg, lambda: local_semantic(conn, cfg), provider
+    )
     reply = handler.submit(h.text)
     h.timeline.mark("intent_search")
     print(f"zach: {reply.say}")
@@ -405,6 +410,78 @@ def _voice_listen(args: argparse.Namespace, kit: Any, conn: Any, cfg: Config) ->
     stages = h.timeline.durations()
     print("latency: " + "  ".join(f"{k} {v:.0f} ms" for k, v in stages.items()))
     del rec
+    return 0
+
+
+def _data_dir(args: argparse.Namespace) -> Path:
+    return Path(args.db or default_db_path()).parent
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Answer a question from your files (LLM if enabled, else the best passage)."""
+    from zachary.actions.safe_actions import SafeActions
+    from zachary.brain import llm
+    from zachary.brain.handler import Handler
+    from zachary.search.semantic import local_semantic
+
+    conn, cfg = _open(args)
+    provider = (lambda: None) if args.local else llm.Provider(cfg, _data_dir(args))
+    handler = Handler(conn, SafeActions(conn, cfg.platform), cfg,
+                      lambda: local_semantic(conn, cfg, in_memory=False), provider)  # fmt: skip
+    question = " ".join(args.question)
+    t0 = time.perf_counter()
+    from zachary.brain.intents import parse
+
+    explain = parse(question).kind == "explain"  # "explain my last project" stays itself
+    reply = handler.submit(
+        question if explain or question.startswith("ask ") else f"ask {question}"
+    )
+    ms = (time.perf_counter() - t0) * 1e3
+    print(f"zach: {reply.say}")
+    if reply.detail:
+        print("\n" + "\n".join("  " + line for line in reply.detail.splitlines()))
+    if reply.items:
+        print("\nsources:")
+        for i, it in enumerate(reply.items[:4], 1):
+            print(f"  {i}. {it.name}  ({_short(os.path.dirname(it.path))})")
+    print(f"\n{ms:.0f} ms" + ("" if provider() else "  (LLM off: passage only)"))
+    return 0
+
+
+def cmd_llm(args: argparse.Namespace) -> int:
+    """LLM status and usage (no API call)."""
+    from zachary.brain import llm
+    from zachary.core.env import get_secret
+
+    _, cfg = _open(args)
+    s = cfg.load()
+    if args.action == "status":
+        name = llm.provider_name(cfg)
+        info = llm.PROVIDERS[name]
+        model = s.llm_model or info.model
+        print(f"enabled: {s.llm_enabled}   provider: {name}   model: {model}   "
+              f"effort: {s.llm_effort}")  # fmt: skip
+        found = bool(get_secret(info.key))
+        print(f"{info.key}: {'found' if found else f'missing (free key: {info.signup})'}")
+        if not s.llm_enabled:
+            print("turn on: python -m zachary.cli set llm_enabled true")
+        print("providers: " + ", ".join(llm.PROVIDERS) + "  (cli set llm_provider gemini)")
+        return 0
+    entries = llm.usage_ledger(_data_dir(args)).entries()
+    if not entries:
+        print("no LLM calls yet")
+        return 0
+    by: dict[str, dict[str, float]] = {}
+    for e in entries:
+        d = by.setdefault(e["endpoint"], {"calls": 0, "in": 0, "out": 0, "errors": 0, "ms": 0})
+        d["calls"] += 1
+        d["in"] += int(e.get("input_tokens", 0))
+        d["out"] += int(e.get("output_tokens", 0))
+        d["errors"] += int(e.get("status") != "ok")
+        d["ms"] += float(e.get("ms", 0))
+    for k, d in by.items():
+        print(f"  {k:14} {int(d['calls']):4} calls  {int(d['in']):7} in / {int(d['out']):6} out "
+              f"tokens  {int(d['errors'])} errors  avg {d['ms'] / d['calls']:.0f} ms")  # fmt: skip
     return 0
 
 
@@ -594,6 +671,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--rebuild", action="store_true", help="cluster now (otherwise nightly)")
     s.add_argument("--limit", type=int, default=50)
     s.set_defaults(fn=cmd_topics)
+
+    s = sub.add_parser("ask", help='answer from your files, e.g. ask "when is my fee due"')
+    s.add_argument("question", nargs="+")
+    s.add_argument("--local", action="store_true", help="never call the LLM (passage only)")
+    s.set_defaults(fn=cmd_ask)
+
+    s = sub.add_parser("llm", help="optional LLM: status | usage")
+    s.add_argument("action", choices=["status", "usage"])
+    s.set_defaults(fn=cmd_llm)
 
     s = sub.add_parser("status", help="index and indexer status")
     s.set_defaults(fn=cmd_status)

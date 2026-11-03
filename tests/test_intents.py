@@ -237,3 +237,60 @@ def test_all_files_stays_a_search() -> None:
 )
 def test_phase5_intents_dont_steal_file_queries(text: str) -> None:
     assert parse(text).kind in {"recent", "open", "find"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "when is my fee due?",
+        "when is my fee due",
+        "whn is my fee due",  # typo
+        "how much fee did I pay last year",
+        "what is my receipt number",
+        "who is my mentor",
+        "fee kab bharna hai",  # Hinglish
+        "meri fee kitni hai",
+        "ask hostel fee amount",
+        "is the hostel fee refundable?",
+    ],
+)
+def test_ask_intent(text: str) -> None:
+    assert parse(text).kind == "ask"
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("where is my resume", "find"),  # locate a file, not an answer
+        ("which file has my marks", "find"),
+        ("dsa notes?", "find"),
+        ("fee receipt", "find"),
+        ("open fee receipt", "open"),
+        ("what are my projects", "show_projects"),
+        ("what was I working on yesterday", "timeline"),
+        ("what did I open yesterday", "recent"),
+        ("show my topics", "topic"),
+        ("kya maine kal kuch khola", "find"),
+    ],
+)
+def test_not_a_question(text: str, kind: str) -> None:
+    assert parse(text).kind == kind
+
+
+@pytest.mark.parametrize(
+    ("text", "query", "ordinal", "project"),
+    [
+        ("Explain me the last project I was working on.", "last project working", None, True),
+        ("tell me about the zachary project", "zachary project", None, True),
+        ("summarize my dsa notes", "dsa notes", None, False),
+        ("summarise my dsa notes", "dsa notes", None, False),  # British spelling
+        ("explain the second one", "", 2, False),
+        ("explain the last one", "", -1, False),
+        ("explain it", "", None, False),
+        ("dsa notes samjhao", "dsa notes", None, False),  # Hinglish
+        ("explian my latest project", "latest project", None, True),  # typo
+    ],
+)
+def test_explain_intent(text: str, query: str, ordinal: int | None, project: bool) -> None:
+    i = parse(text)
+    assert (i.kind, i.query, i.ordinal, i.project_hint) == ("explain", query, ordinal, project)

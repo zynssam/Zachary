@@ -1,0 +1,75 @@
+# Phase 6: Ask your files (report)
+
+Status: **built and tested; waiting for review.** Branch `phase-6`.
+
+## 1. "Done when"
+
+| Check | Result |
+|---|---|
+| "when is my fee due?" answers from the fee document and cites it | ✅ With the Claude API (mocked in tests): a one-line spoken answer ("Your next fee installment is due on 15 June 2026."), the cited passage + file name in the answer box, and the cited file first in the list. **Not yet run against the real API**: no `ANTHROPIC_API_KEY` is set on this machine (see 6.1). |
+| With the LLM off, it still shows the right passage | ✅ Tests: the fee passage with the due date, from `receipt_sem5.pdf`. On your real files: `FeeReceipt (3rdyear53k).pdf` (University Fee 3rd year 20,000 … Total 53,000), 47–75 ms. Your receipts have no due date in them, so with the LLM on, expect "your receipts don't say when it's due" plus the latest receipt. |
+
+## 2. What was built
+
+| Module | What it does |
+|---|---|
+| `brain/qa.py` | Question → passages, all local. Candidate files come from the existing hybrid search (keywords + meaning, plus older versions of the top files). Their chunks (from Phase 3) are scored by meaning (chunk vectors) 55%, question words present 35% and file rank 10%. Code counts 0.5× unless the question is about code (so "fee due" doesn't answer from a `next_due` variable). Keeps the top 4 passages: one per file first, then at most a second per file (after review: the project's own docs/tests, which quote "when is my fee due", were taking all 4 slots), each with a ~280-character snippet centred on the question's words. |
+| `brain/llm.py` | **Three providers behind one interface** (added after review): **Groq** (default, free tier: `openai/gpt-oss-120b`, strict JSON-schema output, `reasoning_effort` low, reasoning text not returned), **Gemini** (free tier: `gemini-3.6-flash` via `generateContent`, `responseJsonSchema`, `thinkingLevel` LOW, key in the `x-goog-api-key` header, never in the URL) and **Claude** (paid). Groq and Gemini use `httpx` (already a dependency), with one retry on a connection error or 5xx. Clear errors for a bad key, free-tier limit (429), unknown model and no connection. Claude backend: optional Claude API client (official `anthropic` SDK, imported only on first use because it takes 2.7 s). **Q&A**: sends the question plus the 4 passages (file name and date, no paths) and gets back JSON (answer, found, sources) through structured outputs. **Unclear commands**: sends only the text and gets one command from a fixed list (find, open, ask, recent, projects, topics, resume, timeline, none). That command goes back through the normal parser, so the safety rules still apply. Server-side refusal fallback is on (`fallbacks: "default"`). 20 s timeout, 1 retry. Every call is logged to `llm_usage.jsonl` (model, tokens, ms, status; no text). |
+| Intent `explain` (added after review) | "explain the last project I was working on", "tell me about the zachary project", "summarize my dsa notes", "dsa notes samjhao", "explain the second one" / "explain it". **Project**: by name, or the one your last work session was in. Its README and docs go first, then the files you edited recently, then the LLM gives 2–3 spoken sentences (what it is + what you were doing). **Topic**: the matching passages. **Shown item**: that file or folder. With the LLM off: the README/best passage + the files. Real run (Gemini): "Zachary is a desktop assistant with file memory… Recently, you have been working on its quick bar UI, request handler, intent parsing rules, and optional LLM integration." (4.0 s, 1,664 in / 394 out tokens). |
+| Intent `ask` | "when/what/how much/who … ?", "fee kab bharna hai", "meri fee kitni hai", "ask …", typos ("whn is my fee due"). Requests for a file still search ("where is my resume", "which file has my marks"). Also fixed: "where is my resume" used to trigger *resume*. |
+| Handler | `ask` → passages; while typing, never the LLM. On Enter or voice: the LLM answer if it's on, else the best passage. If the LLM fails, it falls back to the passage. The LLM reads a command only when it's a sentence (≥ 4 words, ≥ 2 "sentence" words) that the parser couldn't place or that found nothing strong. Plain searches never call it. |
+| Quick bar | An answer box (answer + quoted passage + file) under the status line. "Thinking…" if the reply takes longer than 300 ms. Styles live in `ui/style.py`. |
+| CLI | `cli ask <question>` (`--local` = never call the API), `cli llm status`, `cli llm usage`. |
+| Settings | `llm_enabled` (off), `llm_provider` (`groq` \| `gemini` \| `claude`, default `groq`), `llm_model` (`""` = the provider's default), `llm_effort` (`low`). Keys: `GROQ_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY` in the environment or `.env` (all in `.env.example`). |
+
+## 3. Decisions (please review)
+
+1. **Provider: Groq by default** (free, fastest). Gemini Flash is the free alternative and Claude the paid one. The Claude account had no credits (the first real call returned "credit balance is too low"; nothing was charged).
+2. **What is sent:** the question, ≤ 4 passages of ≤ 1,000 characters, file names and modified dates. No paths, no whole files. For unclear commands, only the sentence. Tests check this (every excerpt sent is a stored chunk; no home path in the message).
+3. **The LLM never acts.** It returns an answer or a command name. Commands go through the parser and safe actions, and "open" still needs a clear winner.
+4. **`anthropic` is a normal dependency** (~45 MB with pydantic/httpx2). It's never imported unless the LLM is turned on and used.
+5. **Refusal fallback** (`server-side-fallback-2026-07-01`, `fallbacks: "default"`) is on. Remove it if you prefer a plain decline.
+6. **Prompt-injection guard:** excerpts are wrapped in `<excerpt>` tags, and the system prompt says they are data, not instructions. The worst case is a wrong sentence on screen, never an action.
+
+## 4. Timings
+
+| What | Measured | Budget |
+|---|---|---|
+| Question → passages, 200k files + 268k chunks, with meaning search (`bench_phase6`) | **p50 20 ms, p95 45 ms** (first version: 254 ms; sqlite-vec scanned all 268k vectors for an `IN (...)` lookup, so it now looks them up one id at a time) | search < 50 ms |
+| Same, keywords only | p50 16 ms, p95 53–55 ms | |
+| Your real home folder (`cli ask`) | 47–75 ms, including opening the DB and the first query | |
+| LLM answer, Groq `gpt-oss-120b` (real, your home folder) | **1.4 s** API call (1,344 in / 89 out tokens); `cli ask` 2.7 s in total, including startup | as low as the API allows |
+| LLM answer, Gemini `gemini-3.6-flash` (real) | `cli ask` 3.6 s in total | |
+
+## 5. Testing
+
+- `tests/test_qa.py` (29 tests). Every provider is mocked: Claude through a fake SDK client, Groq and Gemini through `httpx.MockTransport`. `conftest.py` blocks `*.anthropic.com`, `*.groq.com` and `generativelanguage.googleapis.com`, and hides all three keys. The tests cover:
+  - retrieval finds the due-date passage, with and without meaning search;
+  - snippets centre on the question's words;
+  - LLM off shows the passage;
+  - Hinglish questions;
+  - an answer with a citation, plus exactly what was sent;
+  - the ledger holds no text;
+  - typing never calls the LLM;
+  - an LLM failure falls back to the passage;
+  - not-found answers;
+  - refusal and max_tokens;
+  - source validation;
+  - unclear-command routing (only the text is sent);
+  - routed "open" keeps the confidence rule;
+  - unsafe or "none" commands do nothing;
+  - plain searches never call the LLM;
+  - the provider needs both opt-in and a key;
+  - the exact request shape for Groq and Gemini (auth header, JSON schema, reasoning/thinking level; the key is never in the URL or the ledger);
+  - Gemini's thought parts are skipped, and a SAFETY block counts as "declined";
+  - HTTP 401, 429, 404 and 400 give clear errors;
+  - one retry on a 5xx, then it gives up;
+  - Groq end to end through the handler.
+- `test_intents.py`: 20 new cases (questions vs. file requests). `test_ui.py`: answer box shows and hides.
+- ruff, ruff format, mypy strict (+ win32): clean. Full suite passes locally.
+
+## 6. Open questions
+
+1. **Free key:** add `GROQ_API_KEY` (and/or `GEMINI_API_KEY`) to `.env` so I can run a few real questions and measure the answer latency, or test it yourself with the commands in `run-and-test.md` 3.5.
+2. Free tiers may use or keep request data under each provider's terms. Only the question and up to 4 short excerpts are sent, but check that you're OK with that for your documents.
+3. Your fee receipts don't contain due dates. Is there a fee notice or circular somewhere that should be indexed (e.g. an email PDF in Downloads)?

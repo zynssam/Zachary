@@ -1,7 +1,7 @@
 # Running and testing Zachary
 
 How to set up, run every part (indexer, CLI, quick bar), run all automated
-checks and benchmarks, and test everything by hand. Covers Phases 0–5.
+checks and benchmarks, and test everything by hand. Covers Phases 0–6.
 
 **On Windows?** See [windows.md](windows.md) for the full Windows setup.
 
@@ -159,6 +159,30 @@ python -m zachary.cli set stt_language hi-IN            # default en-IN (handles
 ```
 Real-API smoke test (deliberate, costs credits): `python bench/gnani_smoke.py --yes` (3 calls).
 
+### 3.5 Ask your files (Phase 6)
+Works without any LLM: the best passage is shown. With an LLM, a one-line answer is also spoken and
+the source is cited. Only the question and up to 4 short passages (≤ 1,000 characters each) are sent,
+with file names but not paths. Unclear spoken sentences send only their text.
+
+| `llm_provider` | Key in `.env` | Default model | Cost |
+|---|---|---|---|
+| `groq` (default) | `GROQ_API_KEY` (console.groq.com/keys) | `openai/gpt-oss-120b` | free tier |
+| `gemini` | `GEMINI_API_KEY` (aistudio.google.com/apikey) | `gemini-3.6-flash` | free tier |
+| `claude` | `ANTHROPIC_API_KEY` | `claude-opus-5-5` | paid |
+
+```bash
+python -m zachary.cli ask when is my fee due           # LLM off: best passage + sources
+echo 'GROQ_API_KEY=gsk_...' >> .env                     # (git-ignored)
+python -m zachary.cli set llm_enabled true
+python -m zachary.cli llm status                        # provider, model, key found? (free)
+python -m zachary.cli ask when is my fee due           # 1 API call: answer + cited passage
+python -m zachary.cli ask --local when is my fee due   # never calls the API
+python -m zachary.cli llm usage                         # calls, tokens, errors, avg ms (free)
+python -m zachary.cli set llm_provider gemini           # switch (needs GEMINI_API_KEY)
+python -m zachary.cli set llm_model ""                  # "" = the provider's default model
+python -m zachary.cli set llm_effort low                # low (default) | medium | high
+```
+
 ---
 
 ## 4. Automated checks
@@ -205,6 +229,9 @@ QT_QPA_PLATFORM=wayland pytest tests/test_ui.py   # UI tests on the real display
 | `test_intents`, `test_context`, `test_handler` | Phase 2 brain: intents, follow-ups, confidence rule, safe actions |
 | `test_ui`, `test_hotkeys`, `test_assistant` | Phase 2 Qt UI, global hotkeys, single instance |
 | `test_extract`, `test_semantic`, `test_vectors`, `test_versions`, `test_relations`, `test_semantic_search`, `test_inotify_tree` | Phase 3: extraction, embeddings, vector index, versions, related files, meaning search, exclude-aware watcher |
+| `test_voice` | Phase 4: voice (Gnani mocked) |
+| `test_topics` | Phase 5: topics, sessions, resume, timeline, learning |
+| `test_qa` | Phase 6: passages, answers with citations, LLM off/failing, unclear-command routing, what is sent (Claude mocked; the real API host is blocked in tests) |
 
 **CI:** every push runs the checks on Ubuntu + Windows, Python 3.11 + 3.12:
 ```bash
@@ -237,11 +264,14 @@ QT_QPA_PLATFORM=wayland python bench/bench_phase2.py --db ~/.cache/zachary-bench
 | UI never blocks | `bench_phase2` → `[ui]` | longest stall 26–65 ms |
 | Search with meaning < 50 ms p95 | `bench_phase3` → B `[search]` | p95 28–36 ms (assistant, in-memory index) |
 | "Related files" < 10 ms | `bench_phase3` → `[related]` | p95 0.5 ms |
+| Question → passages (Phase 6) | `bench_phase6` → `[retrieve]` | p95 45 ms with meaning search (268k chunks) |
 
 ```bash
 # 5. Phase 3: content corpus + semantic memory on 200k (~15 min)
 python bench/make_corpus.py ~/.cache/zachary-bench/corpus --files 2000
 python bench/bench_phase3.py --corpus ~/.cache/zachary-bench/corpus --big-db ~/.cache/zachary-bench/bench.db
+# 6. Phase 6: ask-your-files retrieval on 200k (adds ~270k synthetic chunks to a copy; ~2 min)
+python bench/bench_phase6.py --db ~/.cache/zachary-bench/bench3.db
 ```
 
 Clean up afterwards: `rm -rf ~/.cache/zachary-bench`.
@@ -320,12 +350,28 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 | 7 | Search "report", open the 3rd result twice (Enter on it / "open the third one"); search "report" again | it's now first, with "you chose this before" |
 | 8 | "open my resume" | still searches for a file called resume (not the resume command) |
 
+### Phase 6: ask your files
+| # | Do | Expect |
+|---|---|---|
+| 1 | LLM off. Bar: type "when is my fee due?" | while typing: the matching passage in a box under the text, sources below; Enter: "Here's the best match, from …" |
+| 2 | `cli ask when is my fee due` | the same passage + sources, ~20–80 ms |
+| 3 | Turn the LLM on (3.5). Bar: "when is my fee due?" + Enter | "Thinking…", then a one-line answer, spoken with voice on; the box shows the answer + cited passage; the cited file is first |
+| 4 | "fee kab bharna hai", "how much tuition did I pay in 3rd year" | Hinglish and other questions work the same way |
+| 5 | Ask something your files don't contain ("who won the match yesterday") | "Your files don't say …" + the closest passage, never a made-up answer |
+| 6 | Voice: "could you pull up that paper from college about money" | the LLM reads it as a search ("fee receipt"); results shown; opens only on a clear match |
+| 7 | Type "fee receipt", "dsa notes" | plain searches: never call the LLM (`cli llm usage` unchanged) |
+| 8 | Wi-Fi off, ask a question | "Couldn't ask the LLM (no connection …)" + the passage |
+| 9 | "explain the last project I was working on" | 2–3 sentences: what the project is + what you changed lately; the project folder first in the list, "From: README.md, …" |
+| 10 | Search "receipt", then "explain the first one" / "explain it" | an explanation of that file |
+| 11 | "summarize my dsa notes" | a summary from your DSA files |
+
 ---
 
 ## 7. Troubleshooting
 
 | Problem | Fix |
 |---|---|
+| Voice replies slow / late (seen on a phone hotspot: 85% packet loss, DNS failures) | Check the stages with `cli voice latency`: large `stream_open`, `text … after you stopped` or `tts_first_audio` = the network, not Gnani. Limits now: connect 4–5 s, speech-to-text REST fallback 10 s in total, and a reply with no audio within 4 s isn't spoken (the text is on screen) instead of arriving late. Quick check: `ping -c 20 1.1.1.1` (loss) and `curl -4 -so /dev/null -w '%{time_connect}\n' https://api.vachana.ai/` |
 | "inotify limit" warning | `sudo sysctl fs.inotify.max_user_watches=524288` and persist with `echo fs.inotify.max_user_watches=524288 \| sudo tee /etc/sysctl.d/90-zachary.conf` |
 | Hotkey does nothing (GNOME) | GNOME's input-source binding still owns Super+Space (free it, see 3.3), or the dialog was dismissed: check Settings → Keyboard → Shortcuts → Apps, or use `--hotkey ctrl+alt+space`, or bind `--toggle` manually |
 | "Hotkey unavailable" message in the bar | follow the hint shown (bind `python -m zachary.assistant --toggle`) |

@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+
+CONNECT_TIMEOUT_S = 4.0  # a slow/broken network fails fast; the read can take longer
 
 _clients: dict[str, httpx.Client] = {}
 _lock = threading.Lock()
@@ -28,18 +31,26 @@ def http_client(timeout: float) -> httpx.Client:
         if c is None:
             c = httpx.Client(
                 transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=0),
-                timeout=timeout,
+                timeout=httpx.Timeout(timeout, connect=min(CONNECT_TIMEOUT_S, timeout)),
             )
             _clients[key] = c
         return c
 
 
 def post(url: str, *, timeout: float, **kw: Any) -> httpx.Response:
-    """POST over IPv4 (reused connection); if IPv4 can't connect at all, use the default."""
+    """POST over IPv4 (reused connection); if IPv4 can't connect at all, use the default.
+
+    ``timeout`` is the total for both tries: the fallback only gets what's left (on a
+    flaky hotspot, one slow call used to cost two full timeouts: 33 s)."""
+    t0 = time.monotonic()
     try:
         return http_client(timeout).post(url, **kw)
     except httpx.ConnectError:
-        return httpx.post(url, timeout=timeout, **kw)  # e.g. an IPv6-only network
+        left = timeout - (time.monotonic() - t0)
+        if left < 1.0:
+            raise
+        t = httpx.Timeout(left, connect=min(CONNECT_TIMEOUT_S, left))
+        return httpx.post(url, timeout=t, **kw)  # e.g. an IPv6-only network
 
 
 def ws_socket(url: str, timeout: float) -> socket.socket | None:

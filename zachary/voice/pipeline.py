@@ -26,7 +26,15 @@ from typing import Protocol
 
 from zachary.telemetry.latency import Timeline
 from zachary.voice.audio import FRAME_BYTES, EnergyVAD, MicStream, seconds
-from zachary.voice.types import SAMPLE_RATE, STT, StreamingSTT, Transcript, VoiceError
+from zachary.voice.types import (
+    SAMPLE_RATE,
+    STT,
+    StreamingSTT,
+    Transcript,
+    VoiceError,
+    join_segments,
+    segment_key,
+)
 from zachary.voice.wakeword import SPOT_SECONDS, WakeSpotter
 
 log = logging.getLogger(__name__)
@@ -378,7 +386,7 @@ class VoiceListener(threading.Thread):
         local_end_at = 0.0
         server_started = False
         segments_open = 0  # speech_start events not yet answered by a transcript
-        texts: list[str] = []
+        texts: list[tuple[tuple[int, int], str]] = []  # (segment order, text)
         lang: str | None = None
         last_text_at: float | None = None
         commit_at: float | None = None
@@ -473,7 +481,7 @@ class VoiceListener(threading.Thread):
                                 (now - local_end_at) * 1e3 + LOCAL_END_MS
                             )
                         if msg.get("text"):
-                            texts.append(str(msg["text"]).strip())
+                            texts.append((segment_key(msg, len(texts)), str(msg["text"]).strip()))
                             lang = msg.get("detected_language_code") or lang
                             gnani_ms.append(msg.get("latency"))
                         last_text_at = now
@@ -538,7 +546,7 @@ class VoiceListener(threading.Thread):
             tl.info["gnani_latency_ms"] = gnani_ms
         if texts:
             tl.mark("stt")
-            text = " ".join(texts)
+            text = join_segments(texts)
             return Heard(text, Transcript(text, "gnani-stream", lang), tl)
         if not (server_started or local_started):
             tl.mark("stt")
