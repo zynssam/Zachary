@@ -261,8 +261,8 @@ def test_ask_intent(text: str) -> None:
 @pytest.mark.parametrize(
     ("text", "kind"),
     [
-        ("where is my resume", "find"),  # locate a file, not an answer
-        ("which file has my marks", "find"),
+        ("where is my resume", "ask"),  # a locate question: the LLM picks, then it opens
+        ("which file has my marks", "ask"),
         ("dsa notes?", "find"),
         ("fee receipt", "find"),
         ("open fee receipt", "open"),

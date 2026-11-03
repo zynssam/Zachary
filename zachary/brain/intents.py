@@ -123,6 +123,7 @@ PLAN_FILLER = frozenset(
     this it cleanup changes change find show remove delete trash hatao hata nikalo bin
     """.split()
 )
+LOCATE_LEAD = frozenset("which where wich kaunsa kaunsi kahan kidhar".split())
 # Creating files/folders and dictation (new files only; never changes existing ones).
 CREATE_VERBS = frozenset("create make new start banao bana banana write".split())
 CREATE_THINGS = frozenset(
@@ -452,6 +453,18 @@ def parse(text: str) -> Intent:
         and any(t in NO_WORDS for t in toks)
     ):
         return Intent("cancel", confidence=conf, corrected=corrected)
+
+    # --- "which project was I working on about crime scenes", "where is my resume",
+    # "which file has my marks": the LLM picks among your things; then it's opened -----
+    if toks[0] in LOCATE_LEAD and len(toks) >= 3 and not has_open:
+        tr = parse_time(" ".join(toks)).range
+        about = any(t in {"about", "regarding", "related", "wala", "wali"} for t in toks)
+        if tr is not None and not about:  # "which project was I working on yesterday"
+            return Intent("timeline", query=" ".join(toks), confidence=conf,
+                          corrected=corrected)  # fmt: skip
+        is_project = any(t in PROJECT_WORDS or t in FOLDER_WORDS for t in toks)
+        return Intent("ask", query=text.strip(), action="locate", project_hint=is_project,
+                      confidence=conf, corrected=corrected)  # fmt: skip
 
     # --- create a file / folder, dictation ---------------------------------------------
     joined_low = " ".join(toks)

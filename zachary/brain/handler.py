@@ -39,6 +39,8 @@ from zachary.brain.intents import (
 from zachary.brain.llm import LLM, Excerpt, LLMError
 from zachary.brain.timeparse import parse_time
 from zachary.brain.vocab import Vocabulary
+from zachary.brain.workspaces import rank as ws_rank
+from zachary.brain.workspaces import workspaces
 from zachary.core.config import Config, PathRules
 from zachary.core.platform import Platform
 from zachary.core.platform import apps as app_index
@@ -59,6 +61,8 @@ CLEAR_GAP = 0.12  # top score must beat the runner-up by 12% to act without aski
 # The LLM reads a command only when it's a sentence the parser couldn't place
 # (no command word) and the search found nothing convincing.
 ROUTE_MIN_WORDS = 4
+LOCATE_CANDIDATES = 8  # ranked locally, then the LLM picks among these
+LOCATE_DESC = 250  # characters of description per candidate sent to the LLM
 APP_MIN_SCORE = 0.75  # "spotfy" still finds Spotify ...
 APP_SURE_SCORE = 0.9  # ... but below this a file with that name wins
 CLEAN_CATEGORIES = {
@@ -727,7 +731,75 @@ class Handler:
                 return Project(int(row[0]), row[1], row[2], [], float(row[3]))
         return None
 
+    # -- "which project was I working on about crime scenes" / "where is my resume" -------
+    def _locate(self, intent: Intent, *, execute: bool) -> Reply:
+        """Candidates are ranked locally (your projects by their READMEs, or files by
+        search); the LLM picks the one that answers (only names + short descriptions are
+        sent); it's then opened (or shown in its folder for "where ...")."""
+        question = intent.query.strip()
+        where = words(question)[:1] in (["where"], ["kahan"], ["kidhar"])
+        cands: list[tuple[Item, str]] = []
+        if intent.project_hint:
+            roots = [str(r) for r in self.config.index_roots()]
+            ranked = ws_rank(question, workspaces(self.conn, roots), self._embedder())
+            seen: set[str] = set()
+            for ws, score in ranked:
+                key = ws.name.lower() + ws.description[:80]
+                if key in seen:
+                    continue
+                seen.add(key)
+                it = Item(ws.folder_id, ws.path, ws.name, "project", True, ws.last_activity,
+                          [ws.description[:140] or "project"], score)  # fmt: skip
+                desc = ws.description[:LOCATE_DESC] or "no description"
+                cands.append((it, f"{ws.name} ({planner._short(ws.path)}): {desc}"))
+                if len(cands) >= LOCATE_CANDIDATES:
+                    break
+        else:
+            results, _ = self._search(" ".join(qa.question_terms(question)) or question,
+                                      LOCATE_CANDIDATES)  # fmt: skip
+            for r in results:
+                it = _item(r, self.conn)
+                about = next((w[7:] for w in it.why if w.startswith("about: ")), "")
+                cands.append((it, f"{r.name} ({planner._short(os.path.dirname(r.path))})"
+                                  + (f": {about[:LOCATE_DESC]}" if about else "")))  # fmt: skip
+        items = [c[0] for c in cands]
+        self.context.set_results(items, question, "results")
+        if not items:
+            return Reply("I couldn't find anything like that.", "results", [], intent)
+        llm = self.llm()
+        if not execute:
+            say = "Enter to ask." if llm is not None else f"Best match: {items[0].name}."
+            return Reply(say, "results", items, intent, selected=0)
+        pick: int | None = 0
+        answer = ""
+        if llm is not None:
+            try:
+                pick, answer = llm.choose(question, [c[1] for c in cands])
+            except LLMError as e:
+                answer = f"Couldn't ask the LLM ({e})."
+                pick = 0 if clear_winner(items) else None
+        elif not clear_winner(items):
+            pick = None
+        if pick is None:
+            return Reply(answer or "I'm not sure which one; here are the closest.", "results",
+                         items, intent, selected=0)  # fmt: skip
+        target = items[pick]
+        items.insert(0, items.pop(pick))
+        self.context.set_results(items, question, "results")
+        ok = self.actions.reveal(target) if where else self.actions.open(target)
+        verb = "Showing" if where else "Opening"
+        say = (answer + " " if answer else "") + (f"{verb} {target.name}." if ok
+                                                 else f"Couldn't open {target.name}.")  # fmt: skip
+        return Reply(say.strip(), "results", items, intent, "reveal" if where else "open",
+                     target, 0)  # fmt: skip
+
+    def _embedder(self) -> object | None:
+        sem = self.semantic
+        return sem.embedder if sem is not None else None
+
     def _ask(self, intent: Intent, *, execute: bool) -> Reply:
+        if intent.action == "locate":
+            return self._locate(intent, execute=execute)
         if intent.project_hint:
             return self._project_question(intent, execute=execute)
         question = intent.query.strip()

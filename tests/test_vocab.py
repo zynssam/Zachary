@@ -244,3 +244,57 @@ def test_project_question_answered_from_its_own_files(
         r2.items[0].name == "Durdrsti"
         and "port congestion" in msgs.calls[1]["messages"][0]["content"]
     )
+
+
+# -- "which project was I working on about crime scenes?" --------------------------------------
+def _ws_tree(store: FileStore, home: Path) -> None:
+    for name, readme in [("Nishaan-main/backend", "# Nishaan backend\nAI crime scene and suspect "
+                          "sketch generator for police."),
+                         ("Zachary", "# Zachary\nDesktop assistant with file memory: find, open "
+                          "and organize files by voice."),
+                         ("Inventra", "# Inventra\nInventory management for small shops.")]:  # fmt: skip
+        d = home / "Projects" / name
+        d.mkdir(parents=True)
+        (d / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (d / "README.md").write_text(readme)
+    st = scan(store)
+    projects.apply_markers(store, st.markers, scope=None)
+    from zachary.core.config import Config
+    from zachary.indexer.embedder import HashEmbedder
+    from zachary.indexer.semantic import SemanticIndexer
+
+    SemanticIndexer(store.conn, Config(store.conn, store.config.platform), HashEmbedder()).run(16)
+
+
+def test_generic_project_folder_takes_its_parents_name(store: FileStore, home: Path) -> None:
+    from zachary.brain import workspaces
+
+    _ws_tree(store, home)
+    names = {w.name for w in workspaces.workspaces(store.conn, [str(home)])}
+    assert names == {"Nishaan-main", "Zachary", "Inventra"}  # not "backend"
+
+
+def test_locate_question_llm_picks_then_opens(
+    store: FileStore, home: Path, fake_platform: FakePlatform
+) -> None:
+    from zachary.brain import workspaces
+
+    workspaces._cache.clear()
+    _ws_tree(store, home)
+    msgs = Msgs([{"pick": 0, "answer": ""}])
+    model = ClaudeLLM("k", client=SimpleNamespace(beta=SimpleNamespace(messages=msgs)))
+    h = Handler(store.conn, SafeActions(store.conn, fake_platform), store.config, None,
+                lambda: model)  # fmt: skip
+    names = [it.name for it in h.preview("which project was i working on about crime scene").items]
+    assert names[0] == "Nishaan-main"  # ranked locally
+    sent: list[str] = []
+    msgs.replies = [{"pick": names.index("Nishaan-main") + 1,
+                     "answer": "That's Nishaan, a crime scene sketch tool."}]  # fmt: skip
+    r = h.submit("which project was i working on about crime scene")
+    sent.append(msgs.calls[-1]["messages"][0]["content"])
+    assert r.say.endswith("Opening Nishaan-main.") and fake_platform.opened == [
+        home / "Projects" / "Nishaan-main"]  # fmt: skip
+    assert "crime scene" in sent[0] and "Inventory" in sent[0]  # names + short descriptions
+    msgs.replies = [{"pick": 0, "answer": "None of these is about cooking."}]
+    r2 = h.submit("which project was about cooking recipes")
+    assert r2.say == "None of these is about cooking." and len(fake_platform.opened) == 1
