@@ -33,21 +33,11 @@ from PySide6.QtWidgets import (
 )
 
 from zachary.brain.context import Item
+from zachary.ui import style
 
 ItemRole = Qt.ItemDataRole.UserRole + 1
 
-BADGES: dict[str, tuple[str, str]] = {
-    "document": ("D", "#3b82f6"),
-    "code": ("C", "#10b981"),
-    "image": ("I", "#f59e0b"),
-    "video": ("V", "#ef4444"),
-    "audio": ("A", "#8b5cf6"),
-    "archive": ("Z", "#64748b"),
-    "binary": ("B", "#64748b"),
-    "dir": ("F", "#0ea5e9"),
-    "project": ("P", "#ec4899"),
-    "other": ("·", "#94a3b8"),
-}
+BADGES = style.BADGES  # (kept for importers)
 
 _Index = QModelIndex | QPersistentModelIndex
 
@@ -118,7 +108,7 @@ class ResultsDelegate(QStyledItemDelegate):
         r: QRect = option.rect
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if selected:
-            p.fillRect(r, QColor(59, 130, 246, 46))
+            p.fillRect(r, QColor(*style.ACCENT_RGBA, style.SELECTION_ALPHA))
         # badge
         letter, color = BADGES.get(it.kind, BADGES["other"])
         badge = QRect(r.left() + 12, r.top() + 13, 28, 28)
@@ -126,7 +116,7 @@ class ResultsDelegate(QStyledItemDelegate):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(color))
         p.drawRoundedRect(badge, 7, 7)
-        p.setPen(QColor("white"))
+        p.setPen(QColor(style.BADGE_TEXT))
         bf = QFont(option.font)
         bf.setBold(True)
         p.setFont(bf)
@@ -155,9 +145,12 @@ class ResultsDelegate(QStyledItemDelegate):
         if when:
             p.drawText(QRect(right - when_w, r.top() + 9, when_w, tfm.height()),
                        int(Qt.AlignmentFlag.AlignRight), when)  # fmt: skip
-        sub = short_path(it.path) if it.kind == "project" else short_folder(it.path)
+        if it.kind in ("topic", "session"):
+            sub = ""  # not a place on disk: the "why" line says what it is
+        else:
+            sub = short_path(it.path) if it.kind == "project" else short_folder(it.path)
         extra = " · ".join([*it.why[:2], it.detail] if it.detail else it.why[:2])
-        line2 = f"{sub}   {extra}" if extra else sub
+        line2 = f"{sub}   {extra}" if extra and sub else (extra or sub)
         line2 = tfm.elidedText(line2, Qt.TextElideMode.ElideMiddle, right - left)
         p.drawText(QRect(left, r.top() + 9 + fm.height(), right - left, tfm.height()), 0, line2)
         p.restore()

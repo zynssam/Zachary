@@ -408,6 +408,25 @@ def _voice_listen(args: argparse.Namespace, kit: Any, conn: Any, cfg: Config) ->
     return 0
 
 
+def cmd_topics(args: argparse.Namespace) -> int:
+    """List topics (virtual collections); --rebuild clusters now instead of overnight."""
+    from zachary.indexer import clustering
+
+    conn, cfg = _open(args)
+    if args.rebuild:
+        st = clustering.build(conn, [str(r) for r in cfg.index_roots()])
+        print(f"{st.topics} topics from {st.files} files ({st.noise} unassigned), "
+              f"{st.seconds:.1f}s")  # fmt: skip
+    topics = clustering.list_topics(conn, args.limit)
+    if not topics:
+        print("no topics yet (built overnight by the indexer, or run: topics --rebuild)")
+        return 0
+    for t in topics:
+        when = time.strftime("%d %b", time.localtime(t.last_ts)) if t.last_ts else ""
+        print(f"  {t.size:4} files  {when:>6}  {t.label}")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     conn, cfg = _open(args)
     files, dirs = conn.execute("SELECT count(*), coalesce(sum(is_dir), 0) FROM files").fetchone()
@@ -570,6 +589,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--offline", action="store_true", help="local speech recognition only")
     s.add_argument("--no-speak", action="store_true", help="don't speak the reply (listen)")
     s.set_defaults(fn=cmd_voice)
+
+    s = sub.add_parser("topics", help="topics (virtual collections of related files)")
+    s.add_argument("--rebuild", action="store_true", help="cluster now (otherwise nightly)")
+    s.add_argument("--limit", type=int, default=50)
+    s.set_defaults(fn=cmd_topics)
 
     s = sub.add_parser("status", help="index and indexer status")
     s.set_defaults(fn=cmd_status)

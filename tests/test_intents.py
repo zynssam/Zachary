@@ -74,7 +74,6 @@ def test_named_project_is_an_open_with_project_hint() -> None:
     [
         "recent files",
         "what did I open yesterday",
-        "what was I working on last tuesday",
         "recently opened",
         "kal kya khola tha",  # Hinglish
         "haal hi mein kholi files",
@@ -180,3 +179,61 @@ def test_long_sentence_from_the_spec() -> None:
 def test_empty() -> None:
     assert parse("").kind == "none"
     assert parse("   ").kind == "none"
+
+
+@pytest.mark.parametrize(
+    ("text", "kind", "query"),
+    [
+        ("show my topics", "topic", ""),
+        ("my subjects", "topic", ""),
+        ("topic machine learning", "topic", "machine learning"),
+        ("resume where I left off", "resume", ""),
+        ("pick up where i left off", "resume", ""),
+        ("reopen my last session", "resume", ""),
+        ("resume my work", "resume", ""),
+        ("jahan chhoda tha wahi se", "resume", ""),
+        ("what was I working on last tuesday", "timeline", "what was i working on last tuesday"),
+        ("what did I do yesterday", "timeline", "what did i do yesterday"),
+        ("kal kya kaam kiya", "timeline", "kal kya kaam kiya"),
+        ("show my sessions", "timeline", "show my sessions"),
+        ("yes", "confirm", ""),
+        ("yes open them", "confirm", ""),
+        ("haan", "confirm", ""),
+        ("reopen them", "confirm", ""),
+        ("Re-open them.", "confirm", ""),
+        ("re open those", "confirm", ""),
+        ("reopen these files", "confirm", ""),
+        ("reopen those 8 files", "confirm", ""),
+        ("yes open all of them", "confirm", ""),
+        ("open them all", "confirm", ""),
+        ("haan sab kholo", "confirm", ""),
+        ("no", "cancel", ""),
+        ("nahi", "cancel", ""),
+    ],
+)
+def test_phase5_intents(text: str, kind: str, query: str) -> None:
+    i = parse(text)
+    assert (i.kind, i.query) == (kind, query)
+
+
+@pytest.mark.parametrize("text", ["open it", "open that file", "open the first one"])
+def test_confirm_words_dont_steal_followups(text: str) -> None:
+    assert parse(text).kind == "select"
+
+
+def test_all_files_stays_a_search() -> None:
+    assert parse("all files").kind == "find"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "files I worked on yesterday",
+        "what did I open yesterday",
+        "open fee receipt",
+        "open my resume",
+        "resume",
+    ],
+)
+def test_phase5_intents_dont_steal_file_queries(text: str) -> None:
+    assert parse(text).kind in {"recent", "open", "find"}

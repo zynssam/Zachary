@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from zachary.brain.timeparse import TimeRange, parse_time
 from zachary.core.config import PathRules
+from zachary.search import feedback
 from zachary.search.explain import ago, best_passage, name_hits, why_terms
 from zachary.search.tokens import words
 from zachary.search.vectors import SemanticSearch
@@ -414,6 +415,15 @@ def _collapse_versions(
     return out
 
 
+def search_terms(query: str) -> list[str]:
+    """The keyword terms search uses for a query (no time phrase, no kind words)."""
+    tp = parse_time(query, datetime.now().astimezone())
+    terms, _kinds = split_kind_hints(
+        query_terms(tp.rest), words(tp.rest), keep_if_alone=tp.range is None
+    )
+    return terms
+
+
 def search(
     conn: sqlite3.Connection,
     query: str,
@@ -480,6 +490,8 @@ def search(
             # Nothing in range by keyword, but something in range by meaning.
             kw = {k: v for k, v in kw.items() if k in allowed}
             restricted, range_matched = True, True
+    # Learning: files chosen before for the same or similar words.
+    fb = feedback.boosts(conn, terms, now_ts) if terms else {}
     only_kind = bool(kinds) and all(t in KIND_HINTS for t in terms)
     if terms and only_kind and not kw and tr is None:
         # "photos" alone and no file is *named* photos: the most recent photos.
@@ -487,6 +499,7 @@ def search(
         candidates = _recent_of_kinds(conn, kinds, KIND_ONLY_LIMIT)
     elif terms:
         candidates = list(kw) + [i for i in vec if i not in kw]
+        candidates += [i for i in fb if i not in kw and i not in vec]
     elif kinds and in_range:  # "photos last month": time + kind only
         kind_of = _kinds_of(conn, list(in_range))
         candidates = [i for i in in_range if kind_of.get(i) in kinds] or list(in_range)
@@ -548,6 +561,8 @@ def search(
             strength = min(1.0, vec[r.file_id] / 0.4)  # scale by how close the meaning is
             s += VEC_WEIGHT * strength / (RRF_K + vec_rank[r.file_id])
         s += _kind_score(r, kinds)
+        if r.file_id in fb:
+            s += feedback.BONUS * fb[r.file_id]
         r.score = s
 
     ranked = sorted(rows.values(), key=lambda r: (-r.score, -r.last_seen))
@@ -557,6 +572,7 @@ def search(
         r.strong = (
             not terms  # "what I opened yesterday": time/kind is the whole question
             or r.file_id in kw
+            or fb.get(r.file_id, 0.0) >= 1.0  # you picked it for this before
             or r.file_id in exact
             or vec.get(r.file_id, 0.0) >= STRONG_SIM
         )
@@ -573,6 +589,8 @@ def search(
                 r.why.append(f"about: “{p[0]}”")
             elif not r.why or r.why == ["exact name"]:
                 r.why.append("similar meaning")
+        if r.file_id in fb:
+            r.why.append("you chose this before")
         if r.versions:
             r.why.append(f"latest of {len(r.versions) + 1} versions")
         if not in_r:

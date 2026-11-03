@@ -5,6 +5,11 @@ Phase 2 intents:
   find           "find my DSA notes", "fees yesterday" (default when no verb)
   show_projects  "show me all my projects", "mere projects dikhao"
   recent         "recent files", "what did I open yesterday"
+Phase 5 intents:
+  topic          "show my topics", "topic machine learning", "my subjects"
+  resume         "resume where I left off", "reopen my last session", "jahan chhoda tha"
+  timeline       "what was I working on last Tuesday", "what did I do yesterday"
+  confirm/cancel "yes" / "no" (answers to "Reopen these 6 files?")
 Follow-ups (need a previous result list, see ``context.py``):
   select         "open the second one", "doosra wala", "#3", "the last one"
   reveal         "show its folder", "where is it", "iska folder kholo"
@@ -55,6 +60,21 @@ PRONOUNS = frozenset(
 )
 OLDER = frozenset("older old earlier previous purana purani purane haleya hale".split())
 NEWER = frozenset("newer new latest newest naya nayi naye hosa hosadu".split())
+TOPIC_WORDS = frozenset("topic topics subject subjects collection collections".split())
+YES_WORDS = frozenset(
+    "yes yeah yep yup sure ok okay do it go ahead please haan han ha haa ji houdu hoon sari".split()
+)
+# "reopen them" / "re-open those 8 files" / "haan sab kholo": an answer to "Reopen them?".
+# Only these words (plus open verbs, yes words and numbers) may appear, and it needs a yes
+# word or "reopen", or an open verb with "them"/"all"/... ("open it" stays a follow-up).
+CONFIRM_ALL = frozenset("them those these all everything sab sabhi saare saari".split())
+CONFIRM_YES = (YES_WORDS - {"it", "do", "please"}) | {"reopen"}
+CONFIRM_WORDS = CONFIRM_ALL | frozenset(
+    "re open file files of the do it karo kar again dobara phir please ok okay just now".split()
+)
+NO_WORDS = frozenset("no nope nah cancel stop dont don't nahi na beda illa".split())
+WORK_WORDS = frozenset("working worked work doing do kaam busy".split())
+WHAT_WORDS = frozenset("what kya enu".split())
 RELATED_WORDS = frozenset("related similar relevant sambandhit sambandhita sambandhisida".split())
 _JAISA = frozenset("jaisa jaise jaisi".split())
 RELATED_FILLER = frozenset(
@@ -116,7 +136,8 @@ _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show",
 
 @dataclass(frozen=True, slots=True)
 class Intent:
-    kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|none
+    kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|topic|
+    #            resume|timeline|confirm|cancel|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
@@ -223,6 +244,18 @@ def parse(text: str) -> Intent:
     ordinal, ord_idx = _ordinal(toks)
     verbs = OPEN_VERBS | FIND_VERBS | SHOW_VERBS | REVEAL_VERBS
 
+    # --- yes: an answer to a proposal ("Reopen them?"); before follow-ups so that
+    # "yes open all of them" isn't taken as "open the first result" -------------------
+    joined_re = " ".join(toks).replace("re open", "reopen").split()
+    if all(
+        t in YES_WORDS or t in CONFIRM_YES or t in OPEN_VERBS or t in CONFIRM_WORDS or t.isdigit()
+        for t in joined_re
+    ) and (
+        any(t in CONFIRM_YES for t in joined_re)
+        or (any(t in OPEN_VERBS for t in joined_re) and any(t in CONFIRM_ALL for t in joined_re))
+    ):
+        return Intent("confirm", confidence=conf, corrected=corrected)
+
     # --- follow-ups: nothing but command words, ordinals and filler ---------------
     content = [
         t for i, t in enumerate(toks)
@@ -245,6 +278,49 @@ def parse(text: str) -> Intent:
         if has_pronoun and (has_open or has_show):
             return Intent("select", ordinal=None, action="open", confidence=conf,
                           corrected=corrected)  # fmt: skip
+
+    # --- no: an answer to a proposal ("Reopen these 6 files?") ----------------------
+    plain = [t for t in toks if t not in {"please", "ok", "okay", "just", "now", "then"}]
+    if (
+        plain
+        and all(t in NO_WORDS or t in FILLER for t in toks)
+        and any(t in NO_WORDS for t in toks)
+    ):
+        return Intent("cancel", confidence=conf, corrected=corrected)
+
+    # --- resume where I left off -------------------------------------------------------
+    joined = " ".join(toks)
+    # ("resume" alone is also a file: "open my resume" must stay a search.)
+    resume_ctx = {"where", "session", "work", "working", "last", "from", "left", "off"}
+    if (
+        ("resume" in toks and any(t in resume_ctx for t in toks))
+        or "left off" in joined
+        or "last session" in joined
+        or ("reopen" in toks and not content)
+        or "chhoda" in toks
+        or "choda" in toks
+        or "nilsida" in toks
+    ):
+        return Intent("resume", confidence=conf, corrected=corrected)
+
+    # --- timeline: what was I working on --------------------------------------------
+    file_words = {"file", "files", "document", "documents", "doc", "docs", "open", "opened"}
+    if (
+        "timeline" in toks
+        or "sessions" in toks
+        or (
+            any(t in WHAT_WORDS for t in toks)
+            and any(t in WORK_WORDS for t in toks)
+            and not any(t in file_words for t in toks)
+        )
+    ):
+        return Intent("timeline", query=joined, confidence=conf, corrected=corrected)
+
+    # --- topics ---------------------------------------------------------------------------
+    if any(t in TOPIC_WORDS for t in toks):
+        rest = [t for t in toks if t not in TOPIC_WORDS and t not in FILLER and t not in verbs
+                and t not in PROJECT_FILLER and t not in {"all", "about", "on"}]  # fmt: skip
+        return Intent("topic", query=" ".join(rest), confidence=conf, corrected=corrected)
 
     # --- related files ----------------------------------------------------------------
     like_this = "like" in toks and (

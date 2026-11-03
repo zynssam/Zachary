@@ -32,6 +32,7 @@ from PySide6.QtWidgets import QLabel, QLineEdit, QVBoxLayout, QWidget
 
 from zachary.brain.handler import Reply
 from zachary.telemetry.latency import LATENCY
+from zachary.ui import style
 from zachary.ui.engine import Engine
 from zachary.ui.results import ResultsView
 
@@ -277,7 +278,7 @@ class QuickBar(QWidget):
         bg = self.palette().window().color()
         bg.setAlpha(245)
         p.setBrush(bg)
-        p.setPen(QColor(128, 128, 128, 90))
+        p.setPen(QColor(*style.BORDER_RGBA))
         p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 14, 14)
 
 
