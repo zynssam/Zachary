@@ -63,7 +63,13 @@ class WakeSpotter:
 # -- fast spotting: Vosk with a fixed phrase list (no training) -----------------------------
 VOSK_MODEL = "vosk-model-small-en-in-0.4"  # 36 MB download, Indian English
 VOSK_URL = f"https://alphacephei.com/vosk/models/{VOSK_MODEL}.zip"
-WAKE_PHRASES = ("hey zack", "ok zack", "okay zack")  # ("hi zack": "hey Sara" read as it)
+WAKE_PHRASES = (
+    "hey zack", "ok zack", "okay zack",  # ("hi zack": "hey Sara" was read as it)
+    # "Hey Zach, open Spotify" in one breath is often heard as "zack open ...":
+    # the name followed straight by a command counts too (seen with the user's voice).
+    # (not "zack what": "...they act like..." was read as it)
+    "zack open", "zack show", "zack find", "zack play", "zack start", "zack search",
+)  # fmt: skip
 # Phrases that sound close but must *not* wake (without them the recognizer maps
 # "hey Jack" to "hey zack", the nearest phrase it knows). Measured with natural speech.
 DECOYS = (
