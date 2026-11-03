@@ -20,7 +20,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -92,13 +92,14 @@ class MicSource:
         self.auto = mic is None and not device
         self.fixed = mic is not None  # a stream given by the caller: never replaced
         self.dead: set[str] = set()  # source names that gave only digital silence
+        self.bluetooth = True  # False in wake-word mode (the mic stays open all the time)
 
     def _auto_stream(self) -> MicStream:
         from zachary.voice.audio import auto_input
 
         if self.mic.active:
             return self.mic
-        return MicStream(auto_input(exclude=self.dead))
+        return MicStream(auto_input(exclude=self.dead, bluetooth=self.bluetooth))
 
     def start(self) -> None:
         if self.auto:
@@ -128,7 +129,7 @@ class MicSource:
         if current:
             self.dead.add(current)
         try:
-            name = auto_input(exclude=self.dead)
+            name = auto_input(exclude=self.dead, bluetooth=self.bluetooth)
         except Exception:
             return None
         if not name or name == current:
@@ -143,6 +144,38 @@ class MicSource:
             self.dead.add(name)
             return None
         return name
+
+    @contextlib.contextmanager
+    def borrowed(self) -> Iterator[str | None]:
+        """Wake-word mode while its always-open mic is silent: one push-to-talk command
+        uses the best mic, Bluetooth earbuds included (headset mode only for that
+        command, as normal push-to-talk), then the always-open mic is back."""
+        from zachary.voice.audio import auto_input
+
+        if self.fixed:
+            yield None
+            return
+        current = self.mic.source_name or self.mic.device
+        try:
+            name = auto_input(exclude=self.dead, bluetooth=True)
+        except Exception:
+            name = ""
+        if not name or name == current:
+            yield None
+            return
+        old = self.mic
+        old.stop()
+        old.drain()
+        self.mic = MicStream(name)
+        try:
+            self.mic.start()
+            yield name
+        finally:
+            with contextlib.suppress(Exception):
+                self.mic.stop()
+            self.mic = old
+            with contextlib.suppress(Exception):
+                old.start()
 
     def stop(self) -> None:
         self.mic.stop()
@@ -198,6 +231,8 @@ class VoiceListener(threading.Thread):
         # Push-to-talk only: the mic is open only during a command (privacy; and
         # Bluetooth earbuds stay in high-quality music mode the rest of the time).
         self.mic_always_open = self.wake_word if mic_always_open is None else mic_always_open
+        if self.mic_always_open and hasattr(source, "bluetooth"):
+            source.bluetooth = False  # keep earbuds in music mode (see auto_input)
         self.vad = vad or EnergyVAD()
         self._stop_ev = threading.Event()
         self._ptt = threading.Event()
@@ -289,7 +324,10 @@ class VoiceListener(threading.Thread):
                 return
             self._warned_silent = True
             self.on_state(
-                "error: the microphone is silent (check the input device in Sound settings)"
+                "error: the microphone is silent: “Hey Zach” needs a wired or USB mic "
+                "(Bluetooth earbuds stay in music mode; use push-to-talk with them)"
+                if self.mic_always_open
+                else "error: the microphone is silent (check the input device in Sound settings)"
             )
 
     def _loop(self) -> None:
@@ -386,14 +424,20 @@ class VoiceListener(threading.Thread):
             tl.mark("stt")
             self.on_heard(heard)
             return
-        tl.mark("mic_open")
-        log.info("voice: mic open (%s)", self._mic_name())
-        try:
-            heard = self._ptt_listen(tl)
-        finally:
-            if opened_here:
-                with contextlib.suppress(Exception):
-                    self.source.stop()
+        borrow = getattr(self.source, "borrowed", None)
+        with contextlib.ExitStack() as stack:
+            if self.mic_always_open and not after_wake and self._warned_silent and borrow:
+                name = stack.enter_context(borrow())
+                if name:
+                    log.info("voice: always-open mic is silent; this command uses %s", name)
+            tl.mark("mic_open")
+            log.info("voice: mic open (%s)", self._mic_name())
+            try:
+                heard = self._ptt_listen(tl)
+            finally:
+                if opened_here:
+                    with contextlib.suppress(Exception):
+                        self.source.stop()
         heard.via = "wake" if after_wake else "ptt"
         self.on_state("thinking" if heard.text else "idle")
         self.on_heard(heard)

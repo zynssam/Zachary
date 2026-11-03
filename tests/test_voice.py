@@ -5,6 +5,7 @@ The real Gnani API is never called here.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
@@ -1416,3 +1417,55 @@ def test_wake_mode_switches_to_a_mic_connected_later(gnani: MockGnani,
         lis.stop()
         lis.join(3)
     assert any("microphone is silent" in s for s in states) and src.calls >= 2
+
+
+def test_wake_mode_never_picks_a_bluetooth_mic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """User's choice: earbuds stay in music mode while "Hey Zach" listens."""
+    from zachary.voice import audio
+
+    srcs = [{"name": "bluez_input.68_ED", "driver": "x"},
+            {"name": "alsa_input.usb-mic.mono", "driver": "x"}]  # fmt: skip
+    monkeypatch.setattr(audio, "_pactl_sources", lambda: (srcs, "bluez_input.68_ED"))
+    monkeypatch.setattr(audio, "_pactl_default_sink", lambda: "bluez_output.68_ED.1")
+    assert audio.auto_input() == "bluez_input.68_ED"  # push-to-talk: the earbuds
+    assert audio.auto_input(bluetooth=False) == "alsa_input.usb-mic.mono"  # wake mode
+    from zachary.voice.pipeline import MicSource
+
+    src = MicSource()
+    VoiceListener(src, on_heard=lambda _h: None, rest_stt=None, stream_stt=None,
+                  offline_stt=None, spotter=None, wake_word=True,
+                  fast_spotter=FakeFast())  # type: ignore[arg-type]  # fmt: skip
+    assert src.bluetooth is False
+
+
+def test_ptt_in_wake_mode_borrows_the_earbuds_when_the_open_mic_is_silent(
+    gnani: MockGnani,
+) -> None:
+    class Borrowing(CountingSource):
+        borrowed_for = 0
+
+        def get(self, timeout: float) -> bytes | None:
+            try:
+                return self.q.get_nowait()
+            except queue.Empty:
+                time.sleep(0.005)
+                return b"\0" * FRAME_BYTES  # between commands: the dead laptop mic
+
+        @contextlib.contextmanager
+        def borrowed(self) -> Iterator[str | None]:
+            Borrowing.borrowed_for += 1
+            yield "bluez_input.earbuds"
+
+    src = Borrowing()
+    got: list[Heard] = []
+    fast: Any = FakeFast(after=10**6)
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=fast)
+    lis._warned_silent = True  # the always-open (laptop) mic gave only zeros
+    try:
+        lis.push_to_talk()
+        src.load(speech(1.0) + silence(1.0))
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert got[0].text == gnani.transcript and Borrowing.borrowed_for == 1
