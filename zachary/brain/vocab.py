@@ -109,7 +109,7 @@ class Corrector:
             r = difflib.SequenceMatcher(None, heard, c).ratio()
             # Same first letter ("zakari" / "zachary"), or spelled almost the same: a real
             # word that merely sounds similar ("scary") is left alone.
-            ok = r >= 0.8 if strict else (c[0] == heard[0] and r >= 0.55) or r >= 0.8
+            ok = r >= 0.8 if strict else (c[0] == heard[0] and r >= 0.5) or r >= 0.8
             if ok and r > best_r:
                 best, best_r = c, r
         return best

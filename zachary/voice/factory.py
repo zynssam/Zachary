@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +16,8 @@ from zachary.voice.offline_stt import WhisperSTT
 from zachary.voice.types import STT, TTS, StreamingSTT
 from zachary.voice.usage import UsageLedger
 from zachary.voice.wakeword import WakeSpotter
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -27,6 +32,51 @@ class VoiceKit:
     mic_device: str = ""
 
 
+class Keyterms:
+    """Your names for Gnani's ``keyterms`` (projects, apps, topics, folders; never file
+    contents), loaded in the background so a command never waits; refreshed every 10
+    minutes. Approved by the user; off with ``cli set stt_keyterms false``."""
+
+    def __init__(self, config: Config) -> None:
+        from zachary.brain.vocab import Vocabulary
+
+        self.vocab = Vocabulary(
+            config.conn,
+            lambda: [str(r) for r in config.index_roots()],
+            lambda: [a.name for a in config.platform.list_apps()],
+        )
+        self._names: list[str] = []
+        self._at = 0.0
+        self._lock = threading.Lock()
+        self._busy = False
+        self._load()
+
+    def _load(self) -> None:
+        with self._lock:
+            if self._busy:
+                return
+            self._busy = True
+
+        def run() -> None:
+            try:
+                names = self.vocab.keyterms()
+                with self._lock:
+                    self._names, self._at = names, time.monotonic()
+            except Exception:
+                log.debug("could not build keyterms", exc_info=True)
+            finally:
+                with self._lock:
+                    self._busy = False
+
+        threading.Thread(target=run, name="zachary-keyterms", daemon=True).start()
+
+    def __call__(self) -> list[str]:
+        if time.monotonic() - self._at > 600:
+            self._load()
+        with self._lock:
+            return list(self._names)
+
+
 def build_voice(config: Config, data_dir: Path, *, api_key: str | None = None) -> VoiceKit:
     s = config.load()
     key = api_key if api_key is not None else get_secret("GNANI_API_KEY")
@@ -35,17 +85,27 @@ def build_voice(config: Config, data_dir: Path, *, api_key: str | None = None) -
     rest: STT | None = None
     stream: Callable[[], StreamingSTT] | None = None
     tts: TTS | None = None
+    terms = Keyterms(config) if key and s.stt_keyterms else None
     if key:
         # A spoken command is a few seconds of audio, answered in < 1 s by the server:
         # 10 s total (both connection tries) is plenty; past that, local whisper is faster.
         rest = gnani_stt.GnaniRestSTT(
-            key, language=s.stt_language, model=s.stt_model, ledger=ledger, timeout=10.0
+            key,
+            language=s.stt_language,
+            model=s.stt_model,
+            ledger=ledger,
+            timeout=10.0,
+            keyterms=terms,
         )
         if s.stt_streaming:
 
             def stream() -> StreamingSTT:
                 return gnani_stt.GnaniStreamingSTT(
-                    key, language=s.stt_language, model=s.stt_model, ledger=ledger
+                    key,
+                    language=s.stt_language,
+                    model=s.stt_model,
+                    ledger=ledger,
+                    keyterms=terms,
                 )
 
         tts = gnani_tts.GnaniWsTTS(

@@ -40,7 +40,8 @@ def test_sound_key() -> None:
     [("open zakari in vscode", "open zachary in vscode"),
      ("open zachery", "open zachary"), ("open zack ary", "open zachary"),
      ("open sachary project", "open zachary project"), ("open spotfy", "open spotify"),
-     ("open durdristi", "open durdrsti"), ("open spot ify", "open spotify")],
+     ("open durdristi", "open durdrsti"), ("open spot ify", "open spotify"),
+     ("open zakre in vs code", "open zachary in vs code")],  # Gnani, real (no keyterms)
 )  # fmt: skip
 def test_misheard_names_are_fixed(heard: str, fixed: str) -> None:
     assert corrector().correct(heard)[0] == fixed

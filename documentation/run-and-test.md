@@ -214,6 +214,8 @@ Bar or voice:
 - "make a document I'll dictate" → talk (pause = next piece; "new paragraph", "scratch that") → "stop dictation": saved in `Documents/Zachary/<topic>/` and opened
 - "create a text file and paste what I copied", "create a folder called Hackathon Ideas in downloads"
 - "undo" → "yes" removes what was just created (unless you edited it)
+- "how many planets are there" (general → LLM, only the question is sent) vs "when is my fee due" (your files)
+- Names you say are sent to Gnani as recognition hints (keyterms; names only): `cli set stt_keyterms false` to keep them local
 
 ## 4. Automated checks
 

@@ -5,6 +5,7 @@ The real Gnani API is never called here.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
@@ -13,6 +14,7 @@ import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -1150,7 +1152,6 @@ def test_tts_gives_up_when_audio_is_too_late(gnani: MockGnani, ledger: UsageLedg
 
 
 def test_rest_fallback_only_gets_the_time_left(monkeypatch: pytest.MonkeyPatch) -> None:
-    from typing import Any
 
     import httpx
 
@@ -1176,7 +1177,6 @@ def test_rest_fallback_only_gets_the_time_left(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_segments_join_in_gnani_order_not_arrival_order() -> None:
-    from typing import Any
 
     from zachary.voice.types import join_segments, segment_key
 
@@ -1244,3 +1244,33 @@ def test_voice_dictation_rearms_until_stop(
     import docx
 
     assert [p.text for p in docx.Document(str(made)).paragraphs] == ["The demo is on friday."]
+
+
+def test_keyterms_reach_gnani(gnani: MockGnani) -> None:
+    """Your names go as Prisma v3 keyterms (stream header + REST form); approved setting."""
+    names = lambda: ["Zachary", "Durdrsti"]  # noqa: E731
+    stt = GnaniStreamingSTT(KEY, url=gnani.stt_ws, keyterms=names)
+    stt.open()
+    stt.feed(silence(0.2))
+    stt.finish()
+    hdr = gnani.calls[-1]["headers"]
+    assert json.loads(hdr["keyterms"]) == ["Zachary", "Durdrsti"]
+    GnaniRestSTT(KEY, url=gnani.stt_url, keyterms=names).transcribe(speech(0.5))
+    assert json.loads(gnani.calls[-1]["fields"]["keyterms"]) == ["Zachary", "Durdrsti"]
+    GnaniRestSTT(KEY, url=gnani.stt_url).transcribe(speech(0.5))
+    assert "keyterms" not in gnani.calls[-1]["fields"]  # none when off
+
+
+def test_keyterms_setting_off_sends_nothing(
+    conn: Any, fake_platform: FakePlatform, tmp_path: Path
+) -> None:
+    from zachary.core.config import Config
+    from zachary.voice import factory
+
+    cfg = Config(conn, fake_platform)
+    cfg.set_setting("stt_keyterms", False)
+    kit = factory.build_voice(cfg, tmp_path, api_key="k")
+    assert kit.rest_stt is not None and kit.rest_stt.keyterms is None  # type: ignore[attr-defined]
+    cfg.set_setting("stt_keyterms", True)
+    kit = factory.build_voice(cfg, tmp_path, api_key="k")
+    assert isinstance(kit.rest_stt.keyterms, factory.Keyterms)  # type: ignore[union-attr]
