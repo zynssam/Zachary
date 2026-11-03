@@ -14,6 +14,15 @@ Status: **built and tested; waiting for review.** Branch `phase-7-extras` (on to
 | Formats | **.docx** by default; **.txt** for "text file", "txt" or "notepad"; .md for "markdown". |
 | Ask before creating? | No (your choice). Creating only ever makes **new** files and never overwrites (" (2)" is added). "undo" moves the new file to the trash, and removes any folder it made, but **only if you haven't edited it since**; edited files are left in place. |
 
+## 1b. Fixes after trying it (names, questions)
+
+| Problem | Fix |
+|---|---|
+| "Zachary" not understood; another file was opened | **Root cause:** "zachary" was on the search stop-word list (it's also the wake word), so every search for your Zachary project dropped the word and matched other words. Removed. The wake word is now only stripped after "hey/ok" or right before a command ("hey zach open …"), not when it's the thing to open. "open zachary" opens the project whose name matches exactly. |
+| Misheard names | Corrected **locally** by sound before the request is understood: "zakari", "zachery", "zack ary" and "sachary" → Zachary; "spotfy" and "spot ify" → Spotify; "durdristi" → Durdrsti. The vocabulary is your project, app, topic and top-level folder names. A word is only replaced if it isn't in your index, sounds like one of your names, and starts with the same letter (or is spelled almost the same), so "scary movie" stays. Cost: < 1 ms per request; the vocabulary is built at start-up in about 0.15 s. |
+| Questions not about your files should go to the API | "how many / which / when / how / what / who …" questions **not about your things** go to the LLM (Groq, Gemini or Claude) with **only the question** (real run: "how many planets…" → "There are eight planets in the Solar System.", Groq, 0.6 s). A question counts as about your things if it says "my / mine / our / mera / hamara…" or names a file word (file, notes, assignment, receipt…), or if the best passage contains all of its words or the best file's name does ("when was the hackfest pitch"). Then it's answered from your files. If the files don't say and the question wasn't personal, it falls back to the general answer. "how do I …" questions are general. |
+| (not done: needs your OK) Gnani keyterms | Gnani's Prisma v3 can be given up to 200 names to favour (`keyterms`). The client supports it, but it's **not switched on**: it would send your project, app, topic and folder *names* (never contents) to Gnani, which goes beyond "only voice audio goes to Gnani". It needs your decision. |
+
 ## 2. Safety
 
 - **Apps:** only apps the desktop lists can start, through `gio launch <entry>` or `os.startfile`, never a shell or a typed command. "launch /bin/sh" or "rm -rf /" does nothing (tested). Open-with passes exactly one indexed file or folder.
@@ -34,6 +43,7 @@ Status: **built and tested; waiting for review.** Branch `phase-7-extras` (on to
 - `test_apps.py` (19): desktop-entry parsing (hidden entries, user overrides, our own launcher left out), name matching, the "X in Y" parse (including Hinglish order and typos), launching, open in VS Code, "in downloads" staying a search, apps that can't open files, and only installed apps.
 - `test_create.py` (26): create/dictate parsing; never overwriting; .docx content; sorting into existing or new folders; the LLM folder namer gets an excerpt only; undo trashes unless edited; migration 5 keeps history; clipboard paste opened only after writing; folder in a place; undo after create; dictation (pieces, new paragraph, scratch that, nothing written until stop, draft removed), cancel/empty; named .txt dictation.
 - `test_voice.py`: voice dictation through the real listener, engine and bar with the mock Gnani.
+- `test_vocab.py` (24): sound keys, misheard names fixed, real words left alone, "zachary" searchable, open misheard project in VS Code, exact project name, keyterms header value (200 max, ASCII, `<|` rejected), personal vs general questions, a general question sends only the question, no-LLM message, a file-name hit is answered from the file.
 - ruff, mypy strict (+ win32) and the full suite pass locally and on CI.
 
 ## 5. Commands
