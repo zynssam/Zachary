@@ -38,13 +38,12 @@ class Keyterms:
     minutes. Approved by the user; off with ``cli set stt_keyterms false``."""
 
     def __init__(self, config: Config) -> None:
-        from zachary.brain.vocab import Vocabulary
-
-        self.vocab = Vocabulary(
-            config.conn,
-            lambda: [str(r) for r in config.index_roots()],
-            lambda: [a.name for a in config.platform.list_apps()],
-        )
+        # The background thread uses its *own* connection: sharing the caller's one across
+        # threads crashed SQLite when it was closed mid-read (seen on CI).
+        row = config.conn.execute("PRAGMA database_list").fetchone()
+        self.db_path = str(row[2]) if row and row[2] else ""
+        self.roots = [str(r) for r in config.index_roots()]
+        self.platform = config.platform
         self._names: list[str] = []
         self._at = 0.0
         self._lock = threading.Lock()
@@ -59,7 +58,7 @@ class Keyterms:
 
         def run() -> None:
             try:
-                names = self.vocab.keyterms()
+                names = self._build()
                 with self._lock:
                     self._names, self._at = names, time.monotonic()
             except Exception:
@@ -69,6 +68,18 @@ class Keyterms:
                     self._busy = False
 
         threading.Thread(target=run, name="zachary-keyterms", daemon=True).start()
+
+    def _build(self) -> list[str]:
+        from zachary.brain.vocab import names
+        from zachary.core.db import open_db
+
+        if not self.db_path:
+            return []
+        conn = open_db(Path(self.db_path))
+        try:
+            return names(conn, self.roots, [a.name for a in self.platform.list_apps()])
+        finally:
+            conn.close()
 
     def __call__(self) -> list[str]:
         if time.monotonic() - self._at > 600:
