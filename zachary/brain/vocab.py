@@ -21,11 +21,16 @@ from pathlib import Path
 from zachary.search.tokens import words
 
 MAX_KEYTERMS = 200  # Gnani's limit
+# Only words this long are corrected, and only to names this long: short words are
+# too often ordinary ones ("many" was once turned into a folder called "main").
+MIN_LEN = 5
 CACHE_S = 600.0
 GENERIC = frozenset(
     """
     desktop documents downloads music pictures videos templates public new folder untitled
     src lib bin build dist test tests docs data assets images files misc temp tmp
+    main backend frontend server client app apps dummy sample samples scripts utils config
+    public static components pages models views
     """.split()
 )
 
@@ -97,7 +102,7 @@ class Corrector:
         self.by_key: dict[str, list[str]] = {}
         for name in vocabulary:
             for w in words(name):
-                if len(w) >= 4:
+                if len(w) >= MIN_LEN and w not in GENERIC:
                     self.by_key.setdefault(sound_key(w), [])
                     if w not in self.by_key[sound_key(w)]:
                         self.by_key[sound_key(w)].append(w)
@@ -134,7 +139,7 @@ class Corrector:
                         fixed[f"{raw} {toks[i + 1]}"] = joined
                         i += 2
                         continue
-            if len(w) >= 4 and not self.known(w):
+            if len(w) >= MIN_LEN and not self.known(w):
                 m = self._match(w)
                 if m is not None and m != w:
                     out.append(m)
@@ -144,6 +149,17 @@ class Corrector:
             out.append(raw)
             i += 1
         return " ".join(out), fixed
+
+
+def _parser_words() -> frozenset[str]:
+    from zachary.brain import intents as i
+
+    sets = (
+        i.QUESTION_LEAD, i.STAT_THINGS, i.CREATE_THINGS, i.CREATE_VERBS, i.CLEAN_WORDS,
+        i.ORGANIZE_WORDS, i.PROJECT_WORDS, i.TOPIC_WORDS, i.EXPLAIN_WORDS, i.DICTATE_WORDS,
+        i.PASTE_WORDS, i.YES_WORDS, i.NO_WORDS, i.WORK_WORDS,
+    )  # fmt: skip
+    return frozenset().union(*sets)
 
 
 class Vocabulary:
@@ -161,7 +177,7 @@ class Vocabulary:
     def _known(self, w: str) -> bool:
         from zachary.brain.intents import _known as intent_word
 
-        if intent_word(w):
+        if intent_word(w) or w in _parser_words():
             return True
         row = self.conn.execute(
             "SELECT 1 FROM files_fts_vocab WHERE term = ? LIMIT 1", (w,)

@@ -87,6 +87,18 @@ QUESTION_ANYWHERE = frozenset("kab kitna kitni kitne kaunsa kaunsi kyun yaavaga 
 FILE_ASK_WORDS = frozenset(
     "file files folder folders document documents doc docs pdf pdfs where kahan kidhar elli".split()
 )
+# Counting / sizes, answered from the index (never the LLM): "how many pdfs do I have".
+STAT_THINGS = frozenset(
+    """
+    file files document documents doc docs pdf pdfs photo photos picture pictures image
+    images pic pics video videos movie movies song songs music audio folder folders
+    directory directories project projects topic topics code script scripts space storage
+    size gb mb spreadsheet spreadsheets presentation presentations slides
+    """.split()
+)
+_EXT_WORD = re.compile(
+    r"\b(pdf|docx?|pptx?|xlsx?|csv|txt|md|zip|py|js|ts|java|cpp|jpe?g|png|mp4|mp3)s?\b"
+)
 # Cleaning / organizing (Phase 7): always a plan to review, never an action.
 CLEAN_WORDS = frozenset(
     """
@@ -274,7 +286,7 @@ _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show",
 class Intent:
     kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|topic|
     #            resume|timeline|confirm|cancel|ask|explain|clean|organize|undo|create|
-    #            dictate|none
+    #            dictate|stats|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
@@ -539,6 +551,13 @@ def parse(text: str) -> Intent:
         if not rest:
             return Intent("related", ordinal=ordinal, confidence=conf, corrected=corrected)
         return Intent("related", query=" ".join(rest), confidence=conf, corrected=corrected)
+
+    # --- stats: "how many files / pdfs / projects do I have", "how much space ..." -----
+    joined_q = " ".join(toks)
+    count_q = joined_q.startswith(("how many", "how much", "number of", "count ", "total "))
+    count_q = count_q or any(t in {"kitne", "kitni", "kitna", "eshtu", "yestu"} for t in toks)
+    if count_q and (any(t in STAT_THINGS for t in toks) or _EXT_WORD.search(joined_q)):
+        return Intent("stats", query=joined_q, confidence=conf, corrected=corrected)
 
     # --- projects -------------------------------------------------------------------
     if any(t in PROJECT_WORDS for t in toks):

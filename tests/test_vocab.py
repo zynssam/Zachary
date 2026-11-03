@@ -145,3 +145,51 @@ def test_impersonal_question_named_like_a_file_is_answered_from_it(
     assert ps and qa.about_files("when was the hackfest pitch", ps, personal=False)
     assert not qa.about_files("how many planets are there",
                               qa.retrieve(store.conn, "how many planets are there"), False)  # fmt: skip
+
+
+def test_short_common_words_are_never_names() -> None:
+    """ "how many files" once became "how main files" (a folder called main)."""
+    c = Corrector(["main", "backend", "Zachary", "Manya"], lambda w: w in {"how", "files"})
+    assert c.correct("how many files do i have") == ("how many files do i have", {})
+
+
+# -- "how many ... do I have": counted in the index, never the LLM -------------------------------
+@pytest.mark.parametrize(
+    "text",
+    ["How many files do I have?", "how many pdfs do i have", "how many projects do i have",
+     "how much space do my videos take", "how many files in downloads", "kitni files hain",
+     "downloads mein kitni files hain", "how many python files", "how many folders"],
+)  # fmt: skip
+def test_stats_intent(text: str) -> None:
+    from zachary.brain.intents import parse
+
+    assert parse(text).kind == "stats"
+
+
+def test_stats_answers(store: FileStore, home: Path, fake_platform: FakePlatform) -> None:
+    def put(path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    for n in range(3):
+        put(home / "Downloads" / f"r{n}.pdf", b"x" * 1000)
+    put(home / "Videos" / "trip.mp4", b"v" * 5000)
+    put(home / "Documents" / "clip.mp4", b"v" * 3000)
+    put(home / "code" / "app" / "pyproject.toml", b"[project]")
+    put(home / "code" / "app" / "main.py", b"print(1)")
+    st = scan(store)
+    projects.apply_markers(store, st.markers, scope=None)
+    h = Handler(store.conn, SafeActions(store.conn, fake_platform), store.config)
+    asked: list[str] = []
+
+    def no_llm() -> None:
+        asked.append("llm")
+
+    h._llm_provider = no_llm
+    assert h.submit("how many pdfs do i have").say == "You have 3 PDF files, 3 KB in total."
+    assert h.submit("how many files in downloads").say.startswith("You have 3 files in Downloads")
+    assert h.submit("how much space do my videos take").say == "Your videos take 8 KB (2 files)."
+    assert h.submit("how many projects do i have").say == "You have 1 project."
+    r = h.submit("How many files do I have?")
+    assert r.say.startswith("You have 7 files") and "Videos" in r.detail
+    assert not asked  # counted locally, no LLM

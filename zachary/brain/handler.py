@@ -47,7 +47,7 @@ from zachary.indexer import clustering
 from zachary.indexer.projects import Project, list_projects
 from zachary.indexer.relations import related as related_files
 from zachary.search import feedback
-from zachary.search.hybrid import SearchResult, recent, search, search_terms
+from zachary.search.hybrid import KIND_HINTS, SearchResult, recent, search, search_terms
 from zachary.search.tokens import words
 from zachary.search.vectors import SemanticSearch
 
@@ -68,6 +68,18 @@ CLEAN_CATEGORIES = {
     "temporary": "junk", "large": "large", "big": "large", "huge": "large",
 }  # fmt: skip
 STANDARD_FOLDERS = frozenset("downloads desktop documents pictures music videos".split())
+KIND_LABELS = {"document": "documents", "code": "code files", "image": "images",
+               "video": "videos", "audio": "audio files", "archive": "archives",
+               "binary": "programs", "other": "other files", "dir": "folders"}  # fmt: skip
+EXT_NAMES = {"py": "Python", "js": "JavaScript", "ts": "TypeScript", "md": "Markdown",
+             "java": "Java", "cpp": "C++"}  # fmt: skip
+EXT_ALIASES = {"python": "py", "javascript": "js", "typescript": "ts", "excel": "xlsx",
+               "powerpoint": "pptx", "word": "docx", "markdown": "md"}  # fmt: skip
+_EXT_RE = re.compile(
+    r"\b(pdf|docx?|pptx?|xlsx?|csv|txt|md|zip|py|js|ts|java|cpp|jpe?g|png|mp4|mp3|python"
+    r"|javascript|typescript|excel|powerpoint|markdown)s?\b",
+    re.I,
+)
 EXPLAIN_PASSAGES = 6
 LAST_WORDS = frozenset(
     "last latest recent recently current currently working worked doing now".split()
@@ -407,6 +419,8 @@ class Handler:
             reply = self._ask(intent, execute=execute)
         elif intent.kind == "explain":
             reply = self._explain(intent, execute=execute)
+        elif intent.kind == "stats":
+            reply = self._stats(intent)
         elif intent.kind == "create":
             reply = self._create(intent, execute=execute)
         elif intent.kind == "dictate":
@@ -932,6 +946,74 @@ class Handler:
         self.context.set_results(shown, intent.target, "results")
         return Reply(f"Which one should I open in {app.name}?", "results", shown, intent,
                      selected=0)  # fmt: skip
+
+    # -- "how many files / pdfs do I have", "how much space do my videos take" -----------
+    def _stats(self, intent: Intent) -> Reply:
+        """Counted in the index, on this machine (instant; nothing is sent anywhere)."""
+        q = intent.query
+        toks = words(q)
+        if any(t in {"project", "projects"} for t in toks):
+            n = len(list_projects(self.conn))
+            return Reply(f"You have {n:,} project{'s' if n != 1 else ''}.", "none", [], intent)
+        where: list[str] = ["is_dir = 0", "is_excluded = 0"]
+        params: list[object] = []
+        label = "files"
+        kinds = {KIND_HINTS[t] for t in toks if t in KIND_HINTS}
+        exts = sorted({EXT_ALIASES.get(m.group(1), m.group(1)) for m in _EXT_RE.finditer(q)})
+        if "dir" in kinds:
+            where, label = ["is_dir = 1", "is_excluded = 0"], "folders"
+        elif exts:
+            marks = ",".join("?" * len(exts))
+            where.append(f"lower(ext) IN ({marks})")
+            params += ["." + e for e in exts]
+            label = "/".join(EXT_NAMES.get(e, e.upper()) for e in exts) + " files"
+        elif kinds:
+            marks = ",".join("?" * len(kinds))
+            where.append(f"kind IN ({marks})")
+            params += sorted(kinds)
+            label = " and ".join(sorted(KIND_LABELS.get(k, k) for k in kinds))
+        # A place only after "in / inside / from" ("how many files in downloads"), or
+        # before "mein"; "my videos" is the kind, not the Videos folder.
+        place = next((t for i, t in enumerate(toks) if t in STANDARD_FOLDERS and (
+            (i > 0 and toks[i - 1] in {"in", "inside", "from", "under"})
+            or (i + 1 < len(toks) and toks[i + 1] in {"mein", "me"}))), None)  # fmt: skip
+        if place is not None:
+            folder = self._place(place)
+            if folder is None:
+                return Reply(f"I don't have a {place.capitalize()} folder indexed.", "none", [],
+                             intent)  # fmt: skip
+            prefix = str(folder).rstrip("/\\") + os.sep
+            where.append("path >= ? AND path < ?")
+            params += [prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)]
+        tr = parse_time(q).range
+        if tr is not None:
+            where.append("mtime >= ? AND mtime < ?")
+            params += [tr.start, tr.end]
+        sql = " AND ".join(where)
+        n, size = self.conn.execute(
+            f"SELECT count(*), coalesce(sum(size), 0) FROM files WHERE {sql}", params
+        ).fetchone()
+        scope = (f" in {place.capitalize()}" if place else "") + (
+            f" changed {tr.label}" if tr is not None else "")  # fmt: skip
+        wants_size = any(t in {"space", "storage", "size", "big", "gb", "mb", "much"}
+                         for t in toks) and "many" not in toks  # fmt: skip
+        if wants_size and label != "folders":
+            say = f"Your {label}{scope} take {planner.human(size)} ({_count(n, 'file')})."
+        else:
+            total = f", {planner.human(size)} in total." if label != "folders" and n else "."
+            say = f"You have {n:,} {label}{scope}{total}"
+        detail = ""
+        if label == "files" and n and tr is None:
+            rows = self.conn.execute(
+                f"SELECT kind, count(*), sum(size) FROM files WHERE {sql} GROUP BY kind"
+                " ORDER BY count(*) DESC", params,
+            ).fetchall()  # fmt: skip
+            detail = "\n".join(
+                f"{KIND_LABELS.get(k, k).capitalize():12} {c:>8,}   {planner.human(sz or 0)}"
+                for k, c, sz in rows
+            )
+        self.context.set_results([], q, "none")
+        return Reply(say, "none", [], intent, detail=detail)
 
     # -- creating files / folders, dictation ---------------------------------------------
     def _embed(self) -> creator.Embed | None:
