@@ -264,7 +264,8 @@ def test_installed_software_is_never_touched(store: FileStore, home: Path) -> No
     scan(store)
     plan = planner.clean_plan(store.conn, store.config)
     assert not any(str(app) in i.src for i in plan.items)
-    assert planner.Guard(store.conn, store.config).software == [str(home / "Documents" / "tools")]
+    software = planner.Guard(store.conn, store.config).software
+    assert software == [os.path.normcase(str(home / "Documents" / "tools"))]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need admin rights on Windows")
@@ -327,3 +328,16 @@ def test_handler_organize_topic_or_search(
     assert not fake_platform.trashed and (home / "Desktop" / "dsa graphs.pdf").exists()
     h.reject_plan(r.plan_id)
     assert planner.load(store.conn, r.plan_id).status == "rejected"  # type: ignore[union-attr]
+
+
+def test_rules_match_regardless_of_case(
+    store: FileStore, tree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows stores folder rules normcased (lower case) while file paths keep their
+    spelling: never_touch must still match (seen on Windows CI)."""
+    monkeypatch.setattr(planner, "_nc", lambda p: p.lower())
+    store.conn.execute("UPDATE folder_rules SET path = lower(path)")
+    plan = planner.clean_plan(store.conn, store.config, categories=["duplicate"])
+    srcs = {os.path.relpath(i.src, tree) for i in plan.items}
+    assert not any(s.startswith("Keep") for s in srcs)
+    assert os.path.join("Documents", "report.pdf") not in srcs  # the original is kept

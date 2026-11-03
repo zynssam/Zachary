@@ -206,34 +206,41 @@ def set_status(conn: sqlite3.Connection, plan: Plan, status: str) -> None:
 
 
 # -- shared checks -------------------------------------------------------------------------
+def _nc(path: str) -> str:
+    """Comparable form of a path: case-folded on Windows (folder rules are stored
+    normcased there, file paths keep their on-disk spelling), unchanged elsewhere."""
+    return os.path.normcase(path)
+
+
 class Guard:
     """Where Zachary may propose changes at all."""
 
     def __init__(self, conn: sqlite3.Connection, config: Config) -> None:
         self.config = config
-        self.roots = [str(r) for r in config.index_roots()]
+        self.roots = [_nc(str(r)) for r in config.index_roots()]
         self.rules = config.path_rules()
         self.never = [
-            r[0] for r in conn.execute("SELECT path FROM folder_rules WHERE rule = 'never_touch'")
+            _nc(r[0])
+            for r in conn.execute("SELECT path FROM folder_rules WHERE rule = 'never_touch'")
         ]
         self.projects = [
-            r[0]
+            _nc(r[0])
             for r in conn.execute(
                 "SELECT f.path FROM projects p JOIN files f ON f.id = p.folder_id"
             )
         ]
         # Standard folders (Documents, Downloads...) under the home folder and under
         # every index root (another drive can have its own Documents).
-        bases = [os.path.expanduser("~"), *self.roots]
+        bases = [_nc(os.path.expanduser("~")), *self.roots]
         self.standard = {
-            os.path.join(b.rstrip("/\\"), name)
+            _nc(os.path.join(b.rstrip("/\\"), name))
             for b in bases
             for n in STANDARD_FOLDERS
             for name in (n, n.capitalize())
         }
         self._blocked: set[str] | None = None
         self._landmarks = {r.rstrip("/\\") for r in self.roots} | self.standard
-        self._landmarks.add(os.path.expanduser("~"))
+        self._landmarks.add(_nc(os.path.expanduser("~")))
         self.software = self._software_folders(conn)
 
     def _software_folders(self, conn: sqlite3.Connection) -> list[str]:
@@ -241,6 +248,7 @@ class Guard:
         for (path,) in conn.execute(
             "SELECT path FROM files WHERE is_dir = 0 AND (kind = 'binary' OR name LIKE '%.so.%')"
         ):
+            path = _nc(path)
             if not _SHARED_LIB.search(path) and not path.lower().endswith(
                 (".jar", ".dll", ".so", ".dylib", ".class", ".pyd", ".bin", ".exe", ".war")
             ):
@@ -266,8 +274,9 @@ class Guard:
 
     @staticmethod
     def _under(path: str, folders: Iterable[str]) -> bool:
+        path = _nc(path)
         for f in folders:
-            f = f.rstrip("/\\")
+            f = _nc(f).rstrip("/\\")
             if path == f or path.startswith(f + "/") or path.startswith(f + "\\"):
                 return True
         return False
@@ -278,6 +287,7 @@ class Guard:
         return self._blocked
 
     def _root_of(self, path: str) -> str | None:
+        path = _nc(path)
         best = None
         for r in self.roots:
             r = r.rstrip("/\\")
@@ -291,6 +301,8 @@ class Guard:
         """never_touch, a project, installed software, hidden, excluded, or not under an
         index root. ``junk``: temp/lock files are excluded from the index by design; for
         them only the folder they're in must be allowed (not hidden/excluded itself)."""
+        original = path
+        path = _nc(path)
         root = self._root_of(path)
         if root is None:
             return True
@@ -310,13 +322,13 @@ class Guard:
         if any(p.startswith(".") for p in (rel[:-1] if junk else rel)):
             return True
         if junk:
-            parent = os.path.dirname(path)
+            parent = os.path.dirname(original)
             return self.rules.is_excluded(parent, True) and not self.is_landmark(parent)
-        return self.rules.is_excluded(path, False)
+        return self.rules.is_excluded(original, False)
 
     def is_landmark(self, path: str) -> bool:
         """An index root or a standard user folder: never removed, even when empty."""
-        p = path.rstrip("/\\")
+        p = _nc(path).rstrip("/\\")
         return p in {r.rstrip("/\\") for r in self.roots} or p in self.standard
 
 
@@ -448,7 +460,7 @@ def _keep(conn: sqlite3.Connection, rows: list[_Row]) -> tuple[_Row, list[_Row]]
     downloads = _downloads()
 
     def rank(r: _Row) -> tuple[int, int, float, float, int]:
-        in_dl = int(r.path.startswith(downloads + os.sep))
+        in_dl = int(_nc(r.path).startswith(_nc(downloads) + os.sep))
         copy = int(bool(COPY_NAME.search(Path(r.name).stem)))
         return (in_dl, copy, -used.get(r.id, 0.0), min(r.ctime, r.mtime), len(r.path))
 
@@ -480,7 +492,8 @@ def find_junk(conn: sqlite3.Connection, guard: Guard, now: float, scope: str | N
     where, params = _scope_sql(scope)
     dirs = [r[0] for r in conn.execute(f"SELECT path FROM files WHERE is_dir = 1 {where}",
                                        params)]  # fmt: skip
-    dirs += [r for r in guard.roots if not scope or Guard._under(r, [scope])]
+    roots = [str(r) for r in guard.config.index_roots()]  # on-disk spelling, not normcased
+    dirs += [r for r in roots if not scope or Guard._under(r, [scope])]
     cutoff = now - JUNK_MIN_AGE_DAYS * 86400
     out: list[_Row] = []
     seen: set[str] = set()
