@@ -17,6 +17,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from zachary.actions.safe_actions import SafeActions
+from zachary.brain import llm
 from zachary.brain.handler import Handler, Reply
 from zachary.core.config import Config
 from zachary.core.db import open_db
@@ -78,7 +79,11 @@ class Engine(QObject):
         config = Config(conn, self.platform)
         factory = self.semantic_factory
         self.handler = Handler(
-            conn, SafeActions(conn, self.platform), config, lambda: factory(conn, config)
+            conn,
+            SafeActions(conn, self.platform),
+            config,
+            lambda: factory(conn, config),
+            llm.Provider(config, Path(self.db_path).parent),
         )
         _ = self.handler.semantic  # load the model now, not on the first keystroke
 

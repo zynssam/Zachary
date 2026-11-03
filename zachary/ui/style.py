@@ -24,3 +24,9 @@ BADGES: dict[str, tuple[str, str]] = {
     "session": ("S", "#14b8a6"),
     "other": ("·", "#94a3b8"),
 }
+
+# The answer panel in the quick bar (question answers and their source passage).
+ANSWER_CSS = (
+    "padding: 8px 10px; border-radius: 8px;"
+    f" background: rgba({ACCENT_RGBA[0]}, {ACCENT_RGBA[1]}, {ACCENT_RGBA[2]}, 22);"
+)

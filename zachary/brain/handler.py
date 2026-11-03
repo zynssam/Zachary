@@ -9,6 +9,7 @@ wins; otherwise the top results are shown and the user picks ("the second one").
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
@@ -17,9 +18,11 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Protocol
 
+from zachary.brain import qa
 from zachary.brain import sessions as sess
 from zachary.brain.context import Context, Item
-from zachary.brain.intents import Intent, parse
+from zachary.brain.intents import Intent, parse, tokenize
+from zachary.brain.llm import LLM, Excerpt, LLMError
 from zachary.brain.timeparse import parse_time
 from zachary.core.config import Config, PathRules
 from zachary.indexer import clustering
@@ -30,9 +33,21 @@ from zachary.search.hybrid import SearchResult, recent, search, search_terms
 from zachary.search.tokens import words
 from zachary.search.vectors import SemanticSearch
 
+log = logging.getLogger(__name__)
+
 RESULT_LIMIT = 8  # shown in the list
 ASK_LIMIT = 5  # "which one?" shows the top 3-5
 CLEAR_GAP = 0.12  # top score must beat the runner-up by 12% to act without asking
+# The LLM reads a command only when it's a sentence the parser couldn't place
+# (no command word) and the search found nothing convincing.
+ROUTE_MIN_WORDS = 4
+SENTENCE_WORDS = frozenset(
+    """
+    you could can would please the that this thing things something stuff me i my which about
+    with from up for what where how when is was it its there those these a an
+    mujhe mera meri wo woh jo kuch wala wali
+    """.split()
+)
 
 
 class Actions(Protocol):
@@ -52,6 +67,7 @@ class Reply:
     selected: int | None = None  # index to highlight
     ms: float = 0.0
     timings: dict[str, float] = field(default_factory=dict)
+    detail: str = ""  # longer on-screen text (an answer's source passage)
 
 
 def clear_winner(results: list[SearchResult] | list[Item]) -> bool:
@@ -134,6 +150,7 @@ class Handler:
         actions: Actions,
         config: Config,
         semantic: Callable[[], SemanticSearch | None] | None = None,
+        llm: Callable[[], LLM | None] | None = None,
     ) -> None:
         self.conn = conn
         self.actions = actions
@@ -144,6 +161,8 @@ class Handler:
         self._semantic_provider = semantic
         self._semantic: SemanticSearch | None = None
         self._semantic_tried = 0.0
+        self._llm_provider = llm
+        self._last_strong = False  # did the last search have a strong top match?
         self._sessions: dict[int, sess.Session] = {}  # timeline rows -> sessions
         # A proposal waiting for "yes": ("reopen", files, what). Only from submit().
         self._pending: tuple[str, list[Item], str] | None = None
@@ -222,7 +241,12 @@ class Handler:
         intent = Intent("select", ordinal=index + 1, action=action)
         return self._followup(intent, execute=True)
 
-    def _handle(self, text: str, *, execute: bool) -> Reply:
+    def llm(self) -> LLM | None:
+        """The configured LLM (None when off / no key). Asked on each use, so turning it
+        on or off in settings takes effect at once."""
+        return self._llm_provider() if self._llm_provider is not None else None
+
+    def _handle(self, text: str, *, execute: bool, routed: bool = False) -> Reply:
         t0 = time.perf_counter()
         intent = parse(text)
         if intent.kind == "related":  # before follow-ups: "related to the first one"
@@ -252,6 +276,8 @@ class Handler:
             reply = self._timeline(intent)
         elif intent.kind in {"confirm", "cancel"}:
             reply = self._answer(intent, execute=execute)
+        elif intent.kind == "ask":
+            reply = self._ask(intent, execute=execute)
         elif intent.kind == "recent":
             items = self._recent(intent.query)
             self.context.set_results(items, text, "recent")
@@ -261,8 +287,85 @@ class Handler:
             reply = Reply(say, "recent", items, intent)
         else:
             reply = self._find_or_open(intent, execute=execute)
+            if execute and not routed and self._unclear(text, intent, reply):
+                routed_reply = self._route(text)
+                if routed_reply is not None:
+                    reply = routed_reply
         reply.ms = (time.perf_counter() - t0) * 1e3
         return reply
+
+    # -- Phase 6: ask your files, and the LLM for unclear commands ----------------------
+    def _unclear(self, text: str, intent: Intent, reply: Reply) -> bool:
+        """A sentence the parser couldn't place: worth asking the LLM what it means.
+        Plain keyword searches ("dsa notes sem 5 pdf") never qualify."""
+        if intent.kind not in {"find", "open"} or intent.project_hint:
+            return False
+        toks = tokenize(text)
+        if len(toks) < ROUTE_MIN_WORDS or sum(t in SENTENCE_WORDS for t in toks) < 2:
+            return False
+        return not reply.items or not self._last_strong or intent.confidence < 0.7
+
+    def _route(self, text: str) -> Reply | None:
+        """Let the LLM turn an unclear request into one of our own commands, then run
+        that command through the normal parser (so every safety rule still applies)."""
+        llm = self.llm()
+        if llm is None:
+            return None
+        try:
+            r = llm.route(text)
+        except LLMError as e:
+            log.info("llm route failed: %s", e)
+            return None
+        t = r.text.strip()
+        command = {
+            "find": f"find {t}" if t else "",
+            "open": f"open {t}" if t else "",
+            "ask": f"ask {t}" if t else "",
+            "recent": f"recent {t}".strip(),
+            "projects": "show my projects",
+            "topics": "show my topics",
+            "resume": "resume where I left off",
+            "timeline": f"what was I working on {t}".strip(),
+        }.get(r.command, "")
+        if not command:
+            return None
+        log.info("llm read the request as: %s", r.command)
+        return self._handle(command, execute=True, routed=True)
+
+    def _ask(self, intent: Intent, *, execute: bool) -> Reply:
+        question = intent.query.strip()
+        passages = qa.retrieve(self.conn, question, semantic=self.semantic, rules=self.rules())
+        items: list[Item] = []
+        for p in passages:
+            if any(it.file_id == p.file_id for it in items):
+                continue
+            items.append(Item(p.file_id, p.path, p.name, p.kind, False, p.mtime,
+                              [f"“{p.snippet}”"], p.score))  # fmt: skip
+        self.context.set_results(items, question, "answer")
+        if not passages:
+            return Reply("I couldn't find anything about that in your files.", "answer", [],
+                         intent)  # fmt: skip
+        best = passages[0]
+        quote = f"“{best.snippet}”\n— {best.name}"
+        llm = self.llm()
+        if not execute:
+            say = "Enter to ask." if llm is not None else f"Best match: {best.name}."
+            return Reply(say, "answer", items, intent, selected=0, detail=quote)
+        if llm is None:
+            return Reply(f"Here's the best match, from {best.name}.", "answer", items, intent,
+                         selected=0, detail=quote)  # fmt: skip
+        try:
+            ans = llm.answer(question, [Excerpt(p.name, p.mtime, p.text) for p in passages])
+        except LLMError as e:
+            return Reply(f"Couldn't ask the LLM ({e}). Best match: {best.name}.", "answer",
+                         items, intent, selected=0, detail=quote)  # fmt: skip
+        src = passages[ans.sources[0]] if ans.sources else best
+        if ans.found and ans.sources:
+            # The cited file first.
+            items.sort(key=lambda it: it.file_id != src.file_id)
+        detail = f"{ans.text}\n\n“{src.snippet}”\n— {src.name}"
+        say = ans.text or f"Best match: {best.name}."
+        return Reply(say, "answer", items, intent, selected=0, detail=detail)
 
     def _find_or_open(self, intent: Intent, *, execute: bool) -> Reply:
         items: list[Item]
@@ -276,6 +379,7 @@ class Handler:
             winner = len(items) == 1
         else:
             results, note = self._search(intent.query, RESULT_LIMIT)
+            self._last_strong = bool(results) and results[0].strong
             items = [_item(r, self.conn) for r in results]
             view = "results"
             # A note (typo corrected, nothing in the time range) means we guessed: ask.
