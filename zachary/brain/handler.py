@@ -363,7 +363,7 @@ class Handler:
         if ans.found and ans.sources:
             # The cited file first.
             items.sort(key=lambda it: it.file_id != src.file_id)
-        detail = f"{ans.text}\n\n“{src.snippet}”\n— {src.name}"
+        detail = f"“{src.snippet}”\n— {src.name}"  # (the answer itself is the status line)
         say = ans.text or f"Best match: {best.name}."
         return Reply(say, "answer", items, intent, selected=0, detail=detail)
 

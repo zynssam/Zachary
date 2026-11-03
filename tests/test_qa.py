@@ -396,3 +396,22 @@ def test_billing_error_is_explained(
     model, _ = fake_llm([BadRequestError()])
     r = handler(store, sem, fake_platform, model).submit("when is my fee due?")
     assert "no Anthropic API credits" in r.say and DUE in r.detail
+
+
+def test_one_noisy_file_cannot_crowd_out_the_others(
+    store: FileStore, home: Path, db_path: Path
+) -> None:
+    build_corpus(home)
+    noisy = home / "notes" / "faq.md"
+    noisy.parent.mkdir(parents=True, exist_ok=True)
+    noisy.write_text(("When is my fee due? We test whether the fee due question works. " * 12
+                      + "\n\n") * 4)  # several chunks, all repeating the words  # fmt: skip
+    scan(store)
+    conn = open_db(db_path)
+    emb = HashEmbedder()
+    SemanticIndexer(conn, Config(conn, store.config.platform), emb).run(64)
+    vectors.build(conn)
+    sem = SemanticSearch(emb, VectorIndex(store.conn))
+    ps = qa.retrieve(store.conn, "when is my fee due", semantic=sem)
+    names = [p.name for p in ps]
+    assert "receipt_sem5.pdf" in names and names.count("faq.md") <= 1

@@ -28,7 +28,7 @@ SNIPPET_CHARS = 280
 W_MEANING, W_WORDS, W_RANK = 0.55, 0.35, 0.10
 # Questions are usually about documents ("when is my fee due?" must not answer from a
 # scheduler's "next_due" variable); code still wins when the question is about code.
-KIND_WEIGHT = {"document": 1.0, "code": 0.7}
+KIND_WEIGHT = {"document": 1.0, "code": 0.5}
 CODE_WORDS = frozenset(
     "code function class method variable bug error script program python java cpp js api".split()
 )
@@ -185,18 +185,22 @@ def retrieve(
         ) * (1.0 if code_q else KIND_WEIGHT.get(kind, 0.9))
         scored.append(Passage(fid, path, name, kind, float(mtime), cid, text, "", s))
     scored.sort(key=lambda p: -p.score)
+    # Several files before a second passage from the same file: one file that happens
+    # to repeat the question's words mustn't crowd out the others.
     out: list[Passage] = []
     per: dict[int, int] = {}
     seen: set[str] = set()
-    for p in scored:
-        if per.get(p.file_id, 0) >= PER_FILE:
-            continue
-        p.snippet = snippet(p.text, terms)  # only for the passages we keep
-        if p.snippet in seen:
-            continue
-        per[p.file_id] = per.get(p.file_id, 0) + 1
-        seen.add(p.snippet)
-        out.append(p)
-        if len(out) >= k:
-            break
+    for round_ in range(1, PER_FILE + 1):
+        for p in scored:
+            if len(out) >= k:
+                break
+            if per.get(p.file_id, 0) >= round_ or p in out:
+                continue
+            p.snippet = p.snippet or snippet(p.text, terms)  # only for passages we keep
+            if p.snippet in seen:
+                continue
+            per[p.file_id] = per.get(p.file_id, 0) + 1
+            seen.add(p.snippet)
+            out.append(p)
+    out.sort(key=lambda p: -p.score)
     return out
