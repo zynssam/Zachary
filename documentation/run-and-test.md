@@ -204,6 +204,17 @@ Bar or voice: "clean up my downloads", "find duplicates", "organize my DSA notes
 Never proposed: anything under `never_touch`, inside a code project or installed software (a folder with
 ≥ 10 libraries/binaries, e.g. a JDK), hidden, symlinks / hard links, or Documents / Downloads / … themselves.
 
+### 3.7 Apps, creating files, dictation (after Phase 7)
+```bash
+python -m zachary.cli apps                 # installed apps Zachary can open
+python -m zachary.cli apps spotify         # what a name matches
+```
+Bar or voice:
+- "open spotify", "spotify kholo", "open zachary in vscode", "zachary ko vscode mein kholo"
+- "make a document I'll dictate" → talk (pause = next piece; "new paragraph", "scratch that") → "stop dictation": saved in `Documents/Zachary/<topic>/` and opened
+- "create a text file and paste what I copied", "create a folder called Hackathon Ideas in downloads"
+- "undo" → "yes" removes what was just created (unless you edited it)
+
 ## 4. Automated checks
 
 Run all of these before committing (they are what CI runs):
@@ -250,6 +261,7 @@ QT_QPA_PLATFORM=wayland pytest tests/test_ui.py   # UI tests on the real display
 | `test_extract`, `test_semantic`, `test_vectors`, `test_versions`, `test_relations`, `test_semantic_search`, `test_inotify_tree` | Phase 3: extraction, embeddings, vector index, versions, related files, meaning search, exclude-aware watcher |
 | `test_voice` | Phase 4: voice (Gnani mocked) |
 | `test_topics` | Phase 5: topics, sessions, resume, timeline, learning |
+| `test_apps`, `test_create` | after Phase 7: apps and open-with, creating files/folders, sorting, dictation, undo |
 | `test_clean` | Phase 7: duplicate detection, protections, nothing changes without approval, execute + undo restores every file (fake trash), the real OS trash, organize |
 | `test_qa` | Phase 6: passages, answers with citations, LLM off/failing, unclear-command routing, what is sent (Claude mocked; the real API host is blocked in tests) |
 

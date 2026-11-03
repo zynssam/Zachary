@@ -1185,3 +1185,60 @@ def test_segments_join_in_gnani_order_not_arrival_order() -> None:
                {"text": "please"}]  # fmt: skip
     parts = [(segment_key(m, i), str(m["text"])) for i, m in enumerate(arrived)]
     assert join_segments(parts) == "open the fees document I opened yesterday please"
+
+
+def test_voice_dictation_rearms_until_stop(
+    qtbot: object, gnani: MockGnani, store: FileStore, home: Path, db_path: Path,
+    fake_platform: FakePlatform, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """ "make a document I'll dictate" -> the mic re-opens by itself after each piece ->
+    "stop dictation" -> the document is written, then opened."""
+    from zachary.actions import creator
+    from zachary.ui import voice as voice_mod
+    from zachary.ui.engine import Engine
+    from zachary.ui.quickbar import QuickBar
+    from zachary.ui.voice import VoiceController
+    from zachary.voice.audio import Player
+    from zachary.voice.factory import VoiceKit
+
+    base = home / "Documents" / "Zachary"
+    monkeypatch.setattr(creator, "base_folder", lambda: base)
+    monkeypatch.setattr(voice_mod, "DICTATION_PAUSE_MS", 500)
+    engine = Engine(db_path, fake_platform, semantic_factory=lambda _c, _cfg: None)
+    engine.start()
+    bar = QuickBar(engine)
+    kit = VoiceKit(
+        rest_stt=GnaniRestSTT(KEY, url=gnani.stt_url),
+        stream_stt=lambda: GnaniStreamingSTT(KEY, url=gnani.stt_ws),
+        offline_stt=FakeOffline(), spotter=FakeSpotter(),  # type: ignore[arg-type]
+        tts=GnaniWsTTS(KEY, url=gnani.tts_ws), ledger=UsageLedger(None), has_key=True,
+    )  # fmt: skip
+    out = FakeOut()
+    voice = VoiceController(engine, bar, kit, wake_word=False, latency_path=tmp_path / "l.jsonl",
+                            player=Player(open_stream=out.open))  # fmt: skip
+    records: list[dict[str, object]] = []
+    voice.spoken.connect(records.append)
+    src = CountingSource()
+    voice.start(src)
+    try:
+        gnani.transcript = "make a document I'll dictate"
+        voice.push_to_talk()
+        src.load(speech(0.8) + silence(0.8))
+        qtbot.waitUntil(lambda: voice.dictating and len(records) == 1, timeout=15000)  # type: ignore[attr-defined]
+        # Nobody presses anything from here: the mic re-opens by itself.
+        qtbot.waitUntil(lambda: src.starts == 2, timeout=5000)  # type: ignore[attr-defined]
+        gnani.transcript = "the demo is on friday"
+        src.load(speech(0.8) + silence(1.0))
+        qtbot.waitUntil(lambda: len(records) == 2 and src.starts == 3, timeout=15000)  # type: ignore[attr-defined]
+        assert not list(base.rglob("*.docx")) and not fake_platform.opened
+        gnani.transcript = "stop dictation"
+        src.load(speech(0.8) + silence(1.0))
+        qtbot.waitUntil(lambda: bool(fake_platform.opened), timeout=15000)  # type: ignore[attr-defined]
+    finally:
+        voice.stop()
+        engine.stop()
+    (made,) = list(base.rglob("*.docx"))
+    assert fake_platform.opened == [made] and not voice.dictating
+    import docx
+
+    assert [p.text for p in docx.Document(str(made)).paragraphs] == ["The demo is on friday."]

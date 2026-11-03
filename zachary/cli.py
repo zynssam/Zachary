@@ -610,6 +610,27 @@ def cmd_rules(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_apps(args: argparse.Namespace) -> int:
+    """Installed apps Zachary can open ("open spotify"), or what a name matches."""
+    from zachary.core.platform import apps, get_platform
+
+    found = get_platform().list_apps()
+    if args.name:
+        name = " ".join(args.name)
+        m = apps.find_app(name, found)
+        if m is None or m[1] < 0.75:
+            print(f"no installed app matches “{name}”")
+            return 1
+        a, score = m
+        files = "can open files" if a.accepts_files else "doesn't open files"
+        print(f"“{name}” -> {a.name}  ({a.id}, match {score:.2f}, {files})")
+        return 0
+    for a in sorted(found, key=lambda x: x.name.lower()):
+        print(f"  {a.name:40} {a.id}")
+    print(f"{len(found)} apps")
+    return 0
+
+
 def cmd_topics(args: argparse.Namespace) -> int:
     """List topics (virtual collections); --rebuild clusters now instead of overnight."""
     from zachary.indexer import clustering
@@ -796,6 +817,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--rebuild", action="store_true", help="cluster now (otherwise nightly)")
     s.add_argument("--limit", type=int, default=50)
     s.set_defaults(fn=cmd_topics)
+
+    s = sub.add_parser("apps", help="installed apps Zachary can open | apps NAME")
+    s.add_argument("name", nargs="*")
+    s.set_defaults(fn=cmd_apps)
 
     s = sub.add_parser("clean", help="plan a clean-up (nothing changes), e.g. clean downloads")
     s.add_argument("what", nargs="*", help="duplicates | installers | junk | empty | large; "
