@@ -108,3 +108,15 @@ class SafeActions:
             return False
         self._log(item)
         return True
+
+    def open_created(self, path: Path) -> bool:
+        """Open a file/folder Zachary just created (not indexed yet): only paths in the
+        creation log are accepted."""
+        row = self.conn.execute(
+            "SELECT 1 FROM undo_log WHERE op IN ('create', 'mkdir') AND src = ? LIMIT 1",
+            (str(path),),
+        ).fetchone()
+        if row is None or not os.path.exists(path):
+            return False
+        self.platform.open_path(path)
+        return True

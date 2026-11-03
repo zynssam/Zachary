@@ -3,6 +3,7 @@
 * ``move`` src -> dst: move dst back to src (never over an existing file).
 * ``trash`` src (dst = place in the OS trash): restore it from the trash.
 * ``mkdir`` d: remove the folder again if it's empty.
+* ``create`` f (a file Zachary made): to the trash, if it wasn't edited since.
 
 Each step is independent: one that can't be undone (e.g. the trash was emptied) is
 reported and the rest still run. The plan becomes ``undone`` when everything was.
@@ -10,11 +11,13 @@ reported and the rest still run. The plan becomes ``undone`` when everything was
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from zachary.actions import planner
 from zachary.actions.planner import Plan
@@ -53,6 +56,15 @@ def undo(conn: sqlite3.Connection, platform: Platform, plan: Plan) -> UndoResult
                 shutil.move(dst, src)
             elif op == "trash":
                 platform.restore(dst or "", src)
+            elif op == "create":
+                # A file Zachary created: back to the trash, unless it was edited since.
+                if not os.path.lexists(src):
+                    continue  # already gone
+                snap = json.loads(dst or "{}")
+                st = os.stat(src)
+                if st.st_size != snap.get("size") or abs(st.st_mtime - snap.get("mtime", 0)) > 2:
+                    raise OSError("it was edited after it was created; left in place")
+                platform.trash(Path(src))
             elif op == "mkdir":
                 if os.path.isdir(src) and not os.listdir(src):
                     os.rmdir(src)

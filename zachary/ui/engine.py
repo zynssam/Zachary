@@ -8,7 +8,9 @@ text arrived while one was queued, the stale one is skipped.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -19,6 +21,7 @@ from PySide6.QtCore import QObject, QThread, Signal, Slot
 from zachary.actions.safe_actions import SafeActions
 from zachary.brain import llm
 from zachary.brain.handler import Handler, Reply
+from zachary.brain.intents import needs_clipboard
 from zachary.core.config import Config
 from zachary.core.db import open_db
 from zachary.core.platform import Platform
@@ -66,6 +69,9 @@ class Engine(QObject):
         """Queue a request; returns its id.
 
         ``op``: preview | submit | act | pause | approve | reject | undo_plan."""
+        if op == "submit" and isinstance(payload, str) and needs_clipboard(payload):
+            # Read on the UI thread (Qt's clipboard lives there), and only when asked to.
+            payload = (payload, clipboard_text())
         with self._lock:
             self._next_id += 1
             rid = self._next_id
@@ -105,7 +111,10 @@ class Engine(QObject):
             if op == "preview":
                 reply = h.preview(str(payload))
             elif op == "submit":
-                reply = h.submit(str(payload))
+                if isinstance(payload, tuple):
+                    reply = h.submit(str(payload[0]), clipboard=payload[1])
+                else:
+                    reply = h.submit(str(payload))
             elif op == "act":
                 index, action = payload
                 if action == "related":
@@ -130,3 +139,29 @@ class Engine(QObject):
             self.failed.emit(rid, f"{type(e).__name__}: {e}")
             return
         self.replied.emit(rid, reply)
+
+
+def clipboard_text() -> str:
+    """Text last copied: Qt's clipboard, else ``wl-paste`` (Wayland only lets a focused
+    window read the clipboard; the bar may be hidden when you speak)."""
+    text = ""
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        cb = QGuiApplication.clipboard()
+        text = cb.text() if cb is not None else ""
+    except Exception:
+        log.debug("Qt clipboard unavailable", exc_info=True)
+    if not text and sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY"):
+        import shutil
+        import subprocess
+
+        exe = shutil.which("wl-paste")
+        if exe:
+            try:
+                r = subprocess.run([exe, "--no-newline", "--type", "text/plain"],
+                                   capture_output=True, timeout=2)  # fmt: skip
+                text = r.stdout.decode("utf-8", errors="replace") if r.returncode == 0 else ""
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return text

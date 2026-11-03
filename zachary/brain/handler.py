@@ -11,19 +11,31 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Protocol
 
-from zachary.actions import executor, planner
+from zachary.actions import creator, executor, planner
 from zachary.actions import undo as undo_mod
 from zachary.brain import qa
 from zachary.brain import sessions as sess
 from zachary.brain.context import Context, Item
-from zachary.brain.intents import Intent, parse, tokenize
+from zachary.brain.intents import (
+    CANCEL_DICTATION,
+    NEW_PARAGRAPH,
+    SCRATCH_THAT,
+    STOP_DICTATION,
+    CreateSpec,
+    Intent,
+    parse,
+    parse_create,
+    tokenize,
+)
 from zachary.brain.llm import LLM, Excerpt, LLMError
 from zachary.brain.timeparse import parse_time
 from zachary.core.config import Config, PathRules
@@ -78,6 +90,8 @@ class Actions(Protocol):
 
     def open_with(self, app_id: str, item: Item) -> bool: ...
 
+    def open_created(self, path: Path) -> bool: ...
+
 
 @dataclass(slots=True)
 class Reply:
@@ -93,6 +107,7 @@ class Reply:
     detail: str = ""  # longer on-screen text (an answer's source passage)
     plan_id: int = 0  # a clean/organize plan to review (the UI opens the review window)
     plan: planner.Plan | None = None  # ...and the plan itself (no DB reads on the UI thread)
+    dictating: bool = False  # dictation mode is on (the UI keeps listening)
 
 
 def clear_winner(results: list[SearchResult] | list[Item]) -> bool:
@@ -158,6 +173,50 @@ def _item(r: SearchResult, conn: sqlite3.Connection | None = None) -> Item:
     return it
 
 
+_PARA_SPLIT = re.compile(NEW_PARAGRAPH.pattern, re.IGNORECASE)
+
+
+@dataclass(slots=True)
+class Dictation:
+    """A document being dictated: pieces of speech/typing, paragraphs on request."""
+
+    spec: CreateSpec
+    folder: Path | None
+    parts: list[str]
+    started: float
+
+    def add(self, text: str) -> None:
+        """Append speech/typing; "new paragraph" / "next line" starts a new paragraph."""
+        for i, piece in enumerate(_PARA_SPLIT.split(text)):
+            if i > 0:
+                self.parts.append("\n")
+            piece = piece.strip(" ,")
+            if piece:
+                # Speech comes in sentence-sized pieces, often without punctuation.
+                piece = piece[0].upper() + piece[1:]
+                if piece[-1] not in ".!?:;\"')":
+                    piece += "."
+                self.parts.append(piece)
+
+    def text(self) -> str:
+        out: list[str] = []
+        para: list[str] = []
+        for p in self.parts:
+            if p == "\n":
+                if para:
+                    out.append(" ".join(para))
+                    para = []
+            else:
+                para.append(p)
+        if para:
+            out.append(" ".join(para))
+        return "\n\n".join(out)
+
+    def tail(self, n: int = 600) -> str:
+        t = self.text()
+        return ("…" + t[-n:]) if len(t) > n else t
+
+
 def _inside(path: str, folder: str) -> bool:
     f = folder.rstrip("/\\")
     return path.startswith(f + "/") or path.startswith(f + "\\")
@@ -197,6 +256,8 @@ class Handler:
         self._llm_provider = llm
         self._last_strong = False  # did the last search have a strong top match?
         self._open_with: App | None = None  # "which one?" for "open X in <app>"
+        self._clipboard: str | None = None
+        self.dictation: Dictation | None = None
         self._sessions: dict[int, sess.Session] = {}  # timeline rows -> sessions
         # A proposal waiting for "yes": ("reopen", files, what). Only from submit().
         self._pending: tuple[str, list[Item], str] | None = None
@@ -266,9 +327,14 @@ class Handler:
         """As-you-type: show what would happen. Never opens anything."""
         return self._handle(text, execute=False)
 
-    def submit(self, text: str) -> Reply:
-        """Enter / voice: may run a safe action per the confidence rule."""
-        return self._handle(text, execute=True)
+    def submit(self, text: str, clipboard: str | None = None) -> Reply:
+        """Enter / voice: may run a safe action per the confidence rule. ``clipboard``:
+        what was copied, captured by the UI only when the request asks to paste."""
+        self._clipboard = clipboard
+        try:
+            return self._handle(text, execute=True)
+        finally:
+            self._clipboard = None
 
     def act(self, index: int, action: str) -> Reply:
         """A click / keyboard choice on a shown item."""
@@ -282,6 +348,10 @@ class Handler:
 
     def _handle(self, text: str, *, execute: bool, routed: bool = False) -> Reply:
         t0 = time.perf_counter()
+        if self.dictation is not None:
+            reply = self._dictation_input(text, execute=execute)
+            reply.ms = (time.perf_counter() - t0) * 1e3
+            return reply
         intent = parse(text)
         if intent.kind == "related":  # before follow-ups: "related to the first one"
             reply = self._related(intent)
@@ -314,6 +384,10 @@ class Handler:
             reply = self._ask(intent, execute=execute)
         elif intent.kind == "explain":
             reply = self._explain(intent, execute=execute)
+        elif intent.kind == "create":
+            reply = self._create(intent, execute=execute)
+        elif intent.kind == "dictate":
+            reply = self._start_dictation(intent, execute=execute)
         elif intent.kind == "clean":
             reply = self._clean(intent, execute=execute)
         elif intent.kind == "organize":
@@ -781,6 +855,137 @@ class Handler:
         self.context.set_results(shown, intent.target, "results")
         return Reply(f"Which one should I open in {app.name}?", "results", shown, intent,
                      selected=0)  # fmt: skip
+
+    # -- creating files / folders, dictation ---------------------------------------------
+    def _embed(self) -> creator.Embed | None:
+        sem = self.semantic
+        return sem.embedder.encode if sem is not None else None
+
+    def _namer(self) -> creator.NameFolder | None:
+        llm = self.llm()
+        return llm.name_folder if llm is not None else None
+
+    def _place(self, place: str) -> Path | None:
+        """ "downloads" / "the zachary project" / "hackathon folder" -> an existing folder."""
+        w = [x for x in words(place) if x not in {"my", "the", "folder", "directory"}]
+        if not w:
+            return None
+        if len(w) == 1 and w[0] in STANDARD_FOLDERS:
+            bases = [*self.config.index_roots(), Path(os.path.expanduser("~"))]
+            for b in bases:
+                for cand in (b / w[0].capitalize(), b / w[0]):
+                    if cand.is_dir():
+                        return cand
+            return None
+        name = [x for x in w if x not in PROJECT_WORDS_]
+        for p in self._projects():
+            pw = words(p.name)
+            if name and all(any(n.startswith(x) for n in pw) for x in name):
+                return Path(p.path)
+        results, _ = self._search(" ".join(name or w), RESULT_LIMIT)
+        for r in results:
+            if r.is_dir and all(any(n.startswith(x) for n in words(r.name)) for x in name or w):
+                return Path(r.path)
+        return None
+
+    def _where(self, folder: Path) -> str:
+        return planner._short(str(folder))
+
+    def _create(self, intent: Intent, *, execute: bool) -> Reply:
+        spec = parse_create(intent.query)
+        folder = self._place(spec.place) if spec.place else None
+        if spec.place and folder is None:
+            return Reply(f"I couldn't find a folder “{spec.place}”.", "none", [], intent)
+        where = self._where(folder) if folder else "Documents/Zachary"
+        what = "folder" if spec.what == "folder" else f".{spec.fmt} file"
+        if not execute:
+            src = " with what you copied" if spec.paste else ""
+            return Reply(f"Enter to create a {what}{src} in {where}.", "none", [], intent)
+        if spec.what == "folder":
+            made = creator.create_folder(self.conn, spec.name or "New folder", folder)
+            self.actions.open_created(made.path)
+            return Reply(f"Created the folder {made.path.name} in {self._where(made.path.parent)}."
+                         " Say “undo” to remove it.", "none", [], intent)  # fmt: skip
+        content = spec.content
+        if spec.paste:
+            content = (self._clipboard or "").strip()
+            if not content:
+                return Reply("Your clipboard is empty (or has no text).", "none", [], intent)
+        return self._write_and_open(spec, content, folder, intent)
+
+    def _write_and_open(self, spec: CreateSpec, content: str, folder: Path | None,
+                        intent: Intent) -> Reply:  # fmt: skip
+        try:
+            made = creator.create_file(self.conn, content, fmt=spec.fmt, name=spec.name or None,
+                                       folder=folder, embed=self._embed(),
+                                       name_folder=self._namer())  # fmt: skip
+        except OSError as e:
+            return Reply(f"Couldn't create the file ({e.strerror or e}).", "none", [], intent)
+        opened = self.actions.open_created(made.path)  # only now that it's written
+        kind = {"new": " (a new folder)", "existing": ""}.get(made.sorted_into, "")
+        say = (f"Created {made.path.name} in {self._where(made.folder)}{kind}"
+               + (" and opened it." if opened else "."))  # fmt: skip
+        item = Item(0, str(made.path), made.path.name, "document", False, time.time(),
+                    [f"in {self._where(made.folder)}"])  # fmt: skip
+        return Reply(say + " Say “undo” to remove it.", "none", [item], intent,
+                     detail=content[:600])  # fmt: skip
+
+    def _start_dictation(self, intent: Intent, *, execute: bool) -> Reply:
+        spec = parse_create(intent.query)
+        folder = self._place(spec.place) if spec.place else None
+        if not execute:
+            return Reply("Enter to start dictation.", "none", [], intent)
+        self.dictation = Dictation(spec, folder, [], time.time())
+        self._save_draft()
+        fmt = spec.fmt.upper() if spec.fmt != "docx" else "Word"
+        return Reply(f"Dictating a {fmt} document. Talk; say “new paragraph” for a break and "
+                     "“stop dictation” when you're done.", "dictation", [], intent,
+                     dictating=True)  # fmt: skip
+
+    def _draft_path(self) -> Path:
+        db = self.conn.execute("PRAGMA database_list").fetchone()[2]
+        return Path(db).parent / "dictation-draft.txt" if db else Path("dictation-draft.txt")
+
+    def _save_draft(self) -> None:
+        d = self.dictation
+        try:
+            if d is None:
+                self._draft_path().unlink(missing_ok=True)
+            else:
+                self._draft_path().write_text(d.text(), encoding="utf-8")
+        except OSError:
+            log.debug("could not save the dictation draft", exc_info=True)
+
+    def _dictation_input(self, text: str, *, execute: bool) -> Reply:
+        d = self.dictation
+        assert d is not None
+        intent = Intent("dictate", query=text)
+        if not execute:
+            return Reply("Dictating… Enter adds this. Say “stop dictation” to finish.",
+                         "dictation", [], intent, detail=d.tail(), dictating=True)  # fmt: skip
+        if CANCEL_DICTATION.search(text):
+            self.dictation = None
+            self._save_draft()
+            return Reply("Dictation cancelled; nothing was saved.", "none", [], intent)
+        stop = STOP_DICTATION.search(text)
+        body = text[: stop.start()] if stop else text
+        if SCRATCH_THAT.match(body):
+            if d.parts:
+                d.parts.pop()
+            self._save_draft()
+            return Reply("", "dictation", [], intent, detail=d.tail(), dictating=True)
+        d.add(body)
+        self._save_draft()
+        if not stop:
+            return Reply("", "dictation", [], intent, detail=d.tail(), dictating=True)
+        self.dictation = None
+        content = d.text()
+        if not content.strip():
+            self._save_draft()
+            return Reply("Nothing was dictated, so no document was made.", "none", [], intent)
+        reply = self._write_and_open(d.spec, content, d.folder, intent)
+        self._save_draft()  # (removes the draft)
+        return reply
 
     # -- Phase 7: clean / organize / undo (plans only; files change after approval) -------
     def _plan_reply(self, plan: planner.Plan, intent: Intent) -> Reply:

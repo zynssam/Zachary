@@ -290,7 +290,13 @@ class QuickBar(QWidget):
         self._last_applied = rid
         if reply.plan is not None and reply.plan.status == "proposed" and reply.plan.items:
             self._review().show_plan(reply.plan)
-        self.status.setText(reply.say)
+        if reply.dictating and reply.intent.kind == "dictate" and not reply.say:
+            self.edit.blockSignals(True)  # a dictated line was added: clear the box
+            self.edit.clear()
+            self.edit.blockSignals(False)
+            self.status.setText("Dictating… say “stop dictation” when you're done.")
+        else:
+            self.status.setText(reply.say)
         self.answer.setText(reply.detail)
         self.answer.setVisible(bool(reply.detail))
         self.list.set_items(reply.items, reply.selected)

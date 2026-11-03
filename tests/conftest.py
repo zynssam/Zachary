@@ -44,6 +44,16 @@ def _no_real_apis(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("zachary.brain.llm.get_secret", lambda *_a, **_k: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+                  ) -> None:  # fmt: skip
+    """Tests never write into the real home folder (Downloads, Documents/Zachary, ...):
+    ``~`` is a fresh temporary folder for every test."""
+    fake = tmp_path_factory.mktemp("fakehome")
+    monkeypatch.setenv("HOME", str(fake))
+    monkeypatch.setenv("USERPROFILE", str(fake))
+
+
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     return tmp_path / "data" / "zachary.db"

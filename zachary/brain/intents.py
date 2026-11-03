@@ -111,6 +111,94 @@ PLAN_FILLER = frozenset(
     this it cleanup changes change find show remove delete trash hatao hata nikalo bin
     """.split()
 )
+# Creating files/folders and dictation (new files only; never changes existing ones).
+CREATE_VERBS = frozenset("create make new start banao bana banana write".split())
+CREATE_THINGS = frozenset(
+    """
+    file document doc docx note notes folder directory txt textfile notepad markdown md word
+    """.split()
+)
+PASTE_WORDS = frozenset("paste pasted copied clipboard copy".split())
+DICTATE_WORDS = frozenset("dictate dictation dictating likh likho".split())
+# "take notes", "note down what I say", "write what I say"
+_DICTATE_PHRASES = ("take notes", "note down", "write what i say", "type what i say",
+                    "write down what i say", "i'll speak", "i will speak")  # fmt: skip
+STOP_DICTATION = re.compile(
+    r"\b(stop|end|finish|done|close)\s+(the\s+)?(dictation|dictating)\b|\bdone dictating\b"
+    r"|\bdictation (band|khatam|stop)\b",
+    re.IGNORECASE,
+)
+CANCEL_DICTATION = re.compile(r"\b(cancel|discard|abort)\s+(the\s+)?dictation\b", re.I)
+NEW_PARAGRAPH = re.compile(r"\b(?:new|next)\s+(?:paragraph|line)\b[.,!]?", re.IGNORECASE)
+SCRATCH_THAT = re.compile(r"^\s*(scratch that|delete that|undo that)[.!]?\s*$", re.I)
+
+
+@dataclass(frozen=True, slots=True)
+class CreateSpec:
+    what: str  # file | folder
+    fmt: str  # docx | txt | md
+    name: str  # as said ("Hackathon Ideas"), "" = from the content
+    place: str  # "downloads" / "the zachary project" / "" (= sorted into Documents/Zachary)
+    paste: bool  # content = what was copied last
+    dictate: bool  # content = what you say next, until "stop dictation"
+    content: str  # "... saying hello world"
+
+
+_NAME_RE = re.compile(
+    r"\b(?:called|named|titled|name it|naam)\s+[\"“']?(.+?)[\"”']?"
+    r"(?=\s+(?:in|inside|into|on|at|with|and|containing|saying|that says|mein)\b|[.,!?]?$)",
+    re.IGNORECASE,
+)
+_CONTENT_RE = re.compile(
+    r"\b(?:saying|that says|containing|with the text|with text|which says)\s+(.+)$",
+    re.IGNORECASE,
+)
+_PLACE_RE = re.compile(
+    r"\b(?:in|inside|into|on)\s+(?:my\s+|the\s+)?([\w .'-]+?)(?:\s+(?:folder|directory))?"
+    r"(?=\s+(?:and|with|called|named|containing|saying)\b|[.,!?]?$)",
+    re.IGNORECASE,
+)
+
+
+def parse_create(text: str) -> CreateSpec:
+    """Details of "create a text file called todo in downloads and paste what I copied"."""
+    low = text.lower()
+    toks = tokenize(text)
+    what = "folder" if any(t in {"folder", "directory"} for t in toks) and not any(
+        t in {"file", "document", "doc", "note", "txt", "docx", "markdown"} for t in toks
+    ) else "file"  # fmt: skip
+    fmt = "docx"
+    if "text file" in low or any(t in {"txt", "textfile", "notepad", "plain"} for t in toks):
+        fmt = "txt"
+    elif any(t in {"markdown", "md"} for t in toks):
+        fmt = "md"
+    m = _NAME_RE.search(text)
+    name = m.group(1).strip() if m else ""
+    c = _CONTENT_RE.search(text)
+    content = c.group(1).strip() if c and not name.endswith(c.group(1)) else ""
+    place = ""
+    for pm in _PLACE_RE.finditer(text):
+        cand = pm.group(1).strip()
+        low_c = cand.lower()
+        if low_c not in {"it", "that", "this", "there"} and not low_c.startswith(
+            ("a ", "an ", "new ", "the new ")
+        ):
+            place = cand  # the last "in X" wins ("... called notes in downloads")
+    if name and place and place in name:
+        place = ""
+    dictate = any(t in DICTATE_WORDS for t in toks) or any(p in low for p in _DICTATE_PHRASES)
+    paste = any(t in PASTE_WORDS for t in toks)
+    return CreateSpec(what, fmt, name, place, paste, dictate, content)
+
+
+def needs_clipboard(text: str) -> bool:
+    """True when this request uses what was copied (read only then)."""
+    toks = tokenize(text)
+    return any(t in PASTE_WORDS for t in toks) and (
+        any(t in CREATE_VERBS for t in toks) or any(t in CREATE_THINGS for t in toks)
+    )
+
+
 # "explain the last project I was working on", "summarize my dsa notes", "tell me about it"
 EXPLAIN_WORDS = frozenset(
     "explain summarize summarise summary describe overview recap samjhao samjha samjhana".split()
@@ -185,7 +273,8 @@ _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show",
 @dataclass(frozen=True, slots=True)
 class Intent:
     kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|topic|
-    #            resume|timeline|confirm|cancel|ask|explain|clean|organize|undo|none
+    #            resume|timeline|confirm|cancel|ask|explain|clean|organize|undo|create|
+    #            dictate|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
@@ -316,6 +405,10 @@ def parse(text: str) -> Intent:
     ):
         return Intent("confirm", confidence=conf, corrected=corrected)
 
+    # "new document" / "new text file": a new file, not "the newer one".
+    if toks[0] == "new" and len(toks) <= 3 and any(t in CREATE_THINGS for t in toks[1:]):
+        return Intent("create", query=text.strip(), confidence=conf, corrected=corrected)
+
     # --- follow-ups: nothing but command words, ordinals and filler ---------------
     content = [
         t for i, t in enumerate(toks)
@@ -347,6 +440,19 @@ def parse(text: str) -> Intent:
         and any(t in NO_WORDS for t in toks)
     ):
         return Intent("cancel", confidence=conf, corrected=corrected)
+
+    # --- create a file / folder, dictation ---------------------------------------------
+    joined_low = " ".join(toks)
+    wants_dictation = any(t in DICTATE_WORDS for t in toks) or any(
+        p in joined_low for p in _DICTATE_PHRASES
+    )
+    makes = any(t in CREATE_VERBS for t in toks) and any(t in CREATE_THINGS for t in toks)
+    if wants_dictation and not has_open:
+        return Intent("dictate", query=text.strip(), confidence=conf, corrected=corrected)
+    if makes and not has_open and not any(t in CLEAN_WORDS for t in toks):
+        return Intent("create", query=text.strip(), confidence=conf, corrected=corrected)
+    if any(t in PASTE_WORDS for t in toks) and any(t in CREATE_THINGS for t in toks):
+        return Intent("create", query=text.strip(), confidence=conf, corrected=corrected)
 
     # --- clean / organize / undo: destructive -> always a plan (CLAUDE.md) ---------------
     if any(t in UNDO_WORDS for t in toks) and not any(t in ORGANIZE_WORDS for t in toks):

@@ -14,7 +14,7 @@ import queue
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from zachary.brain.handler import Reply
 from zachary.telemetry.latency import Timeline
@@ -31,6 +31,10 @@ STATE_TEXT = {
     "listening": "Listening…",
     "thinking": "…",
 }
+
+
+REARM_MS = 150  # dictation: pause between a piece and listening again
+DICTATION_PAUSE_MS = 1500  # dictation: a breath doesn't end a sentence, a real pause does
 
 
 class VoiceController(QObject):
@@ -70,6 +74,10 @@ class VoiceController(QObject):
         self.state.connect(self._on_state)
         self._status.connect(self.bar.status.setText)
         engine.replied.connect(self._on_reply)
+        # Voice dictation: listen again after each piece (after any spoken reply ended,
+        # so the speaker isn't recorded) until "stop dictation".
+        self.dictating = False
+        self.spoken.connect(self._rearm)
 
     def start(self, source: FrameSource | None = None) -> None:
         self._source = source or self._source or MicSource(device=self.kit.mic_device)
@@ -107,14 +115,14 @@ class VoiceController(QObject):
             with contextlib.suppress(Exception):
                 close()
 
-    def push_to_talk(self, hold: bool = False) -> None:
+    def push_to_talk(self, hold: bool = False, pause_ms: int | None = None) -> None:
         log.info("voice: push-to-talk%s", " (hold)" if hold else "")
         self._cancel_speech()  # talking over the reply interrupts it
         if self.listener is None or not self.listener.is_alive():
             log.warning("voice: listener was not running; restarting it")
             self.start()
         assert self.listener is not None
-        self.listener.push_to_talk(hold=hold)
+        self.listener.push_to_talk(hold=hold, pause_ms=pause_ms)
 
     def bar_visible(self, shown: bool) -> None:
         """Keep the mic warm (local buffer only) while the bar is open."""
@@ -181,6 +189,7 @@ class VoiceController(QObject):
         tl.mark("intent_search")
         tl.info["handler_ms"] = round(reply.ms, 1)
         tl.info["intent"] = reply.intent.kind
+        self.dictating = reply.dictating
         if not self.speak or not reply.say:
             self._done(tl)
             return
@@ -228,6 +237,14 @@ class VoiceController(QObject):
             tl.info["tts_error"] = e.kind
             self._status.emit(f"{text}  (couldn't speak: {e})")
         self._done(tl)
+
+    def _rearm(self, _rec: object = None) -> None:
+        if self.dictating:
+            QTimer.singleShot(REARM_MS, self._rearm_now)
+
+    def _rearm_now(self) -> None:
+        if self.dictating:
+            self.push_to_talk(pause_ms=DICTATION_PAUSE_MS)
 
     def _done(self, tl: Timeline) -> None:
         rec = tl.finish(str(self.latency_path) if self.latency_path else None)

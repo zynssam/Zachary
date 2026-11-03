@@ -196,6 +196,7 @@ class VoiceListener(threading.Thread):
         self._stop_ev = threading.Event()
         self._ptt = threading.Event()
         self._hold = False
+        self._pause_ms: int | None = None
         self._released = threading.Event()
         self._warm = threading.Event()  # bar is open: keep the mic running locally
         self._warmed = False
@@ -206,10 +207,12 @@ class VoiceListener(threading.Thread):
     def stop(self) -> None:
         self._stop_ev.set()
 
-    def push_to_talk(self, hold: bool = False) -> None:
+    def push_to_talk(self, hold: bool = False, pause_ms: int | None = None) -> None:
         """Start a command now (no wake word needed). ``hold``: record until
-        ``release()`` (hold-to-talk), however long the pauses."""
-        self._hold = hold
+        ``release()`` (hold-to-talk), however long the pauses. ``pause_ms``
+        (dictation): like hold, but a pause this long releases it by itself."""
+        self._pause_ms = pause_ms
+        self._hold = hold or pause_ms is not None
         self._released.clear()
         self._ptt.set()
 
@@ -379,7 +382,8 @@ class VoiceListener(threading.Thread):
         audio = bytearray()
         # Local end-of-speech after LOCAL_END_MS of quiet: we then commit at once instead
         # of waiting for Gnani's own silence timer (saves ~0.3-0.5 s per command).
-        vad = EnergyVAD(ratio=2.0, min_rms=0.003, end_silence_ms=LOCAL_END_MS)
+        pause_ms = self._pause_ms
+        vad = EnergyVAD(ratio=2.0, min_rms=0.003, end_silence_ms=pause_ms or LOCAL_END_MS)
         vad.noise = min(self.vad.noise, 0.0015)
         peak = 0.0
         local_started = local_ended = False
@@ -417,7 +421,8 @@ class VoiceListener(threading.Thread):
                     commit(now)
                 else:
                     break
-            if hold and not released and self._released.is_set():
+            auto_release = pause_ms is not None and local_ended and local_started
+            if hold and not released and (self._released.is_set() or auto_release):
                 released = True  # key let go: send what was said
                 local_ended, local_end_at = True, now
                 if stream is not None:
