@@ -45,6 +45,7 @@ from zachary.core.config import Config, PathRules
 from zachary.core.platform import Platform
 from zachary.core.platform import apps as app_index
 from zachary.core.platform.apps import App
+from zachary.core.safety import creation_problem
 from zachary.indexer import clustering
 from zachary.indexer.projects import Project, list_projects
 from zachary.indexer.relations import related as related_files
@@ -789,9 +790,17 @@ class Handler:
         ok = self.actions.reveal(target) if where else self.actions.open(target)
         verb = "Showing" if where else "Opening"
         say = (answer + " " if answer else "") + (f"{verb} {target.name}." if ok
-                                                 else f"Couldn't open {target.name}.")  # fmt: skip
+                                                 else self._not_opened(target))  # fmt: skip
         return Reply(say.strip(), "results", items, intent, "reveal" if where else "open",
                      target, 0)  # fmt: skip
+
+    def _not_opened(self, target: Item) -> str:
+        refused = getattr(self.actions, "last_refused", "")
+        if refused and refused == target.path:
+            self.actions.last_refused = ""  # type: ignore[attr-defined]
+            return (f"{target.name} is a program file, so I showed it in its folder instead"
+                    " of running it.")  # fmt: skip
+        return f"Couldn't open {target.name}."
 
     def _embedder(self) -> object | None:
         sem = self.semantic
@@ -863,7 +872,7 @@ class Handler:
                     return Reply(f"Enter to open {exact[0].name}.", "projects", exact, intent,
                                  "open", exact[0], 0)  # fmt: skip
                 ok = self.actions.open(exact[0])
-                say = f"Opening {exact[0].name}." if ok else f"Couldn't open {exact[0].name}."
+                say = f"Opening {exact[0].name}." if ok else self._not_opened(exact[0])
                 return Reply(say, "projects", exact, intent, "open" if ok else None, exact[0], 0)
         if intent.project_hint:
             items = self._projects(intent.query)
@@ -890,7 +899,7 @@ class Handler:
                     ok = self.actions.open(target)
                     if ok and view == "results":
                         feedback.record(self.conn, search_terms(intent.query), target.file_id, 0)
-                    say = f"Opening {target.name}." if ok else f"Couldn't open {target.name}."
+                    say = f"Opening {target.name}." if ok else self._not_opened(target)
                     return Reply(say, view, items, intent, "open" if ok else None, target, 0)
                 return Reply(
                     f"Enter to open {target.name}.", view, items, intent, "open", target, 0
@@ -1204,6 +1213,11 @@ class Handler:
             src = " with what you copied" if spec.paste else ""
             return Reply(f"Enter to create a {what}{src} in {where}.", "none", [], intent)
         if spec.what == "folder":
+            parent = folder or creator.base_folder()
+            problem = creation_problem(parent, self.config)
+            if problem is not None:
+                return Reply(f"I won't create folders in {self._where(parent)}: {problem}.",
+                             "none", [], intent)  # fmt: skip
             made = creator.create_folder(self.conn, spec.name or "New folder", folder)
             self.actions.open_created(made.path)
             return Reply(f"Created the folder {made.path.name} in {self._where(made.path.parent)}."
@@ -1217,6 +1231,11 @@ class Handler:
 
     def _write_and_open(self, spec: CreateSpec, content: str, folder: Path | None,
                         intent: Intent) -> Reply:  # fmt: skip
+        target = folder or creator.base_folder()
+        problem = creation_problem(target, self.config)
+        if problem is not None:
+            return Reply(f"I won't create files in {self._where(target)}: {problem}.", "none",
+                         [], intent)  # fmt: skip
         try:
             made = creator.create_file(self.conn, content, fmt=spec.fmt, name=spec.name or None,
                                        folder=folder, embed=self._embed(),
@@ -1492,5 +1511,5 @@ class Handler:
         if action == "reveal":
             say = f"Showing {target.name} in its folder." if ok else f"Couldn't show {target.name}."
         else:
-            say = f"Opening {target.name}." if ok else f"Couldn't open {target.name}."
+            say = f"Opening {target.name}." if ok else self._not_opened(target)
         return Reply(say, ctx.view, ctx.items, intent, action if ok else None, target, idx)

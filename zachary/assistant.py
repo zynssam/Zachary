@@ -171,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     bar = QuickBar(engine)
 
     server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)  # only this user
     QLocalServer.removeServer(server_name())
     server.listen(server_name())
 

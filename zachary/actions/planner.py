@@ -40,6 +40,7 @@ from pathlib import Path, PurePath
 from typing import Any
 
 from zachary.core.config import Config
+from zachary.core.safety import is_system
 
 QUICK_BLOCK = 64 * 1024
 MIN_DUP_SIZE = 16 * 1024  # smaller duplicates aren't worth the reader's time
@@ -302,6 +303,8 @@ class Guard:
         index root. ``junk``: temp/lock files are excluded from the index by design; for
         them only the folder they're in must be allowed (not hidden/excluded itself)."""
         original = path
+        if is_system(original, self.config):
+            return True  # never clean or move anything in a system folder
         path = _nc(path)
         root = self._root_of(path)
         if root is None:
