@@ -1,7 +1,9 @@
 """The only actions the assistant (and later voice / LLM output) may trigger.
 
-Whitelist: open, reveal, search, show, suggest. Nothing here moves, renames or
-deletes files, and nothing runs a shell. ``open``/``reveal`` only accept items
+Whitelist: open, reveal, launch, open_with, search, show, suggest. Nothing here
+moves, renames or deletes files, and nothing runs a shell. ``launch`` only starts an
+app the desktop lists (``platform.list_apps``), through the desktop's own launcher;
+``open_with`` passes it one indexed file or folder. ``open``/``reveal`` only accept items
 that are in Zachary's index *and* still exist on disk, so a spoken or generated
 path can never open something arbitrary.
 """
@@ -16,10 +18,11 @@ from pathlib import Path
 
 from zachary.brain.context import Item
 from zachary.core.platform import Platform
+from zachary.core.platform.apps import App
 
 log = logging.getLogger(__name__)
 
-WHITELIST = frozenset({"open", "reveal", "search", "show", "suggest"})
+WHITELIST = frozenset({"open", "reveal", "launch", "open_with", "search", "show", "suggest"})
 
 
 class ActionNotAllowed(PermissionError):
@@ -74,5 +77,34 @@ class SafeActions:
         if p is None:
             return False
         self.platform.reveal_in_file_manager(p)
+        self._log(item)
+        return True
+
+    def _installed(self, app_id: str) -> App | None:
+        """The app only if it's still one the desktop lists (never a free-form command)."""
+        return next((a for a in self.platform.list_apps() if a.id == app_id), None)
+
+    def launch(self, app_id: str) -> bool:
+        app = self._installed(app_id)
+        if app is None:
+            log.warning("refusing to launch an app that isn't installed")
+            return False
+        try:
+            self.platform.launch_app(app)
+        except OSError as e:
+            log.warning("could not launch %s: %s", app.name, e)
+            return False
+        return True
+
+    def open_with(self, app_id: str, item: Item) -> bool:
+        app = self._installed(app_id)
+        p = self._verified(item)
+        if app is None or p is None:
+            return False
+        try:
+            self.platform.launch_app(app, p)
+        except OSError as e:
+            log.warning("could not open with %s: %s", app.name, e)
+            return False
         self._log(item)
         return True

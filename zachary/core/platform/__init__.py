@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Protocol
 
 from zachary.core.hotkeys import Hotkey, HotkeyBackend, HotkeyCallback
+from zachary.core.platform.apps import App
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +116,14 @@ class Platform(Protocol):
 
     def restore(self, trashed: str, original: str) -> None:
         """Undo ``trash``: move the item back to ``original`` (never over a file)."""
+        ...
+
+    def list_apps(self) -> list[App]:
+        """Installed applications the desktop lists (cached)."""
+        ...
+
+    def launch_app(self, app: App, file: Path | None = None) -> None:
+        """Start an installed app, optionally opening ``file`` with it. No shell."""
         ...
 
     def try_lock(self, path: Path) -> object | None:

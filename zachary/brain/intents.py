@@ -190,6 +190,10 @@ class Intent:
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
     project_hint: bool = False  # "open the zachary project" -> prefer project folders
+    # "open zachary in vscode": the possible app ("vscode") and what to open with it
+    # ("zachary"). The handler checks the app is installed; otherwise it's a search.
+    app: str = ""
+    target: str = ""
     confidence: float = 1.0
     corrected: dict[str, str] = field(default_factory=dict)
 
@@ -438,8 +442,14 @@ def parse(text: str) -> Intent:
         if not rest:
             return Intent("show_projects", confidence=conf, corrected=corrected)
         query = " ".join(t for t in raw if corrected.get(t, t) not in verbs and t not in FILLER)
+        target, app = ("", "")
+        if has_open:  # split before filler removal ("in" is a filler word)
+            target, app = split_app(" ".join(t for t in raw if corrected.get(t, t) not in verbs))
+            target = " ".join(
+                t for t in target.split() if t not in PROJECT_WORDS and t not in FILLER
+            )
         return Intent("open" if has_open else "find", query=query, project_hint=True,
-                      confidence=conf, corrected=corrected)  # fmt: skip
+                      confidence=conf, corrected=corrected, app=app, target=target)  # fmt: skip
 
     # --- recent ---------------------------------------------------------------------
     tp = parse_time(" ".join(toks))
@@ -467,19 +477,68 @@ def parse(text: str) -> Intent:
     # --- open / find ----------------------------------------------------------------
     query = _strip_lead(" ".join(t for t, f in zip(raw, toks, strict=True) if f not in verbs))
     if has_open:
-        return Intent("open", query=query, confidence=conf, corrected=corrected)
+        target, app = split_app(query)
+        return Intent("open", query=query, confidence=conf, corrected=corrected, app=app,
+                      target=target)  # fmt: skip
     if has_find or has_show:
         return Intent("find", query=query, confidence=conf, corrected=corrected)
     return Intent("find", query=query, confidence=min(conf, 0.6), corrected=corrected)
 
 
+_APP_SEP = frozenset("in with using via mein me se".split())
+
+
+def split_app(query: str) -> tuple[str, str]:
+    """("zachary in vscode") -> ("zachary", "vscode"); ("", "") if there's no split.
+    The app part is 1-3 words after the last "in" / "with" / "using" / "mein"."""
+    toks = query.split()
+    # Hindi order: "zachary ko vscode mein (kholo)": the app comes before "mein"/"se".
+    if len(toks) >= 3 and toks[-1] in {"mein", "me", "se"}:
+        body = toks[:-1]
+        if "ko" in body:
+            k = len(body) - 1 - body[::-1].index("ko")
+            head, app = body[:k], body[k + 1 :]
+        else:
+            head, app = body[:-1], body[-1:]
+        if head and 1 <= len(app) <= 3:
+            return " ".join(head), " ".join(app)
+    for i in range(len(toks) - 1, 0, -1):
+        if toks[i] in _APP_SEP and 1 <= len(toks) - i - 1 <= 3:
+            head = [t for t in toks[:i] if t not in {"ko", "the", "my", "folder", "file"}]
+            if head:
+                return " ".join(head), " ".join(toks[i + 1 :])
+    return "", ""
+
+
 _LEAD = frozenset("hey ok okay zach zachary please pls plz can could would you".split())
 
 
+_WAKE = frozenset({"zach", "zachary"})
+_COMMAND_START = (
+    OPEN_VERBS
+    | FIND_VERBS
+    | SHOW_VERBS
+    | frozenset(
+        "please can could what when how who where which clean organize undo make create explain"
+        " summarize tell".split()
+    )
+)
+
+
 def _lead_fillers(tokens: list[str]) -> int:
+    """Leading "hey zach, please ..." words. "zach(ary)" counts as the wake word only
+    after hey/ok or right before a command ("zachary open fee receipt"), not when it's
+    the thing to open ("zachary ko vscode mein kholo" = the Zachary project)."""
     n = 0
-    for t in tokens:
-        if t in _LEAD:
+    for i, t in enumerate(tokens):
+        if t in _WAKE:
+            prev_greet = i > 0 and tokens[i - 1] in {"hey", "ok", "okay", "hi", "hello"}
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            before_command = nxt in _COMMAND_START
+            if not (prev_greet or before_command):
+                break
+            n += 1
+        elif t in _LEAD:
             n += 1
         else:
             break
@@ -488,6 +547,6 @@ def _lead_fillers(tokens: list[str]) -> int:
 
 def _strip_lead(query: str) -> str:
     toks = query.split()
-    while toks and toks[0] in _LEAD:
+    while toks and toks[0] in _LEAD and toks[0] not in _WAKE:
         toks.pop(0)
     return " ".join(toks)

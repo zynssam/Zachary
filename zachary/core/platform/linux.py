@@ -29,6 +29,7 @@ from zachary.core.platform import (
     TreeWatcher,
     WatchLimit,
 )
+from zachary.core.platform.apps import App
 
 log = logging.getLogger(__name__)
 
@@ -303,6 +304,16 @@ class LinuxPlatform:
                 _popen_quiet(["xdg-open", str(path.parent if not path.is_dir() else path)])
 
         threading.Thread(target=work, name="zach-reveal", daemon=True).start()
+
+    def list_apps(self) -> list[App]:
+        from zachary.core.platform import apps
+
+        return apps.list_apps()
+
+    def launch_app(self, app: App, file: Path | None = None) -> None:
+        from zachary.core.platform import apps
+
+        apps.launch(app, file)
 
     def trash(self, path: Path) -> str:
         from zachary.core.platform import trash

@@ -28,6 +28,8 @@ from zachary.brain.llm import LLM, Excerpt, LLMError
 from zachary.brain.timeparse import parse_time
 from zachary.core.config import Config, PathRules
 from zachary.core.platform import Platform
+from zachary.core.platform import apps as app_index
+from zachary.core.platform.apps import App
 from zachary.indexer import clustering
 from zachary.indexer.projects import Project, list_projects
 from zachary.indexer.relations import related as related_files
@@ -44,6 +46,8 @@ CLEAR_GAP = 0.12  # top score must beat the runner-up by 12% to act without aski
 # The LLM reads a command only when it's a sentence the parser couldn't place
 # (no command word) and the search found nothing convincing.
 ROUTE_MIN_WORDS = 4
+APP_MIN_SCORE = 0.75  # "spotfy" still finds Spotify ...
+APP_SURE_SCORE = 0.9  # ... but below this a file with that name wins
 CLEAN_CATEGORIES = {
     "duplicates": "duplicate", "duplicate": "duplicate", "dupes": "duplicate",
     "installer": "installer", "installers": "installer", "setup": "installer",
@@ -69,6 +73,10 @@ class Actions(Protocol):
     def open(self, item: Item) -> bool: ...
 
     def reveal(self, item: Item) -> bool: ...
+
+    def launch(self, app_id: str) -> bool: ...
+
+    def open_with(self, app_id: str, item: Item) -> bool: ...
 
 
 @dataclass(slots=True)
@@ -188,6 +196,7 @@ class Handler:
         self._semantic_tried = 0.0
         self._llm_provider = llm
         self._last_strong = False  # did the last search have a strong top match?
+        self._open_with: App | None = None  # "which one?" for "open X in <app>"
         self._sessions: dict[int, sess.Session] = {}  # timeline rows -> sessions
         # A proposal waiting for "yes": ("reopen", files, what). Only from submit().
         self._pending: tuple[str, list[Item], str] | None = None
@@ -541,6 +550,11 @@ class Handler:
         return Reply(say, "answer", items, intent, selected=0, detail=detail)
 
     def _find_or_open(self, intent: Intent, *, execute: bool) -> Reply:
+        self._open_with = None  # a new request: forget "open ... in VS Code" pending
+        if intent.kind == "open":
+            app_reply = self._open_app(intent, execute=execute)
+            if app_reply is not None:
+                return app_reply
         items: list[Item]
         note = ""
         if intent.project_hint:
@@ -693,6 +707,80 @@ class Handler:
         say = f"Reopened {opened} of {len(items)} files." if opened < len(items) else (
             f"Reopened {what}.")  # fmt: skip
         return Reply(say, "session", items, intent, "open" if opened else None)
+
+    # -- apps: "open spotify", "open zachary in vscode" -----------------------------------
+    def _apps(self) -> list[App]:
+        return self.platform.list_apps() if self.platform is not None else []
+
+    def _app_by_id(self, app_id: str) -> App | None:
+        return next((a for a in self._apps() if a.id == app_id), None)
+
+    @staticmethod
+    def _app_item(app: App) -> Item:
+        return Item(0, app.location, app.name, "app", False, 0.0,
+                    [app.generic or "application"], 1.0, app.id)  # fmt: skip
+
+    def _launch_reply(self, app: App, intent: Intent, *, execute: bool) -> Reply:
+        items = [self._app_item(app)]
+        self.context.set_results(items, app.name, "apps")
+        if not execute:
+            return Reply(f"Enter to open {app.name}.", "apps", items, intent, "launch", items[0], 0)
+        ok = self.actions.launch(app.id)
+        say = f"Opening {app.name}." if ok else f"Couldn't open {app.name}."
+        return Reply(say, "apps", items, intent, "launch" if ok else None, items[0], 0)
+
+    def _open_with_reply(self, app: App, target: Item, intent: Intent, *, execute: bool
+                         ) -> Reply:  # fmt: skip
+        items = self.context.items or [target]
+        if not execute:
+            return Reply(f"Enter to open {target.name} in {app.name}.", self.context.view,
+                         items, intent, "open", target, 0)  # fmt: skip
+        self._open_with = None
+        ok = self.actions.open_with(app.id, target)
+        say = (f"Opening {target.name} in {app.name}." if ok
+               else f"Couldn't open {target.name} in {app.name}.")  # fmt: skip
+        return Reply(say, self.context.view, items, intent, "open" if ok else None, target)
+
+    def _open_app(self, intent: Intent, *, execute: bool) -> Reply | None:
+        """An app, or something to open in an app; None = an ordinary file search."""
+        apps = self._apps()
+        if not apps:
+            return None
+        if intent.app and intent.target:
+            m = app_index.find_app(intent.app, apps)
+            if m is not None and m[1] >= APP_MIN_SCORE and m[0].accepts_files:
+                return self._open_in(m[0], intent, execute=execute)
+            return None  # "open notes in downloads": a place, not an app
+        q = " ".join(w for w in words(intent.query) if w not in {"app", "application", "the"})
+        m = app_index.find_app(q, apps) if q else None
+        if m is None or m[1] < APP_MIN_SCORE:
+            return None
+        if m[1] < APP_SURE_SCORE:  # a close spelling ("spotfy"): only if no file wins
+            results, _ = self._search(intent.query, 2)
+            if results and clear_winner(results):
+                return None
+        return self._launch_reply(m[0], intent, execute=execute)
+
+    def _open_in(self, app: App, intent: Intent, *, execute: bool) -> Reply:
+        """ "open zachary in vscode": a project by name, else the best folder/file."""
+        want = words(intent.target)
+        items = [p for p in self._projects() if want and all(
+            any(n.startswith(w) for n in words(p.name)) for w in want)]  # fmt: skip
+        winner = len(items) == 1
+        if not items:
+            results, _ = self._search(intent.target, RESULT_LIMIT)
+            items = [_item(r, self.conn) for r in results]
+            winner = clear_winner(results)
+        self.context.set_results(items, intent.target, "results")
+        if not items:
+            return Reply(f"Nothing found for “{intent.target}”.", "results", [], intent)
+        if winner:
+            return self._open_with_reply(app, items[0], intent, execute=execute)
+        self._open_with = app
+        shown = items[:ASK_LIMIT]
+        self.context.set_results(shown, intent.target, "results")
+        return Reply(f"Which one should I open in {app.name}?", "results", shown, intent,
+                     selected=0)  # fmt: skip
 
     # -- Phase 7: clean / organize / undo (plans only; files change after approval) -------
     def _plan_reply(self, plan: planner.Plan, intent: Intent) -> Reply:
@@ -878,6 +966,12 @@ class Handler:
                 return Reply("Nothing selected.", ctx.view, ctx.items, intent)
         if target.kind in {"topic", "session"}:
             return self._drill(target, intent, execute=execute)
+        if target.kind == "app" and intent.action != "reveal":
+            app = self._app_by_id(target.detail)
+            if app is not None:
+                return self._launch_reply(app, intent, execute=execute)
+        if self._open_with is not None and intent.action != "reveal":
+            return self._open_with_reply(self._open_with, target, intent, execute=execute)
         action = "reveal" if intent.kind == "reveal" or intent.action == "reveal" else "open"
         idx = ctx.focused
         if not execute:

@@ -22,6 +22,7 @@ BADGES: dict[str, tuple[str, str]] = {
     "project": ("P", "#ec4899"),
     "topic": ("T", "#a855f7"),
     "session": ("S", "#14b8a6"),
+    "app": ("▶", "#22c55e"),
     "other": ("·", "#94a3b8"),
 }
 

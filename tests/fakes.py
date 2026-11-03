@@ -16,6 +16,7 @@ from zachary.core.platform import (
     TreeWatcher,
     WatchLimit,
 )
+from zachary.core.platform.apps import App
 
 
 class FakeHotkey:
@@ -49,6 +50,13 @@ class FakePlatform:
         self.revealed: list[Path] = []
         self.spawned: list[list[str]] = []
         self.trashed: list[Path] = []
+        self.apps: list[App] = [
+            App("com.spotify.Client.desktop", "Spotify", "Music Player", location="/x/spotify"),
+            App("code.desktop", "Visual Studio Code", "Text Editor", location="/x/code",
+                accepts_files=True),
+            App("org.gnome.Calculator.desktop", "Calculator", location="/x/calc"),
+        ]  # fmt: skip
+        self.launched: list[tuple[str, Path | None]] = []
         self.native_watcher = True
         self.battery = False
         self.busy = False
@@ -73,6 +81,12 @@ class FakePlatform:
 
     def spawn_detached(self, argv: list[str]) -> None:
         self.spawned.append(argv)
+
+    def list_apps(self) -> list[App]:
+        return list(self.apps)
+
+    def launch_app(self, app: App, file: Path | None = None) -> None:
+        self.launched.append((app.id, file))
 
     def trash(self, path: Path) -> str:
         """A fake trash under the test root (the real one is tested separately)."""
