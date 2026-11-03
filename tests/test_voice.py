@@ -1233,7 +1233,9 @@ def test_voice_dictation_rearms_until_stop(
         assert not list(base.rglob("*.docx")) and not fake_platform.opened
         gnani.transcript = "stop dictation"
         src.load(speech(0.8) + silence(1.0))
-        qtbot.waitUntil(lambda: bool(fake_platform.opened), timeout=15000)  # type: ignore[attr-defined]
+        # Opened in the engine thread; the controller hears "done" when the reply lands.
+        qtbot.waitUntil(lambda: bool(fake_platform.opened) and not voice.dictating,  # type: ignore[attr-defined]
+                        timeout=15000)  # fmt: skip
     finally:
         voice.stop()
         engine.stop()
