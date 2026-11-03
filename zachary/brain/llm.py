@@ -36,6 +36,7 @@ log = logging.getLogger(__name__)
 KEY_NAME = "ANTHROPIC_API_KEY"
 DEFAULT_MODEL = "claude-opus-5-5"
 TIMEOUT_S = 20.0
+CONNECT_TIMEOUT_S = 5.0  # a stalled network fails fast instead of hanging the bar
 MAX_RETRIES = 1
 ANSWER_MAX_TOKENS = 4000  # includes thinking; the answer itself is one sentence
 ROUTE_MAX_TOKENS = 2000
@@ -162,7 +163,9 @@ class ClaudeLLM:
             import anthropic  # lazy: ~2.7 s to import
 
             self._client = anthropic.Anthropic(
-                api_key=self._api_key, timeout=TIMEOUT_S, max_retries=MAX_RETRIES
+                api_key=self._api_key,
+                timeout=anthropic.Timeout(TIMEOUT_S, connect=CONNECT_TIMEOUT_S),
+                max_retries=MAX_RETRIES,
             )
         return self._client
 
@@ -236,6 +239,9 @@ class ClaudeLLM:
 
 def _describe(e: Exception) -> str:
     name = type(e).__name__
+    message = str(getattr(e, "message", "")).lower()
+    if "credit balance" in message:
+        return "no Anthropic API credits left: add some under Plans & Billing"
     return {
         "AuthenticationError": "the Anthropic API key was rejected",
         "PermissionDeniedError": "the Anthropic API key isn't allowed to use this model",

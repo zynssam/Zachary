@@ -266,3 +266,14 @@ def test_provider_needs_opt_in_and_a_key(
 def test_tests_cannot_reach_anthropic() -> None:
     with pytest.raises(OSError, match="Anthropic"):
         socket.getaddrinfo("api.anthropic.com", 443)
+
+
+def test_billing_error_is_explained(
+    store: FileStore, sem: SemanticSearch, fake_platform: FakePlatform
+) -> None:
+    class BadRequestError(Exception):
+        message = "Your credit balance is too low to access the Anthropic API."
+
+    model, _ = fake_llm([BadRequestError()])
+    r = handler(store, sem, fake_platform, model).submit("when is my fee due?")
+    assert "no Anthropic API credits" in r.say and DUE in r.detail
