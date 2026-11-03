@@ -764,7 +764,9 @@ def test_noisy_room_ends_by_gnanis_vad(gnani: MockGnani) -> None:
     lis = _ptt_listener(gnani, src, got)
     try:
         lis.push_to_talk()
-        src.load(noise(0.3, 0.01) + speech(1.2) + noise(1.5, 0.01))
+        # A long noise tail: Gnani's VAD (~0.4 s after the speech) must end it well before
+        # the noise runs out and local silence could end it instead (slow CI runners).
+        src.load(noise(0.3, 0.01) + speech(1.2) + noise(4.0, 0.01))
         wait_until(lambda: got, timeout=10)
     finally:
         lis.stop()
