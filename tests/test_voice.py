@@ -1416,26 +1416,32 @@ def test_wake_mode_switches_to_a_mic_connected_later(gnani: MockGnani,
     finally:
         lis.stop()
         lis.join(3)
-    assert any("microphone is silent" in s for s in states) and src.calls >= 2
+    assert any("no microphone is giving sound" in s for s in states) and src.calls >= 2
 
 
-def test_wake_mode_never_picks_a_bluetooth_mic(monkeypatch: pytest.MonkeyPatch) -> None:
-    """User's choice: earbuds stay in music mode while "Hey Zach" listens."""
-    from zachary.voice import audio
-
-    srcs = [{"name": "bluez_input.68_ED", "driver": "x"},
-            {"name": "alsa_input.usb-mic.mono", "driver": "x"}]  # fmt: skip
-    monkeypatch.setattr(audio, "_pactl_sources", lambda: (srcs, "bluez_input.68_ED"))
-    monkeypatch.setattr(audio, "_pactl_default_sink", lambda: "bluez_output.68_ED.1")
-    assert audio.auto_input() == "bluez_input.68_ED"  # push-to-talk: the earbuds
-    assert audio.auto_input(bluetooth=False) == "alsa_input.usb-mic.mono"  # wake mode
+def test_wake_mode_uses_any_mic_that_gives_sound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """User's choice: whatever input is giving audio, earbuds included; a silent one is
+    skipped and given another chance after DEAD_RETRY_S."""
+    from zachary.voice import audio, pipeline
     from zachary.voice.pipeline import MicSource
 
+    srcs = [{"name": "bluez_input.68_ED", "driver": "x"},
+            {"name": "alsa_input.pci-laptop.analog-stereo", "driver": "x"}]  # fmt: skip
+    monkeypatch.setattr(
+        audio, "_pactl_sources", lambda: (srcs, "alsa_input.pci-laptop.analog-stereo")
+    )
+    monkeypatch.setattr(audio, "_pactl_default_sink", lambda: "bluez_output.68_ED.1")
     src = MicSource()
+    fast: Any = FakeFast()
     VoiceListener(src, on_heard=lambda _h: None, rest_stt=None, stream_stt=None,
-                  offline_stt=None, spotter=None, wake_word=True,
-                  fast_spotter=FakeFast())  # type: ignore[arg-type]  # fmt: skip
-    assert src.bluetooth is False
+                  offline_stt=None, spotter=None, wake_word=True, fast_spotter=fast)  # fmt: skip
+    assert src.bluetooth is True
+    assert audio.auto_input(exclude=src.dead) == "bluez_input.68_ED"  # the earbuds
+    src.mark_dead("bluez_input.68_ED")  # silent (e.g. just disconnected)
+    assert audio.auto_input(exclude=src.dead) == "alsa_input.pci-laptop.analog-stereo"
+    t = time.monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: t + pipeline.DEAD_RETRY_S + 1)
+    assert src.dead == set()  # tried again later
 
 
 def test_ptt_in_wake_mode_borrows_the_earbuds_when_the_open_mic_is_silent(

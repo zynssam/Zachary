@@ -250,9 +250,7 @@ def auto_input(exclude: set[str] | frozenset[str] = frozenset(), *, bluetooth: b
     """
     sources, default = _pactl_sources()
     real = [str(x["name"]) for x in sources if not _is_virtual(x)]
-    if not bluetooth:
-        # "Hey Zach" keeps the mic open: a Bluetooth mic would hold the earbuds in
-        # call-quality headset mode the whole time (user's choice: keep music quality).
+    if not bluetooth:  # (callers may still ask for "no Bluetooth"; default: any mic)
         real = [n for n in real if not n.startswith("bluez_input")]
     names = [n for n in real if n not in exclude]
     if not names:

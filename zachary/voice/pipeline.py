@@ -47,6 +47,7 @@ NO_SPEECH_S = 6.0  # push-to-talk: give up if nothing is said within this time
 SEGMENT_GRACE_S = 0.12  # after a transcript, wait this long for more speech
 PREROLL_WARM_S = 0.6  # audio kept from just before the press (covers the long-press wait)
 MAX_HOLD_S = 28.0  # hold-to-talk cap (REST, the fallback, takes up to 30 s)
+DEAD_RETRY_S = 120.0  # a silent mic is tried again after this long
 RECHECK_FRAMES = int(5 * SAMPLE_RATE * 2 / FRAME_BYTES)  # silent mic: look again every ~5 s
 WAKE_TAIL_S = 0.3  # audio kept from just before "Hey Zach" was detected
 LOCAL_END_MS = 350  # quiet that ends a command locally (then commit immediately)
@@ -91,8 +92,10 @@ class MicSource:
         self.mic = mic or MicStream(device)
         self.auto = mic is None and not device
         self.fixed = mic is not None  # a stream given by the caller: never replaced
-        self.dead: set[str] = set()  # source names that gave only digital silence
-        self.bluetooth = True  # False in wake-word mode (the mic stays open all the time)
+        # Source names that gave only digital silence, with when: given another chance
+        # after DEAD_RETRY_S (earbuds reconnected, a mic unmuted, ...).
+        self._dead: dict[str, float] = {}
+        self.bluetooth = True  # any mic that gives audio, earbuds included (user's choice)
 
     def _auto_stream(self) -> MicStream:
         from zachary.voice.audio import auto_input
@@ -100,6 +103,15 @@ class MicSource:
         if self.mic.active:
             return self.mic
         return MicStream(auto_input(exclude=self.dead, bluetooth=self.bluetooth))
+
+    @property
+    def dead(self) -> set[str]:
+        now = time.monotonic()
+        self._dead = {k: t for k, t in self._dead.items() if now - t < DEAD_RETRY_S}
+        return set(self._dead)
+
+    def mark_dead(self, name: str) -> None:
+        self._dead[name] = time.monotonic()
 
     def start(self) -> None:
         if self.auto:
@@ -127,7 +139,7 @@ class MicSource:
 
         current = self.mic.source_name or self.mic.device
         if current:
-            self.dead.add(current)
+            self.mark_dead(current)
         try:
             name = auto_input(exclude=self.dead, bluetooth=self.bluetooth)
         except Exception:
@@ -141,7 +153,7 @@ class MicSource:
         try:
             self.mic.start()
         except Exception:
-            self.dead.add(name)
+            self.mark_dead(name)
             return None
         return name
 
@@ -231,8 +243,6 @@ class VoiceListener(threading.Thread):
         # Push-to-talk only: the mic is open only during a command (privacy; and
         # Bluetooth earbuds stay in high-quality music mode the rest of the time).
         self.mic_always_open = self.wake_word if mic_always_open is None else mic_always_open
-        if self.mic_always_open and hasattr(source, "bluetooth"):
-            source.bluetooth = False  # keep earbuds in music mode (see auto_input)
         self.vad = vad or EnergyVAD()
         self._stop_ev = threading.Event()
         self._ptt = threading.Event()
@@ -324,8 +334,7 @@ class VoiceListener(threading.Thread):
                 return
             self._warned_silent = True
             self.on_state(
-                "error: the microphone is silent: “Hey Zach” needs a wired or USB mic "
-                "(Bluetooth earbuds stay in music mode; use push-to-talk with them)"
+                "error: no microphone is giving sound; I'll switch as soon as one does"
                 if self.mic_always_open
                 else "error: the microphone is silent (check the input device in Sound settings)"
             )
