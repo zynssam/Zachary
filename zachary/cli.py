@@ -438,6 +438,7 @@ def _wake_test(data_dir: Path, cfg: Config, seconds_: float) -> int:
     spot = VoskSpotter(data_dir / "models")
     import vosk
 
+    vosk.SetLogLevel(-1)  # (its start-up lines aren't useful here)
     free = vosk.KaldiRecognizer(vosk.Model(str(spot.model_dir)), 16000)  # what was *said*
     src = MicSource(device=cfg.load().mic_device)
     src.start()
@@ -445,11 +446,14 @@ def _wake_test(data_dir: Path, cfg: Config, seconds_: float) -> int:
           " (local only). Say “Hey Zach” a few times, and some other sentences.")  # fmt: skip
     t_end = time.monotonic() + seconds_
     wakes = 0
+    frames = zero = 0
     try:
         while time.monotonic() < t_end:
             f = src.get(0.2)
             if f is None or len(f) != FRAME_BYTES:
                 continue
+            frames += 1
+            zero += f.count(0) == len(f)
             if spot.feed(f):
                 wakes += 1
                 print(f"  >>> WAKE ({wakes})")
@@ -460,6 +464,11 @@ def _wake_test(data_dir: Path, cfg: Config, seconds_: float) -> int:
                     print(f"  heard: {said!r}   (wake phrases list: {spot.last_heard!r})")
     finally:
         src.stop()
+    if frames and zero / frames > 0.95:
+        print("This microphone recorded only silence (e.g. the built-in mic without a Linux"
+              " driver). “Hey Zach” needs a wired or USB mic: plug one in and run this again."
+              " Bluetooth earbuds work with push-to-talk.")  # fmt: skip
+        return 1
     print(f"{wakes} wake(s). Paste these lines to tune the wake word.")
     return 0
 
