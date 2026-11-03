@@ -19,7 +19,8 @@ dependencies = [
     "httpx>=0.27",  # Gnani REST
     "websockets>=13",  # Gnani streaming STT / TTS
     "sounddevice>=0.4",  # microphone and speaker (PortAudio)
-    "pywhispercpp>=1.2",  # local wake-word spotting and offline STT (whisper.cpp)
+    "pywhispercpp>=1.2",  # offline STT (whisper.cpp)
+    "vosk>=0.3.45",  # fast local "Hey Zach" spotting (phrase list, no training)
     "scikit-learn>=1.5",  # HDBSCAN for topics (indexer only, loaded nightly)
     "anthropic>=2.4",  # optional LLM (Phase 6); imported only when enabled
     "send2trash>=1.8",  # Phase 7: removal always goes to the OS trash (undoable)
@@ -83,7 +84,7 @@ disallow_untyped_calls = false
 [[tool.mypy.overrides]]
 module = ["sqlite_vec", "jeepney", "jeepney.*", "openpyxl", "openpyxl.*", "pptx", "pptx.*",
           "docx", "docx.*", "pymupdf", "model2vec", "model2vec.*", "huggingface_hub",
-          "sounddevice", "pywhispercpp", "pywhispercpp.*", "sklearn", "sklearn.*", "send2trash"]
+          "sounddevice", "pywhispercpp", "pywhispercpp.*", "sklearn", "sklearn.*", "send2trash", "vosk"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

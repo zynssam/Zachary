@@ -140,7 +140,7 @@ python -m zachary.assistant -v                  # restart the assistant to pick 
 |---|---|
 | **Super+Alt+Space** (global) or **Ctrl+M** (in the bar) | push-to-talk (default): the mic opens, you speak, it ends when you stop; press again to stop early |
 | **hold Space** in the bar | hold-to-talk: records while held (pauses are fine), release to send; while typing, hold > 0.4 s (a tap is a space) |
-| "Hey Zach, open the fee receipt" | only with `cli set wake_word true` (runs whisper locally, ~300 MB; mic always open) |
+| "Hey Zach, open the fee receipt" | only with `cli set wake_word true` (+ `cli voice setup` once for the 36 MB Vosk model): fast local spotting, ~5% CPU; mic always open, audio stays local until "Hey Zach" |
 
 Other voice commands (the ones that use credits say so):
 ```bash

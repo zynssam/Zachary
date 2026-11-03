@@ -35,7 +35,7 @@ from zachary.voice.types import (
     join_segments,
     segment_key,
 )
-from zachary.voice.wakeword import SPOT_SECONDS, WakeSpotter
+from zachary.voice.wakeword import SPOT_SECONDS, VoskSpotter, WakeSpotter
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ NO_SPEECH_S = 6.0  # push-to-talk: give up if nothing is said within this time
 SEGMENT_GRACE_S = 0.12  # after a transcript, wait this long for more speech
 PREROLL_WARM_S = 0.6  # audio kept from just before the press (covers the long-press wait)
 MAX_HOLD_S = 28.0  # hold-to-talk cap (REST, the fallback, takes up to 30 s)
+WAKE_TAIL_S = 0.3  # audio kept from just before "Hey Zach" was detected
 LOCAL_END_MS = 350  # quiet that ends a command locally (then commit immediately)
 COMMIT_WAIT_S = 3.0  # after commit, wait at most this long for the transcript
 SERVER_LAG_S = 1.0  # local VAD heard speech end but the server never started: commit
@@ -179,6 +180,7 @@ class VoiceListener(threading.Thread):
         wake_word: bool = True,
         vad: EnergyVAD | None = None,
         mic_always_open: bool | None = None,
+        fast_spotter: VoskSpotter | None = None,
     ) -> None:
         super().__init__(name="zach-voice", daemon=True)
         self.source = source
@@ -188,7 +190,10 @@ class VoiceListener(threading.Thread):
         self.stream_stt = stream_stt
         self.offline_stt = offline_stt
         self.spotter = spotter
-        self.wake_word = wake_word and spotter is not None
+        # Fast streaming "Hey Zach" (Vosk); else the slower whisper check per utterance.
+        self.fast_spotter = fast_spotter
+        self.wake_word = wake_word and (spotter is not None or fast_spotter is not None)
+        self._pushback: collections.deque[bytes] = collections.deque()
         # Push-to-talk only: the mic is open only during a command (privacy; and
         # Bluetooth earbuds stay in high-quality music mode the rest of the time).
         self.mic_always_open = self.wake_word if mic_always_open is None else mic_always_open
@@ -245,6 +250,8 @@ class VoiceListener(threading.Thread):
                 self.source.stop()
 
     def _frame(self, timeout: float = 0.1) -> bytes | None:
+        if self._pushback:  # audio just after "Hey Zach", handed to the command
+            return self._pushback.popleft()
         f = self.source.get(timeout)
         if f is not None:
             self._check_silent(f)
@@ -277,6 +284,10 @@ class VoiceListener(threading.Thread):
         preroll: collections.deque[bytes] = collections.deque(
             maxlen=max(1, int(PREROLL_S * SAMPLE_RATE * 2 / FRAME_BYTES))
         )
+        # Fast wake word: the last moment before detection goes to the command.
+        recent: collections.deque[bytes] = collections.deque(
+            maxlen=max(1, int(WAKE_TAIL_S * SAMPLE_RATE * 2 / FRAME_BYTES))
+        )
         self.on_state("idle")
         while not self._stop_ev.is_set():
             if self._ptt.is_set():
@@ -296,6 +307,9 @@ class VoiceListener(threading.Thread):
             frame = self._frame()
             if frame is None:
                 continue
+            if self.wake_word and self.fast_spotter is not None:
+                self._fast_wake(frame, recent)
+                continue
             ev = self.vad.push(frame)
             if not self.wake_word:
                 preroll.append(frame)
@@ -312,13 +326,37 @@ class VoiceListener(threading.Thread):
             else:
                 preroll.append(frame)
 
+    def _fast_wake(self, frame: bytes, recent: collections.deque[bytes]) -> None:
+        """Vosk heard "Hey Zach": the command is whatever follows, captured exactly like
+        push-to-talk (Gnani streaming + its VAD), starting with the last ~0.3 s (the
+        detection lags the end of "Zach" by ~0.1 s; a leftover "zach" is ignored)."""
+        assert self.fast_spotter is not None
+        recent.append(frame)
+        if not self.fast_spotter.feed(frame):
+            return
+        self.fast_spotter.reset()
+        log.info("voice: wake word")
+        self._pushback.extend(recent)
+        recent.clear()
+        try:
+            self._ptt_session(after_wake=True)
+        except Exception as e:  # never let one bad command kill voice
+            log.exception("voice command failed")
+            self.on_state(f"error: voice command failed ({type(e).__name__}: {e})")
+        self._pushback.clear()
+        self.fast_spotter.reset()
+        self.vad.reset()
+        self.on_state("idle")
+
     # -- push-to-talk: Gnani streaming with the server's VAD --------------------------------
-    def _ptt_session(self) -> None:
+    def _ptt_session(self, after_wake: bool = False) -> None:
         tl = Timeline("voice")
         self.on_state("listening")
         opened_here = False
         try:
-            if self.mic_always_open:
+            if after_wake:
+                tl.info["preroll_s"] = round(len(self._pushback) * FRAME_BYTES / 2 / SAMPLE_RATE, 2)
+            elif self.mic_always_open:
                 self._drain()  # only what's said after the press counts
             elif self._warmed:
                 # Already open (bar showing): keep the last moment before the press,
@@ -344,7 +382,7 @@ class VoiceListener(threading.Thread):
             if opened_here:
                 with contextlib.suppress(Exception):
                     self.source.stop()
-        heard.via = "ptt"
+        heard.via = "wake" if after_wake else "ptt"
         self.on_state("thinking" if heard.text else "idle")
         self.on_heard(heard)
 

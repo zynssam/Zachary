@@ -15,7 +15,7 @@ from zachary.voice import gnani_stt, gnani_tts
 from zachary.voice.offline_stt import WhisperSTT
 from zachary.voice.types import STT, TTS, StreamingSTT
 from zachary.voice.usage import UsageLedger
-from zachary.voice.wakeword import WakeSpotter
+from zachary.voice.wakeword import VoskSpotter, WakeSpotter
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ class VoiceKit:
     ledger: UsageLedger
     has_key: bool
     mic_device: str = ""
+    fast_spotter: VoskSpotter | None = None  # "Hey Zach" via Vosk (if its model is there)
 
 
 class Keyterms:
@@ -122,6 +123,8 @@ def build_voice(config: Config, data_dir: Path, *, api_key: str | None = None) -
         tts = gnani_tts.GnaniWsTTS(
             key, voice=s.tts_voice, model=s.tts_model, language=s.tts_language, ledger=ledger
         )
+    fast = VoskSpotter(data_dir / "models")
     return VoiceKit(
-        rest, stream, whisper, WakeSpotter(whisper), tts, ledger, bool(key), s.mic_device
-    )
+        rest, stream, whisper, WakeSpotter(whisper), tts, ledger, bool(key), s.mic_device,
+        fast if fast.available() else None,
+    )  # fmt: skip

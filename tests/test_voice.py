@@ -1274,3 +1274,94 @@ def test_keyterms_setting_off_sends_nothing(
     cfg.set_setting("stt_keyterms", True)
     kit = factory.build_voice(cfg, tmp_path, api_key="k")
     assert isinstance(kit.rest_stt.keyterms, factory.Keyterms)  # type: ignore[union-attr]
+
+
+# -- fast "Hey Zach" (Vosk) ---------------------------------------------------------------------
+_REAL_MODELS = Path(os.path.expanduser("~")) / ".local" / "share" / "zachary" / "models"
+_CLIPS = Path(os.path.expanduser("~")) / ".cache" / "zachary-bench" / "wake_clips.pkl"
+
+
+class FakeFast:
+    """Fires after ``after`` loud frames (stands in for Vosk hearing "Hey Zach")."""
+
+    def __init__(self, after: int = 10) -> None:
+        self.after, self.loud, self.resets, self.fired = after, 0, 0, 0
+
+    def feed(self, frame: bytes) -> bool:
+        x = np.frombuffer(frame, dtype=np.int16)
+        self.loud = self.loud + 1 if x.size and np.abs(x).mean() > 500 else self.loud
+        if self.loud >= self.after:
+            self.fired += 1
+            return True
+        return False
+
+    def reset(self) -> None:
+        self.resets += 1
+        self.loud = 0
+
+
+def test_fast_wake_word_starts_a_command(gnani: MockGnani) -> None:
+    """ "Hey Zach, open the fees" in one breath: Vosk fires right after "Zach", the rest
+    is streamed to Gnani like push-to-talk (with ~0.3 s from just before the wake)."""
+    src = CountingSource()
+    got: list[Heard] = []
+    fast = FakeFast(after=10)
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=fast)
+    try:
+        src.load(silence(0.5) + speech(1.5) + silence(1.0))
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    h = got[0]
+    assert h.via == "wake" and h.text == gnani.transcript and fast.fired == 1
+    assert float(h.timeline.info["preroll_s"]) > 0.25  # type: ignore[arg-type]  # kept
+    assert fast.resets >= 2  # fresh after the wake and after the command
+    assert gnani.calls[0]["endpoint"] == "stt-stream"  # nothing sent before the wake word
+
+
+def test_no_wake_word_nothing_is_sent(gnani: MockGnani) -> None:
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=FakeFast(after=10**6))
+    try:
+        src.load(silence(0.3) + speech(1.5) + silence(1.0))
+        time.sleep(2.5)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert not got and not gnani.calls  # talking without "Hey Zach" never reaches Gnani
+
+
+@pytest.mark.skipif(
+    not (_REAL_MODELS / "vosk" / "vosk-model-small-en-in-0.4" / "am").is_dir()
+    or not _CLIPS.exists(),
+    reason="needs the Vosk model (cli voice setup) and recorded clips (local only)",
+)
+def test_real_vosk_hears_hey_zach_not_hey_jack() -> None:
+    import pickle
+
+    from zachary.voice.wakeword import VoskSpotter
+
+    clips: dict[str, bytes] = pickle.loads(_CLIPS.read_bytes())
+    spot = VoskSpotter(_REAL_MODELS)
+    assert spot.available()
+
+    def fires(pcm: bytes) -> list[float]:
+        spot.reset()
+        out = []
+        pcm = silence(0.5) + pcm + silence(0.5)
+        for i in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES):
+            if spot.feed(pcm[i : i + FRAME_BYTES]):
+                out.append(round(i / 32000 - 0.5, 2))
+                spot.reset()
+        return out
+
+    t = time.perf_counter()
+    wake = fires(clips["Hey Zach, open the fee receipt."])
+    assert len(wake) == 1 and wake[0] < 1.2  # right after "Zach"
+    assert fires(clips["okzach"])  # "Okay Zach"
+    for no in ("Hey Jack, what's up?", "Open the zachary project.", "talk"):
+        assert fires(clips[no]) == [], no
+    audio_s = sum(len(c) for c in clips.values()) / 32000
+    assert (time.perf_counter() - t) / audio_s < 0.2  # well under real time

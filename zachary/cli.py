@@ -229,6 +229,12 @@ def cmd_voice(args: argparse.Namespace) -> int:
         t = time.perf_counter()
         kit.offline_stt.transcribe(b"\0\0" * 16000)  # downloads the model once
         print(f"local speech model ready ({time.perf_counter() - t:.1f}s)")
+        from zachary.voice.wakeword import download_vosk
+
+        t = time.perf_counter()
+        download_vosk(data_dir / "models")
+        print(f"\"Hey Zach\" model ready ({time.perf_counter() - t:.1f}s)"
+              " (turn on: cli set wake_word true)")  # fmt: skip
         try:
             import sounddevice as sd
 

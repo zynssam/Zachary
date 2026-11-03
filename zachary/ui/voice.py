@@ -90,6 +90,7 @@ class VoiceController(QObject):
             offline_stt=self.kit.offline_stt,
             spotter=self.kit.spotter,
             wake_word=self.wake_word,
+            fast_spotter=self.kit.fast_spotter,
         )
         self.listener.start()
         warm = getattr(self.kit.tts, "warm", None)

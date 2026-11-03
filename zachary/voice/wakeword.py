@@ -1,4 +1,6 @@
-"""Local "Hey Zach" spotting: voice activity -> whisper.cpp on the first ~1.6 s
+"""Local "Hey Zach" spotting. Fast path: ``VoskSpotter`` (streaming, a fixed phrase
+list, no training; see the bottom of this file). Fallback (no Vosk model): voice
+activity -> whisper.cpp on the first ~1.6 s
 of each utterance -> is the wake phrase there? Nothing is trained and nothing
 leaves the machine; audio goes to Gnani only *after* the wake word.
 
@@ -13,6 +15,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from zachary.voice.offline_stt import WhisperSTT, Word
 from zachary.voice.types import SAMPLE_RATE
@@ -51,3 +55,86 @@ class WakeSpotter:
         """``pcm``: audio from the start of an utterance (any length; first 1.6 s used)."""
         window = pcm[: int(SPOT_SECONDS * SAMPLE_RATE) * 2]
         return find_wake(self.whisper.words(window, prompt=PROMPT))
+
+
+# -- fast spotting: Vosk with a fixed phrase list (no training) -----------------------------
+VOSK_MODEL = "vosk-model-small-en-in-0.4"  # 36 MB download, Indian English
+VOSK_URL = f"https://alphacephei.com/vosk/models/{VOSK_MODEL}.zip"
+WAKE_PHRASES = ("hey zack", "hi zack", "ok zack", "okay zack")
+# Phrases that sound close but must *not* wake (without them the recognizer maps
+# "hey Jack" to "hey zack", the nearest phrase it knows). Measured with natural speech.
+DECOYS = ("hey jack", "hey jake", "hey sack", "zachary")
+STABLE_UPDATES = 3  # partial result must show the wake phrase this many times in a row
+# (a partial briefly read "hey zack" for "hey Sara" once; 3 updates = ~0.1 s, measured:
+# fires ~0.9 s into "Hey Zach, open ...", right after "Zach"; final results fire ~2 s)
+
+
+class VoskSpotter:
+    """Streaming "Hey Zach" detector: feed every 32 ms frame; ~4% of real time on one
+    CPU core, ~80 MB RAM. Runs only locally; nothing is sent anywhere."""
+
+    name = "vosk"
+
+    def __init__(self, models_dir: Path) -> None:
+        self.model_dir = models_dir / "vosk" / VOSK_MODEL
+        self._model: object | None = None
+        self._rec: object | None = None
+        self._streak = 0
+
+    def available(self) -> bool:
+        try:
+            import vosk  # noqa: F401
+        except ImportError:
+            return False
+        return (self.model_dir / "am").is_dir()
+
+    def _recognizer(self) -> object:
+        if self._rec is None:
+            import json
+
+            import vosk
+
+            vosk.SetLogLevel(-1)
+            if self._model is None:
+                self._model = vosk.Model(str(self.model_dir))
+            self._rec = vosk.KaldiRecognizer(
+                self._model, SAMPLE_RATE, json.dumps([*WAKE_PHRASES, *DECOYS, "[unk]"])
+            )
+        return self._rec
+
+    def reset(self) -> None:
+        self._rec = None  # a fresh recognizer: nothing heard before carries over
+        self._streak = 0
+
+    def feed(self, frame: bytes) -> bool:
+        """True once the wake phrase was clearly heard (then call ``reset``)."""
+        import json
+
+        rec: Any = self._recognizer()
+        if rec.AcceptWaveform(frame):
+            self._streak = 0  # an utterance ended without a (stable) wake phrase
+            return False
+        partial = json.loads(rec.PartialResult()).get("partial", "")
+        tail = " ".join(partial.split()[-2:])
+        self._streak = self._streak + 1 if tail in WAKE_PHRASES else 0
+        return self._streak >= STABLE_UPDATES
+
+
+def download_vosk(models_dir: Path) -> Path:
+    """Fetch the small Vosk model once (~36 MB) into ``<models>/vosk``."""
+    import io
+    import urllib.request
+    import zipfile
+
+    target = models_dir / "vosk" / VOSK_MODEL
+    if (target / "am").is_dir():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(VOSK_URL, timeout=60) as r:  # (a fixed https URL)
+        data = r.read()
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for member in z.namelist():  # no absolute paths / ".." in a downloaded archive
+            if member.startswith("/") or ".." in Path(member).parts:
+                raise ValueError(f"unsafe path in the Vosk archive: {member}")
+        z.extractall(target.parent)
+    return target
