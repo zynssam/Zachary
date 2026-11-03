@@ -30,3 +30,10 @@ ANSWER_CSS = (
     "padding: 8px 10px; border-radius: 8px;"
     f" background: rgba({ACCENT_RGBA[0]}, {ACCENT_RGBA[1]}, {ACCENT_RGBA[2]}, 22);"
 )
+
+# The plan review window (Phase 7).
+PLAN_WINDOW_SIZE = (900, 560)
+PRIMARY_BUTTON_CSS = (
+    f"QPushButton {{ background: {ACCENT}; color: white; padding: 6px 14px; border-radius: 6px; }}"
+    " QPushButton:disabled { background: #94a3b8; }"
+)

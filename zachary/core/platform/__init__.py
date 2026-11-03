@@ -108,6 +108,15 @@ class Platform(Protocol):
         """Start a background process that outlives us (no console window)."""
         ...
 
+    def trash(self, path: Path) -> str:
+        """Move to the OS trash (never a permanent delete); returns where it went
+        ("" if unknown) so ``restore`` can undo it."""
+        ...
+
+    def restore(self, trashed: str, original: str) -> None:
+        """Undo ``trash``: move the item back to ``original`` (never over a file)."""
+        ...
+
     def try_lock(self, path: Path) -> object | None:
         """Take an exclusive single-instance lock; ``None`` if already held."""
         ...

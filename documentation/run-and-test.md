@@ -1,7 +1,7 @@
 # Running and testing Zachary
 
 How to set up, run every part (indexer, CLI, quick bar), run all automated
-checks and benchmarks, and test everything by hand. Covers Phases 0–6.
+checks and benchmarks, and test everything by hand. Covers Phases 0–7.
 
 **On Windows?** See [windows.md](windows.md) for the full Windows setup.
 
@@ -185,6 +185,25 @@ python -m zachary.cli set llm_effort low                # low (default) | medium
 
 ---
 
+### 3.6 Clean up and organize (Phase 7)
+Nothing changes until you approve. Removed files go to the system trash, and undo puts everything back.
+```bash
+python -m zachary.cli clean                       # plan: duplicates, old installers, junk, empty folders, large files
+python -m zachary.cli clean downloads duplicates  # narrower
+python -m zachary.cli plan show 3                 # numbered items, [x] = ticked
+python -m zachary.cli plan approve 3 --skip 4,7   # asks y/N, then trashes/moves only those
+python -m zachary.cli undo                        # restore the last applied plan
+python -m zachary.cli organize dsa notes          # plan: move a topic's files into one folder
+python -m zachary.cli rules add ~/Documents/Projects never_touch   # never propose anything there
+python -m zachary.cli rules
+```
+Bar or voice: "clean up my downloads", "find duplicates", "organize my DSA notes" open the **review window**
+(untick items, double-click "Move to" to change a destination, then Approve / Reject; Undo afterwards).
+"undo" then "yes" undoes the last applied plan. "yes" alone never approves a plan.
+
+Never proposed: anything under `never_touch`, inside a code project or installed software (a folder with
+≥ 10 libraries/binaries, e.g. a JDK), hidden, symlinks / hard links, or Documents / Downloads / … themselves.
+
 ## 4. Automated checks
 
 Run all of these before committing (they are what CI runs):
@@ -231,6 +250,7 @@ QT_QPA_PLATFORM=wayland pytest tests/test_ui.py   # UI tests on the real display
 | `test_extract`, `test_semantic`, `test_vectors`, `test_versions`, `test_relations`, `test_semantic_search`, `test_inotify_tree` | Phase 3: extraction, embeddings, vector index, versions, related files, meaning search, exclude-aware watcher |
 | `test_voice` | Phase 4: voice (Gnani mocked) |
 | `test_topics` | Phase 5: topics, sessions, resume, timeline, learning |
+| `test_clean` | Phase 7: duplicate detection, protections, nothing changes without approval, execute + undo restores every file (fake trash), the real OS trash, organize |
 | `test_qa` | Phase 6: passages, answers with citations, LLM off/failing, unclear-command routing, what is sent (Claude mocked; the real API host is blocked in tests) |
 
 **CI:** every push runs the checks on Ubuntu + Windows, Python 3.11 + 3.12:
@@ -264,6 +284,7 @@ QT_QPA_PLATFORM=wayland python bench/bench_phase2.py --db ~/.cache/zachary-bench
 | UI never blocks | `bench_phase2` → `[ui]` | longest stall 26–65 ms |
 | Search with meaning < 50 ms p95 | `bench_phase3` → B `[search]` | p95 28–36 ms (assistant, in-memory index) |
 | "Related files" < 10 ms | `bench_phase3` → `[related]` | p95 0.5 ms |
+| Clean-up plan, 200k files (Phase 7) | `bench_phase7` → `[whole clean plan]` | 3.8 s with 500 duplicate pairs (on demand, not a hot path) |
 | Question → passages (Phase 6) | `bench_phase6` → `[retrieve]` | p95 45 ms with meaning search (268k chunks) |
 
 ```bash
@@ -272,6 +293,8 @@ python bench/make_corpus.py ~/.cache/zachary-bench/corpus --files 2000
 python bench/bench_phase3.py --corpus ~/.cache/zachary-bench/corpus --big-db ~/.cache/zachary-bench/bench.db
 # 6. Phase 6: ask-your-files retrieval on 200k (adds ~270k synthetic chunks to a copy; ~2 min)
 python bench/bench_phase6.py --db ~/.cache/zachary-bench/bench3.db
+# 7. Phase 7: clean-up / organize plans on 200k (adds then removes ~100 MB of duplicates)
+python bench/bench_phase7.py --home ~/.cache/zachary-bench/home --db ~/.cache/zachary-bench/bench.db
 ```
 
 Clean up afterwards: `rm -rf ~/.cache/zachary-bench`.
@@ -364,6 +387,18 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 | 9 | "explain the last project I was working on" | 2–3 sentences: what the project is + what you changed lately; the project folder first in the list, "From: README.md, …" |
 | 10 | Search "receipt", then "explain the first one" / "explain it" | an explanation of that file |
 | 11 | "summarize my dsa notes" | a summary from your DSA files |
+
+
+### Phase 7: clean up and organize
+| # | Do | Expect |
+|---|---|---|
+| 1 | `cli clean` | a numbered plan; on your home: ~19 duplicates, 3 old installers (514 MB), ~20 lock files, ~8 empty folders; **nothing in `~/Documents/hackathon` (installed software) or code projects** |
+| 2 | Check the disk | nothing changed (making a plan never touches files) |
+| 3 | Bar: "find duplicates" | the review window; untick one, Approve | only the ticked ones go to the trash (check your file manager's Trash) |
+| 4 | Bar: "undo", then "yes" (or the Undo button) | every file is back where it was |
+| 5 | `cli rules add ~/Downloads never_touch`, then `cli clean downloads` | nothing proposed there; `cli rules remove ~/Downloads never_touch` |
+| 6 | Bar: "organize my DSA notes" | moves into one folder (the one most already share, else `Documents/<topic>`); Reject leaves everything |
+| 7 | Edit a file after the plan, then approve | that item is skipped ("changed since the plan was made") |
 
 ---
 

@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Protocol
 
+from zachary.actions import executor, planner
+from zachary.actions import undo as undo_mod
 from zachary.brain import qa
 from zachary.brain import sessions as sess
 from zachary.brain.context import Context, Item
@@ -25,6 +27,7 @@ from zachary.brain.intents import Intent, parse, tokenize
 from zachary.brain.llm import LLM, Excerpt, LLMError
 from zachary.brain.timeparse import parse_time
 from zachary.core.config import Config, PathRules
+from zachary.core.platform import Platform
 from zachary.indexer import clustering
 from zachary.indexer.projects import Project, list_projects
 from zachary.indexer.relations import related as related_files
@@ -41,6 +44,13 @@ CLEAR_GAP = 0.12  # top score must beat the runner-up by 12% to act without aski
 # The LLM reads a command only when it's a sentence the parser couldn't place
 # (no command word) and the search found nothing convincing.
 ROUTE_MIN_WORDS = 4
+CLEAN_CATEGORIES = {
+    "duplicates": "duplicate", "duplicate": "duplicate", "dupes": "duplicate",
+    "installer": "installer", "installers": "installer", "setup": "installer",
+    "setups": "installer", "empty": "empty_folder", "junk": "junk", "temp": "junk",
+    "temporary": "junk", "large": "large", "big": "large", "huge": "large",
+}  # fmt: skip
+STANDARD_FOLDERS = frozenset("downloads desktop documents pictures music videos".split())
 EXPLAIN_PASSAGES = 6
 LAST_WORDS = frozenset(
     "last latest recent recently current currently working worked doing now".split()
@@ -73,6 +83,8 @@ class Reply:
     ms: float = 0.0
     timings: dict[str, float] = field(default_factory=dict)
     detail: str = ""  # longer on-screen text (an answer's source passage)
+    plan_id: int = 0  # a clean/organize plan to review (the UI opens the review window)
+    plan: planner.Plan | None = None  # ...and the plan itself (no DB reads on the UI thread)
 
 
 def clear_winner(results: list[SearchResult] | list[Item]) -> bool:
@@ -161,10 +173,13 @@ class Handler:
         config: Config,
         semantic: Callable[[], SemanticSearch | None] | None = None,
         llm: Callable[[], LLM | None] | None = None,
+        platform: Platform | None = None,
     ) -> None:
         self.conn = conn
         self.actions = actions
         self.config = config
+        # Needed only to run approved clean/organize plans (trash / restore).
+        self.platform = platform or getattr(actions, "platform", None)
         self.context = Context()
         self._rules: PathRules | None = None
         self._rules_rev = -1
@@ -290,6 +305,12 @@ class Handler:
             reply = self._ask(intent, execute=execute)
         elif intent.kind == "explain":
             reply = self._explain(intent, execute=execute)
+        elif intent.kind == "clean":
+            reply = self._clean(intent, execute=execute)
+        elif intent.kind == "organize":
+            reply = self._organize(intent, execute=execute)
+        elif intent.kind == "undo":
+            reply = self._undo(intent, execute=execute)
         elif intent.kind == "recent":
             items = self._recent(intent.query)
             self.context.set_results(items, text, "recent")
@@ -663,12 +684,125 @@ class Handler:
             return Reply(say, self.context.view, self.context.items, intent)
         if not execute:
             self._pending = pending  # preview: don't consume it
-            return Reply(f"Enter to reopen {pending[2]}.", "session", pending[1], intent)
+            verb = "undo" if pending[0] == "undo" else "reopen"
+            return Reply(f"Enter to {verb} {pending[2]}.", self.context.view, pending[1], intent)
         _kind, items, what = pending
+        if _kind == "undo":
+            return self._run_undo(int(items[0].file_id) if items else 0, intent)
         opened = sum(1 for it in items if self.actions.open(it))
         say = f"Reopened {opened} of {len(items)} files." if opened < len(items) else (
             f"Reopened {what}.")  # fmt: skip
         return Reply(say, "session", items, intent, "open" if opened else None)
+
+    # -- Phase 7: clean / organize / undo (plans only; files change after approval) -------
+    def _plan_reply(self, plan: planner.Plan, intent: Intent) -> Reply:
+        items = [
+            Item(0, it.src, os.path.basename(it.src.rstrip("/\\")), "dir" if it.is_dir else
+                 "other", it.is_dir, it.mtime,
+                 [planner.LABELS[it.category] + ": " + it.reason
+                  + (f" → {planner._short(it.dst)}" if it.dst else "")], 0.0)
+            for it in plan.items[:RESULT_LIMIT]
+        ]  # fmt: skip
+        self.context.set_results([], "", "plan")
+        if not plan.items:
+            return Reply(plan.note, "plan", [], intent)
+        what = "Review and approve it" if plan.kind == "clean" else "Review the moves"
+        return Reply(f"{plan.note} {what} — nothing changes until you approve.", "plan", items,
+                     intent, plan_id=plan.id, detail=plan.title, plan=plan)  # fmt: skip
+
+    def _clean(self, intent: Intent, *, execute: bool) -> Reply:
+        q = set(words(intent.query))
+        cats = {c for w, c in CLEAN_CATEGORIES.items() if w in q}
+        scope = None
+        for w in q:
+            if w in STANDARD_FOLDERS:
+                cand = os.path.join(os.path.expanduser("~"), w.capitalize())
+                if os.path.isdir(cand):
+                    scope = cand
+        where = f" in {planner._short(scope)}" if scope else ""
+        if not execute:
+            return Reply(f"Enter to look for things to clean up{where}.", "plan", [], intent)
+        plan = planner.save(self.conn, planner.clean_plan(
+            self.conn, self.config, scope=scope, categories=cats or None))  # fmt: skip
+        return self._plan_reply(plan, intent)
+
+    def _organize(self, intent: Intent, *, execute: bool) -> Reply:
+        q = intent.query.strip()
+        if not q:
+            return Reply("Organize what? Try “organize my DSA notes”.", "none", [], intent)
+        want = set(words(q)) - {"notes", "stuff", "files", "documents", "docs"}
+        topic = None
+        if want:
+            scored = sorted(
+                ((len(want & set(words(t.label))) / len(want), t)
+                 for t in clustering.list_topics(self.conn)),
+                key=lambda x: -x[0],
+            )  # fmt: skip
+            if scored and scored[0][0] >= 0.5:
+                topic = scored[0][1]
+        if topic is not None:
+            label = topic.label
+            ids = clustering.topic_files(self.conn, topic.id, limit=500)
+        else:
+            label = q
+            results, _ = self._search(q, 60)
+            ids = [r.file_id for r in results if not r.is_dir and r.kind == "document"]
+        if not execute:
+            return Reply(f"Enter to plan putting “{label}” ({len(ids)} files) in one folder.",
+                         "plan", [], intent)  # fmt: skip
+        if not ids:
+            return Reply(f"I found no documents about “{q}”.", "none", [], intent)
+        plan = planner.save(self.conn, planner.organize_plan(self.conn, self.config, ids, label))
+        return self._plan_reply(plan, intent)
+
+    def _undo(self, intent: Intent, *, execute: bool) -> Reply:
+        plan = planner.latest(self.conn, ["executed", "failed"])
+        if plan is None:
+            return Reply("There's nothing to undo.", "none", [], intent)
+        n = self.conn.execute(
+            "SELECT count(*) FROM undo_log WHERE plan_id = ? AND op != 'mkdir'", (plan.id,)
+        ).fetchone()[0]
+        what = f"“{plan.title}” ({n} change{'s' if n != 1 else ''})"
+        marker = [Item(plan.id, "", plan.title, "other", False, plan.created_at, [])]
+        if execute:
+            self._pending = ("undo", marker, what)
+        return Reply(f"Undo {what}? Say yes to restore everything.", "plan", [], intent,
+                     plan_id=0)  # fmt: skip
+
+    def undo_plan(self, plan_id: int) -> Reply:
+        """The review window's Undo button (one click)."""
+        return self._run_undo(plan_id, Intent("undo_plan"))
+
+    def _run_undo(self, plan_id: int, intent: Intent) -> Reply:
+        plan = planner.load(self.conn, plan_id)
+        if plan is None or self.platform is None:
+            return Reply("There's nothing to undo.", "none", [], intent)
+        res = undo_mod.undo(self.conn, self.platform, plan)
+        detail = "\n".join(res.problems[:8])
+        return Reply(res.summary(), "plan", [], intent, detail=detail)
+
+    def approve_plan(self, plan_id: int, select: dict[int, bool] | None = None,
+                     dst: dict[int, str] | None = None) -> Reply:  # fmt: skip
+        """The review window's Approve button: the user's explicit approval."""
+        intent = Intent("approve")
+        plan = planner.load(self.conn, plan_id)
+        if plan is None or plan.status != "proposed":
+            return Reply("That plan is no longer waiting for approval.", "plan", [], intent)
+        if self.platform is None:
+            return Reply("Can't change files from here.", "plan", [], intent)
+        planner.edit(self.conn, plan, select=select, dst=dst)
+        planner.set_status(self.conn, plan, "approved")
+        res = executor.execute(self.conn, self.platform, self.config, plan)
+        problems = [f"{planner._short(i.src)}: {i.result}" for i in plan.items
+                    if i.result.startswith(("skipped", "failed"))]  # fmt: skip
+        return Reply(res.summary() + " Say “undo” to put everything back.", "plan", [], intent,
+                     plan_id=plan.id, detail="\n".join(problems[:8]), plan=plan)  # fmt: skip
+
+    def reject_plan(self, plan_id: int) -> Reply:
+        plan = planner.load(self.conn, plan_id)
+        if plan is not None and plan.status == "proposed":
+            planner.set_status(self.conn, plan, "rejected")
+        return Reply("Okay, nothing was changed.", "plan", [], Intent("reject"))
 
     def _related(self, intent: Intent) -> Reply:
         """Precomputed related files of a shown item or of the best match for a query."""

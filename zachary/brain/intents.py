@@ -87,6 +87,30 @@ QUESTION_ANYWHERE = frozenset("kab kitna kitni kitne kaunsa kaunsi kyun yaavaga 
 FILE_ASK_WORDS = frozenset(
     "file files folder folders document documents doc docs pdf pdfs where kahan kidhar elli".split()
 )
+# Cleaning / organizing (Phase 7): always a plan to review, never an action.
+CLEAN_WORDS = frozenset(
+    """
+    clean cleanup clear declutter tidy duplicates duplicate dupes junk safai saaf
+    """.split()
+)
+ORGANIZE_WORDS = frozenset("organize organise arrange sort jamao lagao group".split())
+UNDO_WORDS = frozenset("undo revert".split())
+REMOVE_VERBS = frozenset("remove delete trash hatao hata nikalo bin".split())
+# What a clean-up can be about ("remove old installers", "delete empty folders").
+CLEAN_TARGETS = frozenset(
+    """
+    duplicates duplicate dupes installer installers setup setups empty junk temp temporary
+    large big huge
+    """.split()
+)
+PLAN_FILLER = frozenset(
+    """
+    clean cleanup clear up declutter tidy organize organise arrange sort out jamao lagao karo
+    kar do my mine me the a an all of in on please stuff things files file folder folders
+    together into one place group everything some free space safai saaf undo revert that last
+    this it cleanup changes change find show remove delete trash hatao hata nikalo bin
+    """.split()
+)
 # "explain the last project I was working on", "summarize my dsa notes", "tell me about it"
 EXPLAIN_WORDS = frozenset(
     "explain summarize summarise summary describe overview recap samjhao samjha samjhana".split()
@@ -152,7 +176,8 @@ _FUZZY_VOCAB = sorted(
     {"open", "launch", "find", "search", "locate", "show", "list", "display", "projects",
      "project", "repository", "repositories", "recent", "recently", "folder", "directory",
      "first", "second", "third", "fourth", "fifth", "older", "newer", "latest",
-     "related", "similar", "explain", "summarize", "describe"}
+     "related", "similar", "explain", "summarize", "describe", "clean", "organize",
+     "duplicates", "undo"}
 )  # fmt: skip
 _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show", "list", "display"})
 
@@ -160,7 +185,7 @@ _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show",
 @dataclass(frozen=True, slots=True)
 class Intent:
     kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|topic|
-    #            resume|timeline|confirm|cancel|ask|explain|none
+    #            resume|timeline|confirm|cancel|ask|explain|clean|organize|undo|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
@@ -318,6 +343,18 @@ def parse(text: str) -> Intent:
         and any(t in NO_WORDS for t in toks)
     ):
         return Intent("cancel", confidence=conf, corrected=corrected)
+
+    # --- clean / organize / undo: destructive -> always a plan (CLAUDE.md) ---------------
+    if any(t in UNDO_WORDS for t in toks) and not any(t in ORGANIZE_WORDS for t in toks):
+        return Intent("undo", confidence=conf, corrected=corrected)
+    free_space = "free" in toks and "space" in toks
+    remove_kind = any(t in REMOVE_VERBS for t in toks) and any(t in CLEAN_TARGETS for t in toks)
+    if (any(t in CLEAN_WORDS for t in toks) or free_space or remove_kind) and not has_open:
+        rest = [t for t in toks if t not in PLAN_FILLER]
+        return Intent("clean", query=" ".join(rest), confidence=conf, corrected=corrected)
+    if any(t in ORGANIZE_WORDS for t in toks):
+        rest = [t for t in toks if t not in PLAN_FILLER]
+        return Intent("organize", query=" ".join(rest), confidence=conf, corrected=corrected)
 
     # --- explain / summarize a project, topic or the shown item ---------------------------
     tell_about = "tell" in toks and "about" in toks

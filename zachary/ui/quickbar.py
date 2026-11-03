@@ -34,6 +34,7 @@ from zachary.brain.handler import Reply
 from zachary.telemetry.latency import LATENCY
 from zachary.ui import style
 from zachary.ui.engine import Engine
+from zachary.ui.plan_review import PlanReview
 from zachary.ui.results import ResultsView
 
 TYPE_DEBOUNCE_MS = 25
@@ -106,6 +107,7 @@ class QuickBar(QWidget):
         engine.failed.connect(lambda _rid, msg: self.status.setText(f"Error: {msg}"))
 
         self._last_applied = 0
+        self.review: PlanReview | None = None  # clean/organize plans (Phase 7)
         self._explicit_selection = False  # user moved with arrows since the last reply
         self._holding_space = False
         # In a box with text, Space is a space when tapped and talk when held longer
@@ -267,10 +269,27 @@ class QuickBar(QWidget):
             QTimer.singleShot(0, self.hide)
 
     # -- replies -------------------------------------------------------------------------
+    def _review(self) -> PlanReview:
+        if self.review is None:
+            self.review = PlanReview()
+            self.review.approved.connect(
+                lambda pid, sel, dst: self.engine.ask("approve", (pid, sel, dst))
+            )
+            self.review.rejected.connect(lambda pid: self.engine.ask("reject", pid))
+            self.review.undo_requested.connect(lambda pid: self.engine.ask("undo_plan", pid))
+        return self.review
+
     def _on_reply(self, rid: int, reply: Reply) -> None:
+        if reply.intent.kind in {"approve", "reject", "undo_plan"}:
+            if reply.intent.kind != "reject":
+                self._review().show_result(reply)
+            self.status.setText(reply.say)
+            return  # from the review window: the bar's list stays as it is
         if rid < self._last_applied:
             return  # an older reply arrived late
         self._last_applied = rid
+        if reply.plan is not None and reply.plan.status == "proposed" and reply.plan.items:
+            self._review().show_plan(reply.plan)
         self.status.setText(reply.say)
         self.answer.setText(reply.detail)
         self.answer.setVisible(bool(reply.detail))

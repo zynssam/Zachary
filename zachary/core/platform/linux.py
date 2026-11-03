@@ -304,6 +304,16 @@ class LinuxPlatform:
 
         threading.Thread(target=work, name="zach-reveal", daemon=True).start()
 
+    def trash(self, path: Path) -> str:
+        from zachary.core.platform import trash
+
+        return trash.trash(path)
+
+    def restore(self, trashed: str, original: str) -> None:
+        from zachary.core.platform import trash
+
+        trash.restore(trashed, original)
+
     def spawn_detached(self, argv: list[str]) -> None:
         _popen_quiet(argv)
 

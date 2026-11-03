@@ -461,6 +461,16 @@ class WindowsPlatform:
         if sys.platform == "win32":
             subprocess.Popen(f'explorer /select,"{path}"', close_fds=True)
 
+    def trash(self, path: Path) -> str:
+        from zachary.core.platform import trash
+
+        return trash.trash(path)
+
+    def restore(self, trashed: str, original: str) -> None:
+        from zachary.core.platform import trash
+
+        trash.restore(trashed, original)
+
     def spawn_detached(self, argv: list[str]) -> None:
         if sys.platform != "win32":
             return

@@ -63,7 +63,9 @@ class Engine(QObject):
         self._thread.wait(3000)
 
     def ask(self, op: str, payload: Any = None) -> int:
-        """Queue a request; returns its id. ``op``: preview|submit|act|pause."""
+        """Queue a request; returns its id.
+
+        ``op``: preview | submit | act | pause | approve | reject | undo_plan."""
         with self._lock:
             self._next_id += 1
             rid = self._next_id
@@ -84,6 +86,7 @@ class Engine(QObject):
             config,
             lambda: factory(conn, config),
             llm.Provider(config, Path(self.db_path).parent),
+            self.platform,
         )
         _ = self.handler.semantic  # load the model now, not on the first keystroke
 
@@ -109,6 +112,13 @@ class Engine(QObject):
                     reply = h.submit(f"related to #{int(index) + 1}")
                 else:
                     reply = h.act(int(index), str(action))
+            elif op == "approve":  # the review window's Approve button
+                plan_id, select, dst = payload
+                reply = h.approve_plan(int(plan_id), dict(select), dict(dst))
+            elif op == "reject":
+                reply = h.reject_plan(int(payload))
+            elif op == "undo_plan":
+                reply = h.undo_plan(int(payload))
             elif op == "pause":
                 h.config.set_setting("indexing_paused", bool(payload))
                 return
