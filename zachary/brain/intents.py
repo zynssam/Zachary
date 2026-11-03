@@ -87,6 +87,17 @@ QUESTION_ANYWHERE = frozenset("kab kitna kitni kitne kaunsa kaunsi kyun yaavaga 
 FILE_ASK_WORDS = frozenset(
     "file files folder folders document documents doc docs pdf pdfs where kahan kidhar elli".split()
 )
+# "explain the last project I was working on", "summarize my dsa notes", "tell me about it"
+EXPLAIN_WORDS = frozenset(
+    "explain summarize summarise summary describe overview recap samjhao samjha samjhana".split()
+)
+EXPLAIN_FILLER = frozenset(
+    """
+    explain summarize summarise summary describe overview recap samjhao samjha samjhana
+    tell about give me a an the of my mine i was were am been on what is it this that
+    briefly quickly short please kya hai ke ki ka mujhe
+    """.split()
+)
 RELATED_WORDS = frozenset("related similar relevant sambandhit sambandhita sambandhisida".split())
 _JAISA = frozenset("jaisa jaise jaisi".split())
 RELATED_FILLER = frozenset(
@@ -141,7 +152,7 @@ _FUZZY_VOCAB = sorted(
     {"open", "launch", "find", "search", "locate", "show", "list", "display", "projects",
      "project", "repository", "repositories", "recent", "recently", "folder", "directory",
      "first", "second", "third", "fourth", "fifth", "older", "newer", "latest",
-     "related", "similar"}
+     "related", "similar", "explain", "summarize", "describe"}
 )  # fmt: skip
 _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show", "list", "display"})
 
@@ -149,7 +160,7 @@ _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show",
 @dataclass(frozen=True, slots=True)
 class Intent:
     kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|topic|
-    #            resume|timeline|confirm|cancel|ask|none
+    #            resume|timeline|confirm|cancel|ask|explain|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
@@ -307,6 +318,20 @@ def parse(text: str) -> Intent:
         and any(t in NO_WORDS for t in toks)
     ):
         return Intent("cancel", confidence=conf, corrected=corrected)
+
+    # --- explain / summarize a project, topic or the shown item ---------------------------
+    tell_about = "tell" in toks and "about" in toks
+    if any(t in EXPLAIN_WORDS for t in toks) or tell_about:
+        rest = [t for t in toks if t not in EXPLAIN_FILLER]
+        # "explain the second one" refers to a shown result; "the last project" doesn't.
+        pick = [t for i, t in enumerate(rest) if toks.index(t) not in ord_idx]
+        if ordinal is not None and not [t for t in pick if t not in {"one", "result", "file"}]:
+            return Intent("explain", ordinal=ordinal, confidence=conf, corrected=corrected)
+        if has_pronoun and not rest:
+            return Intent("explain", confidence=conf, corrected=corrected)
+        return Intent("explain", query=" ".join(rest), confidence=conf,
+                      project_hint=any(t in PROJECT_WORDS for t in toks),
+                      corrected=corrected)  # fmt: skip
 
     # --- resume where I left off -------------------------------------------------------
     joined = " ".join(toks)

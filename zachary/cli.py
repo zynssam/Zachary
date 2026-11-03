@@ -430,7 +430,12 @@ def cmd_ask(args: argparse.Namespace) -> int:
                       lambda: local_semantic(conn, cfg, in_memory=False), provider)  # fmt: skip
     question = " ".join(args.question)
     t0 = time.perf_counter()
-    reply = handler.submit(question if question.startswith("ask ") else f"ask {question}")
+    from zachary.brain.intents import parse
+
+    explain = parse(question).kind == "explain"  # "explain my last project" stays itself
+    reply = handler.submit(
+        question if explain or question.startswith("ask ") else f"ask {question}"
+    )
     ms = (time.perf_counter() - t0) * 1e3
     print(f"zach: {reply.say}")
     if reply.detail:

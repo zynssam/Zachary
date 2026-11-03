@@ -26,7 +26,7 @@ from zachary.brain.llm import LLM, Excerpt, LLMError
 from zachary.brain.timeparse import parse_time
 from zachary.core.config import Config, PathRules
 from zachary.indexer import clustering
-from zachary.indexer.projects import list_projects
+from zachary.indexer.projects import Project, list_projects
 from zachary.indexer.relations import related as related_files
 from zachary.search import feedback
 from zachary.search.hybrid import SearchResult, recent, search, search_terms
@@ -41,6 +41,11 @@ CLEAR_GAP = 0.12  # top score must beat the runner-up by 12% to act without aski
 # The LLM reads a command only when it's a sentence the parser couldn't place
 # (no command word) and the search found nothing convincing.
 ROUTE_MIN_WORDS = 4
+EXPLAIN_PASSAGES = 6
+LAST_WORDS = frozenset(
+    "last latest recent recently current currently working worked doing now".split()
+)
+PROJECT_WORDS_ = frozenset("project projects repo repos repository repositories".split())
 SENTENCE_WORDS = frozenset(
     """
     you could can would please the that this thing things something stuff me i my which about
@@ -131,6 +136,11 @@ def _item(r: SearchResult, conn: sqlite3.Connection | None = None) -> Item:
             if v in rows
         ]
     return it
+
+
+def _inside(path: str, folder: str) -> bool:
+    f = folder.rstrip("/\\")
+    return path.startswith(f + "/") or path.startswith(f + "\\")
 
 
 REASONS = {
@@ -278,6 +288,8 @@ class Handler:
             reply = self._answer(intent, execute=execute)
         elif intent.kind == "ask":
             reply = self._ask(intent, execute=execute)
+        elif intent.kind == "explain":
+            reply = self._explain(intent, execute=execute)
         elif intent.kind == "recent":
             items = self._recent(intent.query)
             self.context.set_results(items, text, "recent")
@@ -331,6 +343,146 @@ class Handler:
             return None
         log.info("llm read the request as: %s", r.command)
         return self._handle(command, execute=True, routed=True)
+
+    # -- explain a project / topic / shown item ------------------------------------------
+    def _explain(self, intent: Intent, *, execute: bool) -> Reply:
+        """ "explain the last project I was working on", "tell me about the zachary
+        project", "summarize my dsa notes", "explain the second one"."""
+        if intent.ordinal is not None or (not intent.query and not intent.project_hint):
+            ctx = self.context
+            target = (
+                ctx.by_ordinal(intent.ordinal) if intent.ordinal is not None
+                else ctx.focused_item()
+            ) if ctx.active() else None  # fmt: skip
+            if target is None:
+                return Reply("Explain what? Try “explain my last project”.", "none", [], intent)
+            if target.is_dir or target.kind == "project":
+                return self._explain_folder(target.path, target.name, target.file_id, [],
+                                            intent, execute=execute)  # fmt: skip
+            return self._explain_files(target.name, [target.file_id], [], intent,
+                                       execute=execute)  # fmt: skip
+        q_words = words(intent.query)
+        want_last = any(w in LAST_WORDS for w in q_words)
+        name = [w for w in q_words if w not in LAST_WORDS and w not in PROJECT_WORDS_]
+        recent_files: list[str] = []
+        if want_last:
+            s = sess.last_session(self.conn)
+            recent_files = [f.name for f in s.files[:10]] if s else []
+        if intent.project_hint or (want_last and not name):
+            proj = self._which_project(name, want_last)
+            if proj is not None:
+                return self._explain_folder(proj.path, proj.name, proj.folder_id, recent_files,
+                                            intent, execute=execute)  # fmt: skip
+            if want_last and not name:
+                s = sess.last_session(self.conn)
+                if s is None or not s.files:
+                    return Reply("I don't know what you worked on last yet.", "none", [], intent)
+                return self._explain_files(s.label or "your last session",
+                                           [f.file_id for f in s.files if not f.is_dir][:8],
+                                           recent_files, intent, execute=execute)  # fmt: skip
+        # A topic / anything else: the passages that match it, explained.
+        subject = " ".join(name) or intent.query
+        passages = qa.retrieve(self.conn, subject, semantic=self.semantic, rules=self.rules(),
+                               k=EXPLAIN_PASSAGES)  # fmt: skip
+        return self._explain_reply(subject, passages, recent_files, None, intent, execute=execute)
+
+    def _which_project(self, name: list[str], want_last: bool) -> Project | None:
+        projects = list_projects(self.conn)
+        if not projects:
+            return None
+        if name:
+
+            def score(p: Project) -> int:
+                pw = words(p.name)
+                return sum(any(n.startswith(w) or w.startswith(n) for n in pw) for w in name)
+
+            best = max(projects, key=score)
+            return best if score(best) > 0 else None
+        # "my last project": the project of the last work session, else the most active.
+        s = sess.last_session(self.conn)
+        if s is not None and s.files:
+            hits = {
+                p.folder_id: sum(1 for f in s.files if _inside(f.path, p.path)) for p in projects
+            }
+            pid, n = max(hits.items(), key=lambda kv: kv[1])
+            if n:
+                return next(p for p in projects if p.folder_id == pid)
+        return projects[0]
+
+    def _explain_folder(self, folder: str, name: str, folder_id: int, recent: list[str],
+                        intent: Intent, *, execute: bool) -> Reply:  # fmt: skip
+        """A project/folder: its README and docs first, then what was edited lately."""
+        prefix = folder.rstrip("/\\") + ("\\" if "\\" in folder and "/" not in folder else "/")
+        rows = self.conn.execute(
+            """SELECT f.id, f.name, f.mtime FROM files f
+               WHERE f.path >= ? AND f.path < ? AND f.is_dir = 0
+                 AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+               ORDER BY f.mtime DESC LIMIT 400""",
+            (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)),
+        ).fetchall()
+        recent_set = {r.lower() for r in recent}
+
+        def rank(r: tuple[int, str, float]) -> tuple[int, float]:
+            n = r[1].lower()
+            pri = 0 if n.startswith("readme") else 1 if n.endswith((".md", ".txt", ".rst")) else 2
+            if n in recent_set:
+                pri = min(pri, 1)
+            return (pri, -r[2])
+
+        ids = [r[0] for r in sorted(rows, key=rank)[:EXPLAIN_PASSAGES]]
+        return self._explain_files(name, ids, recent, intent, execute=execute,
+                                   folder=(folder_id, folder, name))  # fmt: skip
+
+    def _explain_files(self, subject: str, file_ids: list[int], recent: list[str],
+                       intent: Intent, *, execute: bool,
+                       folder: tuple[int, str, str] | None = None) -> Reply:  # fmt: skip
+        passages: list[qa.Passage] = []
+        rules = self.rules()
+        for fid in file_ids:
+            row = self.conn.execute(
+                """SELECT c.id, c.text_excerpt, f.path, f.name, f.kind, f.mtime FROM chunks c
+                   JOIN files f ON f.id = c.file_id WHERE c.file_id = ? ORDER BY c.ord LIMIT 1""",
+                (fid,),
+            ).fetchone()
+            if row is None or rules.is_excluded(row[2], False):
+                continue
+            cid, text, path, fname, kind, mtime = row
+            passages.append(qa.Passage(fid, path, fname, kind, float(mtime), cid, text,
+                                       qa.snippet(text, []), 0.0))  # fmt: skip
+        return self._explain_reply(subject, passages, recent, folder, intent, execute=execute)
+
+    def _explain_reply(self, subject: str, passages: list[qa.Passage], recent: list[str],
+                       folder: tuple[int, str, str] | None, intent: Intent, *, execute: bool
+                       ) -> Reply:  # fmt: skip
+        items: list[Item] = []
+        if folder is not None:
+            fid, fpath, fname = folder
+            items.append(Item(fid, fpath, fname, "project", True, time.time(), ["project"]))
+        for p in passages:
+            if all(it.file_id != p.file_id for it in items):
+                items.append(Item(p.file_id, p.path, p.name, p.kind, False, p.mtime,
+                                  [f"“{p.snippet}”"], p.score))  # fmt: skip
+        self.context.set_results(items, subject, "answer")
+        if not passages:
+            return Reply(f"I have nothing readable about {subject} yet.", "answer", items, intent)
+        best = passages[0]
+        quote = f"“{best.snippet}”\n— {best.name}"
+        llm = self.llm()
+        if not execute:
+            say = "Enter to explain." if llm is not None else f"About {subject}: {best.name}."
+            return Reply(say, "answer", items, intent, selected=0, detail=quote)
+        fallback = f"{subject}: here's what its files say, starting with {best.name}."
+        if llm is None:
+            return Reply(fallback, "answer", items, intent, selected=0, detail=quote)
+        try:
+            ans = llm.explain(subject, [Excerpt(p.name, p.mtime, p.text) for p in passages],
+                              recent)  # fmt: skip
+        except LLMError as e:
+            return Reply(f"Couldn't ask the LLM ({e}). {fallback}", "answer", items, intent,
+                         selected=0, detail=quote)  # fmt: skip
+        used = ", ".join(dict.fromkeys(passages[i].name for i in ans.sources)) or best.name
+        return Reply(ans.text or fallback, "answer", items, intent, selected=0,
+                     detail=f"From: {used}")  # fmt: skip
 
     def _ask(self, intent: Intent, *, execute: bool) -> Reply:
         question = intent.query.strip()

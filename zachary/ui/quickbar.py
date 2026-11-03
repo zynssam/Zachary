@@ -73,6 +73,7 @@ class QuickBar(QWidget):
         self.edit.setFrame(False)
         self.edit.setMinimumHeight(44)
         self.status = QLabel(self)
+        self.status.setWordWrap(True)  # answers/explanations can be two or three sentences
         self.status.setStyleSheet("color: palette(placeholder-text); padding: 2px 4px;")
         # An answer's source passage ("ask your files"); hidden otherwise.
         self.answer = QLabel(self)

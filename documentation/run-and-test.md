@@ -361,6 +361,9 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 | 6 | Voice: "could you pull up that paper from college about money" | the LLM reads it as a search ("fee receipt"); results shown; opens only on a clear match |
 | 7 | Type "fee receipt", "dsa notes" | plain searches: never call the LLM (`cli llm usage` unchanged) |
 | 8 | Wi-Fi off, ask a question | "Couldn't ask the LLM (no connection …)" + the passage |
+| 9 | "explain the last project I was working on" | 2–3 sentences: what the project is + what you changed lately; the project folder first in the list, "From: README.md, …" |
+| 10 | Search "receipt", then "explain the first one" / "explain it" | an explanation of that file |
+| 11 | "summarize my dsa notes" | a summary from your DSA files |
 
 ---
 

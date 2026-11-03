@@ -417,3 +417,72 @@ def test_one_noisy_file_cannot_crowd_out_the_others(
     # Every matching file gets a slot before faq.md gets a second one.
     assert "receipt_sem5.pdf" in names and len(set(names)) >= 3
     assert names.count("faq.md") <= qa.PER_FILE
+
+
+# -- explain a project / topic / shown item -------------------------------------------------
+@pytest.fixture
+def demo_project(store: FileStore, home: Path, db_path: Path) -> SemanticSearch:
+    from zachary.indexer import projects
+
+    root = home / "code" / "hydra"
+    (root / "src").mkdir(parents=True)
+    (root / "README.md").write_text("# Hydra\nA water-usage tracker for hostels. It reads "
+                                    "meter photos and charts daily use per room.\n")  # fmt: skip
+    (root / "pyproject.toml").write_text("[project]\nname = 'hydra'\n")
+    (root / "src" / "notes.md").write_text("Next: add OCR for meter photos and weekly email.\n")
+    build_corpus(home)
+    st = scan(store)
+    projects.apply_markers(store, st.markers, scope=None)
+    conn = open_db(db_path)
+    emb = HashEmbedder()
+    SemanticIndexer(conn, Config(conn, store.config.platform), emb).run(64)
+    vectors.build(conn)
+    return SemanticSearch(emb, VectorIndex(store.conn))
+
+
+EXPLAINED = {"answer": "Hydra tracks hostel water use from meter photos.", "found": True,
+             "sources": [1]}  # fmt: skip
+
+
+def test_explain_a_named_project_from_its_readme(
+    store: FileStore, demo_project: SemanticSearch, fake_platform: FakePlatform
+) -> None:
+    model, msgs = fake_llm([EXPLAINED])
+    r = handler(store, demo_project, fake_platform, model).submit("tell me about the hydra project")
+    assert r.say == EXPLAINED["answer"] and "README.md" in r.detail
+    assert r.items[0].kind == "project" and r.items[0].name == "hydra"
+    sent = msgs.calls[0]["messages"][0]["content"]
+    assert sent.startswith("Today is") and "Explain: hydra" in sent
+    assert "water-usage tracker" in sent and "Groceries" not in sent  # only its own files
+    assert msgs.calls[0]["system"] == llm.EXPLAIN_SYSTEM
+    assert not fake_platform.opened
+
+
+def test_explain_last_project_without_llm(
+    store: FileStore, demo_project: SemanticSearch, fake_platform: FakePlatform
+) -> None:
+    h = handler(store, demo_project, fake_platform, None)
+    r = h.submit("Explain me the last project I was working on.")
+    assert r.view == "answer" and r.items and r.items[0].kind == "project"
+    assert "README.md" in r.detail and "water-usage" in r.detail
+    assert h.preview("explain my last project").say.startswith("About ")
+
+
+def test_explain_shown_item_and_topic(
+    store: FileStore, demo_project: SemanticSearch, fake_platform: FakePlatform
+) -> None:
+    model, msgs = fake_llm([EXPLAINED, EXPLAINED])
+    h = handler(store, demo_project, fake_platform, model)
+    h.submit("receipt sem5")
+    r = h.submit("explain the first one")
+    assert r.items[0].name == "receipt_sem5.pdf" and len(msgs.calls) == 1
+    assert DUE in msgs.calls[0]["messages"][0]["content"]
+    h.submit("summarize my notes on data structures")
+    assert len(msgs.calls) == 2
+    assert h.submit("explain it").view == "answer"  # the focused item of the last list
+
+
+def test_explain_with_nothing_shown(store: FileStore, sem: SemanticSearch,
+                                    fake_platform: FakePlatform) -> None:  # fmt: skip
+    r = handler(store, sem, fake_platform, None).submit("explain it")
+    assert r.say.startswith("Explain what?")

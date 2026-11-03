@@ -275,3 +275,22 @@ def test_ask_intent(text: str) -> None:
 )
 def test_not_a_question(text: str, kind: str) -> None:
     assert parse(text).kind == kind
+
+
+@pytest.mark.parametrize(
+    ("text", "query", "ordinal", "project"),
+    [
+        ("Explain me the last project I was working on.", "last project working", None, True),
+        ("tell me about the zachary project", "zachary project", None, True),
+        ("summarize my dsa notes", "dsa notes", None, False),
+        ("summarise my dsa notes", "dsa notes", None, False),  # British spelling
+        ("explain the second one", "", 2, False),
+        ("explain the last one", "", -1, False),
+        ("explain it", "", None, False),
+        ("dsa notes samjhao", "dsa notes", None, False),  # Hinglish
+        ("explian my latest project", "latest project", None, True),  # typo
+    ],
+)
+def test_explain_intent(text: str, query: str, ordinal: int | None, project: bool) -> None:
+    i = parse(text)
+    assert (i.kind, i.query, i.ordinal, i.project_hint) == ("explain", query, ordinal, project)
