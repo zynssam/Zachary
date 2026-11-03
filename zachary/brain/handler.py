@@ -777,8 +777,9 @@ class Handler:
             try:
                 pick, answer = llm.choose(question, [c[1] for c in cands])
             except LLMError as e:
-                answer = f"Couldn't ask the LLM ({e})."
-                pick = 0 if clear_winner(items) else None
+                # Never open a guess: show the closest ones instead.
+                answer = f"Couldn't ask the LLM ({e}); here are the closest."
+                pick = None
         elif not clear_winner(items):
             pick = None
         if pick is None:

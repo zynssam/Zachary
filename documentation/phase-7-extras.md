@@ -73,3 +73,37 @@ python -m zachary.cli apps spotify         # what a name matches
 1. Is 1.5 s right for the dictation pause? Shorter means pieces get added sooner, but more full stops appear mid-sentence.
 2. Gnani's text often has no punctuation, so each dictated piece becomes a sentence (capital letter and full stop). Is that OK, or would you prefer the text exactly as heard?
 3. Windows: Start Menu and Store apps are implemented but only tested with fake data here. Could you try "open spotify" on your Windows machine?
+
+## 7. Security audit and full check (4 Nov 2026)
+
+### What leaves your laptop (all of it)
+
+| Where | What | When |
+|---|---|---|
+| Gnani (`api.vachana.ai`) | Your voice for a command (after push-to-talk or "Hey Zach"); the text of spoken replies; your project / app / topic / folder **names** as recognition hints (keyterms; your choice, `cli set stt_keyterms false` to stop) | voice only |
+| Groq / Gemini (LLM, opt-in) | The question; for file questions up to 4–6 short passages (≤ 1,000 characters each) with file names and dates; for "which project…" the names + ≤ 250-character descriptions of ≤ 8 candidates; for unclear commands only the sentence; for new-file folder naming the first ≤ 800 characters of that note | only when the LLM is on |
+| Hugging Face, the Whisper source, `alphacephei.com` | Nothing about you: one-time **model downloads** (meaning model, offline speech, "Hey Zach") | first use |
+
+Nothing else: no telemetry, no analytics. Measured in the full check: **only `api.groq.com` and `api.vachana.ai` were contacted**. Keys are read from `.env` (git-ignored; no key in the repository or its history) and sent only in each service's auth header; logs and the usage ledgers never contain keys, audio or file contents.
+
+### What Zachary may change on disk (all of it)
+
+| What | Where | Guard |
+|---|---|---|
+| Its own data (index, logs, models, dictation draft) | `~/.local/share/zachary` | — |
+| New files / folders you ask for | `~/Documents/Zachary/…`, or a folder you name | **new paths only, never overwrite**; refused in system, hidden, excluded and never-touch folders and anywhere outside home / index roots (`core/safety.py`) |
+| Clean-up / organize | only items **you approved** | system folders (`/etc`, `/usr`, `/boot`, `C:\Windows`, Program Files…), hidden folders, code projects, installed software and never-touch folders are never proposed; re-checked at run time; removal = OS trash |
+| Undo | puts things back | never over a file that's there now |
+| The desktop entry for the hotkey portal | `~/.local/share/applications` | — |
+
+### Fixed in this audit
+* **"open" could run programs**: opening `setup.exe`, `*.sh`, `*.AppImage`, `*.desktop`, an installer… would *execute* it. Now program files are **never opened** by voice / text / the LLM: they're shown in their folder ("… is a program file, so I showed it in its folder instead of running it"). On Windows scripts (`.bat`, `.ps1`, `.py`, `.vbs`…) count too, since opening runs them there. Opening a script *in an editor you name* ("open build.sh in vscode") is allowed. Installed apps still start through the desktop's app list.
+* **"create a file in X"** had no folder check: now the rules above.
+* **The command socket** (`--toggle`, `--talk`) is explicitly limited to your user (it already lived in your private runtime folder and accepts only `toggle`, `talk`, `ping`).
+* **No guessing**: when the LLM is unavailable for "which project…", the candidates are shown instead of opening the local best guess.
+* **Groq free-tier limit**: hit during the check (8k tokens / minute). Now Groq ↔ Gemini fall back to each other when one is rate-limited, down or unreachable (a rejected request isn't re-sent; a paid Claude is never used unless chosen).
+
+### Full check with real inputs
+Your real index (a copy), real Groq + Gnani calls, Gnani's own voice as the speaker (no microphone), opening/launching recorded instead of performed, creating in a scratch home. **31/32 passed**: search, open, projects, open-in-VS-Code, open Spotify, a misheard name ("zakre" → Zachary), counts, topics, timeline, file Q&A, project Q&A, "which project… crime scene" → **Nishaan-main** (opened), general question, explain, paste-to-file, create folder, dictation (start / line / new paragraph / stop → .docx sorted into a new topic folder, opened after writing), undo; **voice end to end**: "Open Zachary in VS Code", "Create a text file and paste what I copied" (→ `Room 204, Friday 10 am.txt`), "How many PDF files do I have?"; wake word on recordings. The one miss ("find duplicates" in the scratch home) is the test harness (it swaps the home folder); on your real home it finds the 19 duplicates.
+
+Note: "when is my fee due" answered "15 January 2027" from `bench/bench_phase6.py` (a synthetic fee receipt in Zachary's own benchmark). To keep Zachary's test data out of answers: `cli exclude add ~/Documents/PROJECTS/Zachary/bench` (and `.../tests`).

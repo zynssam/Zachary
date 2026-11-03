@@ -265,20 +265,40 @@ def test_provider_needs_opt_in_and_a_key(
 
     monkeypatch.setattr("zachary.brain.llm.get_secret", secret)
     cfg.set_setting("llm_effort", "low")  # (bumps the config revision)
-    m = p()
-    assert isinstance(m, llm.GroqLLM) and m.model == "openai/gpt-oss-120b"  # the default
-    assert asked[-1] == "GROQ_API_KEY"
+
+    def first(x: Any) -> Any:
+        return x.chain[0] if isinstance(x, llm.FallbackLLM) else x
+
+    m: Any = p()
+    assert isinstance(first(m), llm.GroqLLM) and m.model == "openai/gpt-oss-120b"  # default
+    assert [type(b).__name__ for b in m.chain] == ["GroqLLM", "GeminiLLM"]  # free fallback
     cfg.set_setting("llm_provider", "gemini")
     m = p()
-    assert isinstance(m, llm.GeminiLLM) and m.model == "gemini-3.6-flash"
-    assert asked[-1] == "GEMINI_API_KEY"
+    assert isinstance(first(m), llm.GeminiLLM) and m.model == "gemini-3.6-flash"
     cfg.set_setting("llm_provider", "claude")
     cfg.set_setting("llm_model", "claude-haiku-5-5")
     m = p()
-    assert isinstance(m, ClaudeLLM) and m.model == "claude-haiku-5-5"
-    assert m._client is None  # nothing imported / connected until the first question
+    assert isinstance(first(m), ClaudeLLM) and m.model == "claude-haiku-5-5"
+    assert first(m)._client is None  # nothing imported / connected until the first question
+    assert "ClaudeLLM" not in [type(b).__name__ for b in m.chain[1:]]  # paid: never a fallback
     cfg.set_setting("llm_provider", "nonsense")
-    assert isinstance(p(), llm.GroqLLM)  # unknown -> the default
+    assert isinstance(first(p()), llm.GroqLLM)  # unknown -> the default
+    assert "GROQ_API_KEY" in asked and "GEMINI_API_KEY" in asked
+
+
+def test_rate_limited_provider_falls_back_to_the_next() -> None:
+    limited = llm.GroqLLM("k", client=_mock([(429, {"error": {"message": "Rate limit"}})], []))
+    ok = {"candidates": [{"finishReason": "STOP", "content": {"parts": [
+        {"text": json.dumps({"answer": "Eight."})}]}}]}  # fmt: skip
+    gem = llm.GeminiLLM("k", client=_mock([(200, ok)], []))
+    f = llm.FallbackLLM([limited, gem])
+    assert f.general("how many planets") == "Eight." and f.model == gem.model
+    rejected = llm.GroqLLM("k", client=_mock([(400, {"error": {"message": "bad"}})], []))
+    seen: list[httpx.Request] = []
+    f2 = llm.FallbackLLM([rejected, llm.GeminiLLM("k", client=_mock([(200, ok)], seen))])
+    with pytest.raises(LLMError, match="rejected"):
+        f2.general("x")
+    assert not seen  # a rejected request isn't sent to another provider
 
 
 # -- Groq and Gemini (HTTP mocked) -----------------------------------------------------------
