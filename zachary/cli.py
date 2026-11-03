@@ -243,7 +243,7 @@ def cmd_voice(args: argparse.Namespace) -> int:
             print(f"microphone: unavailable ({e})")
         return 0
     if args.action == "wake-test":
-        return _wake_test(data_dir, cfg, float(args.text or 20))
+        return _wake_test(data_dir, cfg, float(args.text or 20), args.save)
     if args.action == "transcribe":
         pcm, sr = wav_to_pcm(Path(args.text).read_bytes())
         pcm = resample(pcm, sr)
@@ -425,7 +425,7 @@ def _data_dir(args: argparse.Namespace) -> Path:
     return Path(args.db or default_db_path()).parent
 
 
-def _wake_test(data_dir: Path, cfg: Config, seconds_: float) -> int:
+def _wake_test(data_dir: Path, cfg: Config, seconds_: float, save: str | None = None) -> int:
     """Say "Hey Zach" a few times: prints what the local detector hears, live. Uses the
     microphone only while it runs; nothing is sent anywhere (no Gnani, no API)."""
     import json as _json
@@ -447,6 +447,7 @@ def _wake_test(data_dir: Path, cfg: Config, seconds_: float) -> int:
     t_end = time.monotonic() + seconds_
     wakes = 0
     frames = zero = 0
+    recorded: list[bytes] = []
     try:
         while time.monotonic() < t_end:
             f = src.get(0.2)
@@ -454,6 +455,8 @@ def _wake_test(data_dir: Path, cfg: Config, seconds_: float) -> int:
                 continue
             frames += 1
             zero += f.count(0) == len(f)
+            if save:
+                recorded.append(f)
             if spot.feed(f):
                 wakes += 1
                 print(f"  >>> WAKE ({wakes})")
@@ -464,6 +467,12 @@ def _wake_test(data_dir: Path, cfg: Config, seconds_: float) -> int:
                     print(f"  heard: {said!r}   (wake phrases list: {spot.last_heard!r})")
     finally:
         src.stop()
+    if save and recorded:
+        from zachary.voice.audio import pcm_to_wav
+
+        out = Path(save).expanduser()
+        out.write_bytes(pcm_to_wav(b"".join(recorded)))
+        print(f"saved the recording (stays on this laptop): {out}")
     if frames and zero / frames > 0.95:
         print("This microphone recorded only silence (e.g. the built-in mic without a Linux"
               " driver). “Hey Zach” needs a wired or USB mic: plug one in and run this again."
@@ -867,6 +876,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("text", nargs="?", default=None, help="WAV path, text to say, or a mic id")
     s.add_argument("--offline", action="store_true", help="local speech recognition only")
     s.add_argument("--no-speak", action="store_true", help="don't speak the reply (listen)")
+    s.add_argument("--save", default=None, help="wake-test: also save the recording to this WAV")
     s.set_defaults(fn=cmd_voice)
 
     s = sub.add_parser("topics", help="topics (virtual collections of related files)")
