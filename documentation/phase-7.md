@@ -50,7 +50,7 @@ These run only when you ask (a clean/organize command), not on the search hot pa
 
 ## 5. Testing
 
-- `tests/test_clean.py` (18 tests):
+- `tests/test_clean.py` (19 tests):
   - detection and keeper choice;
   - categories, scope, and large files not preselected;
   - nothing changes without approval;
@@ -62,10 +62,11 @@ These run only when you ask (a clean/organize command), not on the search hot pa
   - undo reports what it can't restore;
   - the real OS trash and restore;
   - installed software, symlinks/hard links, and code/binaries are never duplicates;
-  - through the handler, including that "yes" never approves.
+  - through the handler, including that "yes" never approves;
+  - **rules match regardless of case**. Windows CI caught this: rules are stored lower-cased there, so `never_touch` didn't match, and the original in Documents was proposed for the trash instead of the protected copy. Every path comparison in the guard is now case-insensitive on Windows.
 - `test_ui.py`: the review window (ticks, button text, approve/reject/undo signals), plus **an untick that survives the round trip through the engine**. This test caught a real bug: a Qt `dict` signal silently dropped the selection (int keys), which would have run the plan's original ticks instead of yours. The signal now passes plain objects. It also caught Approve and Reject staying disabled for a second plan.
 - `test_intents.py`: 15 new cases.
-- ruff, ruff format, mypy strict (+ win32) and the full suite pass locally.
+- ruff, ruff format, mypy strict (+ win32) and the full suite pass locally and on CI (Linux + Windows, Python 3.11 + 3.12), including the real Recycle Bin on Windows.
 
 ## 6. Open questions
 
