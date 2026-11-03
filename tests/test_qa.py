@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from tests.fakes import FakePlatform
@@ -256,16 +257,134 @@ def test_provider_needs_opt_in_and_a_key(
     assert p() is None  # off by default
     cfg.set_setting("llm_enabled", True)
     assert p() is None  # no key
-    monkeypatch.setattr("zachary.brain.llm.get_secret", lambda *_a, **_k: "sk-test")
+    asked: list[str] = []
+
+    def secret(name: str, *_a: Any, **_k: Any) -> str:
+        asked.append(name)
+        return "k-test"
+
+    monkeypatch.setattr("zachary.brain.llm.get_secret", secret)
+    cfg.set_setting("llm_effort", "low")  # (bumps the config revision)
+    m = p()
+    assert isinstance(m, llm.GroqLLM) and m.model == "openai/gpt-oss-120b"  # the default
+    assert asked[-1] == "GROQ_API_KEY"
+    cfg.set_setting("llm_provider", "gemini")
+    m = p()
+    assert isinstance(m, llm.GeminiLLM) and m.model == "gemini-3.6-flash"
+    assert asked[-1] == "GEMINI_API_KEY"
+    cfg.set_setting("llm_provider", "claude")
     cfg.set_setting("llm_model", "claude-haiku-5-5")
     m = p()
     assert isinstance(m, ClaudeLLM) and m.model == "claude-haiku-5-5"
     assert m._client is None  # nothing imported / connected until the first question
+    cfg.set_setting("llm_provider", "nonsense")
+    assert isinstance(p(), llm.GroqLLM)  # unknown -> the default
+
+
+# -- Groq and Gemini (HTTP mocked) -----------------------------------------------------------
+def _mock(responses: list[tuple[int, dict[str, Any]]], seen: list[httpx.Request]) -> httpx.Client:
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        code, body = responses.pop(0)
+        return httpx.Response(code, json=body)
+
+    return httpx.Client(transport=httpx.MockTransport(handle))
+
+
+ANSWER = {"answer": f"It's due on {DUE}.", "found": True, "sources": [1]}
+
+
+def test_groq_request_and_answer(tmp_path: Path) -> None:
+    seen: list[httpx.Request] = []
+    ok = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(ANSWER)}}],
+          "usage": {"prompt_tokens": 700, "completion_tokens": 30}}  # fmt: skip
+    ledger = UsageLedger(tmp_path / "u.jsonl")
+    m = llm.GroqLLM("gsk-test", ledger=ledger, client=_mock([(200, ok)], seen))
+    ans = m.answer("when is my fee due", [Excerpt("receipt.pdf", 0, f"due on {DUE}")])
+    assert ans.text == f"It's due on {DUE}." and ans.found and ans.sources == [0]
+    (req,) = seen
+    assert str(req.url) == llm.GroqLLM.URL
+    assert req.headers["authorization"] == "Bearer gsk-test"
+    body = json.loads(req.content)
+    assert body["model"] == "openai/gpt-oss-120b"
+    assert body["response_format"]["type"] == "json_schema"
+    assert body["response_format"]["json_schema"]["strict"] is True
+    assert body["reasoning_effort"] == "low" and body["include_reasoning"] is False
+    assert DUE in body["messages"][1]["content"]
+    (entry,) = ledger.entries()
+    assert entry["endpoint"] == "groq-answer" and entry["status"] == "ok"
+    assert entry["input_tokens"] == 700 and "gsk-test" not in json.dumps(entry)
+
+
+def test_gemini_request_and_answer() -> None:
+    seen: list[httpx.Request] = []
+    ok = {"candidates": [{"finishReason": "STOP",
+                          "content": {"parts": [{"text": json.dumps(ANSWER)}]}}],
+          "usageMetadata": {"promptTokenCount": 650, "candidatesTokenCount": 25}}  # fmt: skip
+    m = llm.GeminiLLM("AIza-test", client=_mock([(200, ok)], seen))
+    ans = m.answer("when is my fee due", [Excerpt("receipt.pdf", 0, f"due on {DUE}")])
+    assert ans.found and ans.sources == [0]
+    (req,) = seen
+    assert str(req.url).endswith("/models/gemini-3.6-flash:generateContent")
+    assert req.headers["x-goog-api-key"] == "AIza-test" and "key=" not in str(req.url)
+    body = json.loads(req.content)
+    cfg = body["generationConfig"]
+    assert cfg["responseMimeType"] == "application/json" and "responseJsonSchema" in cfg
+    assert cfg["thinkingConfig"] == {"thinkingLevel": "LOW"}
+    assert body["systemInstruction"]["parts"][0]["text"] == llm.ANSWER_SYSTEM
+
+
+def test_gemini_route_and_safety_block() -> None:
+    seen: list[httpx.Request] = []
+    route = {"candidates": [{"finishReason": "STOP", "content": {"parts": [
+        {"text": "thinking...", "thought": True},
+        {"text": json.dumps({"command": "find", "text": "fee receipt"})}]}}]}  # fmt: skip
+    blocked = {"candidates": [{"finishReason": "SAFETY", "content": {"parts": []}}]}
+    m = llm.GeminiLLM("k", client=_mock([(200, route), (200, blocked)], seen))
+    r = m.route("that paper about money")
+    assert (r.command, r.text) == ("find", "fee receipt")
+    with pytest.raises(LLMError, match="declined"):
+        m.route("x y z w")
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "match"),
+    [
+        (401, {"error": {"message": "Invalid API Key"}}, "key was rejected"),
+        (429, {"error": {"message": "Rate limit reached"}}, "free-tier limit"),
+        (404, {"error": {"message": "model not found"}}, "unknown groq model"),
+        (400, {"error": {"message": "bad schema"}}, "rejected the request"),
+    ],
+)
+def test_groq_http_errors(code: int, body: dict[str, Any], match: str) -> None:
+    m = llm.GroqLLM("k", client=_mock([(code, body)], []))
+    with pytest.raises(LLMError, match=match):
+        m.route("hello there")
+
+
+def test_retry_once_on_server_error_then_give_up() -> None:
+    seen: list[httpx.Request] = []
+    m = llm.GroqLLM("k", client=_mock([(503, {}), (503, {})], seen))
+    with pytest.raises(LLMError, match="server error"):
+        m.route("hello there")
+    assert len(seen) == 2  # one retry, no more
+
+
+def test_groq_through_the_handler(
+    store: FileStore, sem: SemanticSearch, fake_platform: FakePlatform
+) -> None:
+    ok = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(ANSWER)}}]}
+    m = llm.GroqLLM("k", client=_mock([(200, ok)], []))
+    h = Handler(store.conn, SafeActions(store.conn, fake_platform), store.config,
+                lambda: sem, lambda: m)  # fmt: skip
+    r = h.submit("when is my fee due?")
+    assert r.say == f"It's due on {DUE}." and r.items[0].name == "receipt_sem5.pdf"
 
 
 def test_tests_cannot_reach_anthropic() -> None:
-    with pytest.raises(OSError, match="Anthropic"):
-        socket.getaddrinfo("api.anthropic.com", 443)
+    for host in ("api.anthropic.com", "api.groq.com", "generativelanguage.googleapis.com"):
+        with pytest.raises(OSError, match="real LLM API"):
+            socket.getaddrinfo(host, 443)
 
 
 def test_billing_error_is_explained(

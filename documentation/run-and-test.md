@@ -160,18 +160,26 @@ python -m zachary.cli set stt_language hi-IN            # default en-IN (handles
 Real-API smoke test (deliberate, costs credits): `python bench/gnani_smoke.py --yes` (3 calls).
 
 ### 3.5 Ask your files (Phase 6)
-Works without any LLM: the best passage is shown. With the optional Claude API, a one-line answer is
-also spoken and the source is cited. Only the question and up to 4 short passages (≤ 1,000 characters
-each) are sent, with file names but not paths. Unclear spoken sentences send only their text.
+Works without any LLM: the best passage is shown. With an LLM, a one-line answer is also spoken and
+the source is cited. Only the question and up to 4 short passages (≤ 1,000 characters each) are sent,
+with file names but not paths. Unclear spoken sentences send only their text.
+
+| `llm_provider` | Key in `.env` | Default model | Cost |
+|---|---|---|---|
+| `groq` (default) | `GROQ_API_KEY` (console.groq.com/keys) | `openai/gpt-oss-120b` | free tier |
+| `gemini` | `GEMINI_API_KEY` (aistudio.google.com/apikey) | `gemini-3.6-flash` | free tier |
+| `claude` | `ANTHROPIC_API_KEY` | `claude-opus-5-5` | paid |
+
 ```bash
 python -m zachary.cli ask when is my fee due           # LLM off: best passage + sources
-echo 'ANTHROPIC_API_KEY=sk-ant-...' >> .env             # (git-ignored)
+echo 'GROQ_API_KEY=gsk_...' >> .env                     # (git-ignored)
 python -m zachary.cli set llm_enabled true
-python -m zachary.cli llm status                        # enabled? key found? (free)
+python -m zachary.cli llm status                        # provider, model, key found? (free)
 python -m zachary.cli ask when is my fee due           # 1 API call: answer + cited passage
 python -m zachary.cli ask --local when is my fee due   # never calls the API
-python -m zachary.cli llm usage                         # calls, tokens, errors (free)
-python -m zachary.cli set llm_model claude-haiku-5-5    # faster/cheaper (default claude-opus-5-5)
+python -m zachary.cli llm usage                         # calls, tokens, errors, avg ms (free)
+python -m zachary.cli set llm_provider gemini           # switch (needs GEMINI_API_KEY)
+python -m zachary.cli set llm_model ""                  # "" = the provider's default model
 python -m zachary.cli set llm_effort low                # low (default) | medium | high
 ```
 

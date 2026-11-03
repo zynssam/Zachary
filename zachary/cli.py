@@ -451,10 +451,16 @@ def cmd_llm(args: argparse.Namespace) -> int:
     _, cfg = _open(args)
     s = cfg.load()
     if args.action == "status":
-        print(f"enabled: {s.llm_enabled}   model: {s.llm_model}   effort: {s.llm_effort}")
-        print(f"{llm.KEY_NAME}: {'found' if get_secret(llm.KEY_NAME) else 'missing'}")
+        name = llm.provider_name(cfg)
+        info = llm.PROVIDERS[name]
+        model = s.llm_model or info.model
+        print(f"enabled: {s.llm_enabled}   provider: {name}   model: {model}   "
+              f"effort: {s.llm_effort}")  # fmt: skip
+        found = bool(get_secret(info.key))
+        print(f"{info.key}: {'found' if found else f'missing (free key: {info.signup})'}")
         if not s.llm_enabled:
             print("turn on: python -m zachary.cli set llm_enabled true")
+        print("providers: " + ", ".join(llm.PROVIDERS) + "  (cli set llm_provider gemini)")
         return 0
     entries = llm.usage_ledger(_data_dir(args)).entries()
     if not entries:
