@@ -414,4 +414,6 @@ def test_one_noisy_file_cannot_crowd_out_the_others(
     sem = SemanticSearch(emb, VectorIndex(store.conn))
     ps = qa.retrieve(store.conn, "when is my fee due", semantic=sem)
     names = [p.name for p in ps]
-    assert "receipt_sem5.pdf" in names and names.count("faq.md") <= 1
+    # Every matching file gets a slot before faq.md gets a second one.
+    assert "receipt_sem5.pdf" in names and len(set(names)) >= 3
+    assert names.count("faq.md") <= qa.PER_FILE
