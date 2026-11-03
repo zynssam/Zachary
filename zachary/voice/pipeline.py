@@ -47,6 +47,7 @@ NO_SPEECH_S = 6.0  # push-to-talk: give up if nothing is said within this time
 SEGMENT_GRACE_S = 0.12  # after a transcript, wait this long for more speech
 PREROLL_WARM_S = 0.6  # audio kept from just before the press (covers the long-press wait)
 MAX_HOLD_S = 28.0  # hold-to-talk cap (REST, the fallback, takes up to 30 s)
+RECHECK_FRAMES = int(5 * SAMPLE_RATE * 2 / FRAME_BYTES)  # silent mic: look again every ~5 s
 WAKE_TAIL_S = 0.3  # audio kept from just before "Hey Zach" was detected
 LOCAL_END_MS = 350  # quiet that ends a command locally (then commit immediately)
 COMMIT_WAIT_S = 3.0  # after commit, wait at most this long for the transcript
@@ -267,6 +268,17 @@ class VoiceListener(threading.Thread):
                 self.on_state("idle")
             return
         self._zero_frames += 1
+        if self._warned_silent and self.mic_always_open and self._zero_frames >= RECHECK_FRAMES:
+            # Wake-word mode keeps the mic open: earbuds / a headset may have been
+            # connected since. Look again (the dead mic is remembered and skipped).
+            self._zero_frames = 0
+            try_next = getattr(self.source, "try_next", None)
+            switched = try_next() if try_next is not None else None
+            if switched:
+                log.info("voice: microphone was silent; switched to %s", switched)
+                self._warned_silent = False
+                self.on_state(f"info: using microphone {switched}")
+            return
         if not self._warned_silent and self._zero_frames >= SILENT_FRAMES:
             self._zero_frames = 0
             try_next = getattr(self.source, "try_next", None)

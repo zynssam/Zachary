@@ -1372,3 +1372,47 @@ def test_real_vosk_hears_hey_zach_not_hey_jack() -> None:
     got = fires(stream)
     start = len(talk) / 32000
     assert len(got) == 1 and start < got[0] < start + 1.5, got
+
+
+class LaterMicSource(ListSource):
+    """A dead mic at start; a working one "appears" (earbuds connected) later."""
+
+    def __init__(self) -> None:
+        super().__init__(b"")
+        self.calls = 0
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def get(self, timeout: float) -> bytes | None:
+        time.sleep(0.001)
+        return b"\0" * FRAME_BYTES  # exact zeros: a mic with no driver
+
+    def try_next(self) -> str | None:
+        self.calls += 1
+        return "bluez_input.earbuds" if self.calls >= 2 else None
+
+
+def test_wake_mode_switches_to_a_mic_connected_later(gnani: MockGnani,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    from zachary.voice import pipeline
+
+    monkeypatch.setattr(pipeline, "RECHECK_FRAMES", 20)
+    monkeypatch.setattr(pipeline, "SILENT_FRAMES", 20)
+    src = LaterMicSource()
+    states: list[str] = []
+    fast: Any = FakeFast(after=10**6)
+    lis = VoiceListener(src, on_heard=lambda _h: None, on_state=states.append,
+                        rest_stt=None, stream_stt=None, offline_stt=FakeOffline(),
+                        spotter=None, wake_word=True, fast_spotter=fast)  # fmt: skip
+    lis.start()
+    try:
+        wait_until(lambda: any("using microphone bluez_input.earbuds" in s for s in states),
+                   timeout=10)  # fmt: skip
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert any("microphone is silent" in s for s in states) and src.calls >= 2
