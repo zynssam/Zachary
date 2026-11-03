@@ -29,7 +29,7 @@ import httpx
 
 from zachary.voice import net
 from zachary.voice.audio import FRAME_BYTES, frames, pcm_to_wav, seconds
-from zachary.voice.types import SAMPLE_RATE, Transcript, VoiceError
+from zachary.voice.types import SAMPLE_RATE, Transcript, VoiceError, join_segments, segment_key
 from zachary.voice.usage import UsageLedger
 
 log = logging.getLogger(__name__)
@@ -272,7 +272,7 @@ class GnaniStreamingSTT:
             raise VoiceError("config", "stream not open")
         t0 = time.perf_counter()
         lang: str | None = None
-        texts: list[str] = []
+        texts: list[tuple[tuple[int, int], str]] = []
         try:
             self.commit()
             deadline = time.monotonic() + self.result_timeout
@@ -287,7 +287,7 @@ class GnaniStreamingSTT:
                 kind = msg.get("type")
                 if kind == "transcript":
                     if msg.get("text"):
-                        texts.append(str(msg["text"]).strip())
+                        texts.append((segment_key(msg, len(texts)), str(msg["text"]).strip()))
                     lang = msg.get("detected_language_code") or lang
                     got_final = True
                 elif kind == "error":
@@ -301,7 +301,7 @@ class GnaniStreamingSTT:
         finally:
             self.close()
         return Transcript(
-            text=" ".join(t for t in texts if t),
+            text=join_segments(texts),
             provider=self.name,
             language=lang or self.language,
             latency_ms=(time.perf_counter() - t0) * 1e3,

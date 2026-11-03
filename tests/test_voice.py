@@ -1173,3 +1173,15 @@ def test_rest_fallback_only_gets_the_time_left(monkeypatch: pytest.MonkeyPatch) 
     assert seen and seen[0] <= 1.75  # 2.0 total minus the 0.3 s already spent
     with pytest.raises(httpx.ConnectError):
         net.post("https://x.test/", timeout=1.2)  # under 1 s left: no second try
+
+
+def test_segments_join_in_gnani_order_not_arrival_order() -> None:
+    from typing import Any
+
+    from zachary.voice.types import join_segments, segment_key
+
+    arrived: list[dict[str, Any]] = [{"segment_index": 2, "text": "I opened yesterday"},
+               {"segment_index": 1, "text": "open the fees document"},
+               {"text": "please"}]  # fmt: skip
+    parts = [(segment_key(m, i), str(m["text"])) for i, m in enumerate(arrived)]
+    assert join_segments(parts) == "open the fees document I opened yesterday please"

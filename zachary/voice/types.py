@@ -76,3 +76,14 @@ class TTS(Protocol):
     def stream(self, text: str) -> Iterator[SpeechAudio]:
         """Audio chunks as soon as they are ready (lowest latency)."""
         ...
+
+
+def segment_key(msg: dict[str, Any], arrival: int) -> tuple[int, int]:
+    """Sort key for transcript segments: Gnani's ``segment_index`` (finals of a long
+    command can arrive out of order), else the order they arrived in."""
+    idx = msg.get("segment_index")
+    return (idx, arrival) if isinstance(idx, int) else (1 << 30, arrival)
+
+
+def join_segments(parts: list[tuple[tuple[int, int], str]]) -> str:
+    return " ".join(t for _k, t in sorted(parts) if t)
