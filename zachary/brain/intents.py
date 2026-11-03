@@ -478,6 +478,20 @@ def parse(text: str) -> Intent:
         rest = [t for t in toks if t not in PLAN_FILLER]
         return Intent("organize", query=" ".join(rest), confidence=conf, corrected=corrected)
 
+    # --- a question about a project ("what is the zachary project about", "how do I run
+    # my hackfest project", "what does this project do"): answered from its files -------
+    asks = toks[0] in QUESTION_LEAD or text.strip().endswith("?")
+    # Singular: one project ("what is the zachary project about"). "projects" asks for
+    # a list ("what are my projects", "which projects did I work on").
+    names_project = any(t in {"project", "repo", "repository"} for t in toks)
+    counting_projects = "many" in toks and any(
+        toks[i + 1] in PROJECT_WORDS for i, t in enumerate(toks[:-1]) if t == "many"
+    )  # "how many projects do I have" is a count
+    listing = any(t in SHOW_VERBS or t in {"list", "all"} for t in toks)
+    if asks and names_project and not counting_projects and not listing and len(toks) >= 3:
+        return Intent("ask", query=text.strip(), project_hint=True, confidence=conf,
+                      corrected=corrected)  # fmt: skip
+
     # --- explain / summarize a project, topic or the shown item ---------------------------
     tell_about = "tell" in toks and "about" in toks
     if any(t in EXPLAIN_WORDS for t in toks) or tell_about:

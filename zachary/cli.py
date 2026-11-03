@@ -242,6 +242,8 @@ def cmd_voice(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"microphone: unavailable ({e})")
         return 0
+    if args.action == "wake-test":
+        return _wake_test(data_dir, cfg, float(args.text or 20))
     if args.action == "transcribe":
         pcm, sr = wav_to_pcm(Path(args.text).read_bytes())
         pcm = resample(pcm, sr)
@@ -423,6 +425,45 @@ def _data_dir(args: argparse.Namespace) -> Path:
     return Path(args.db or default_db_path()).parent
 
 
+def _wake_test(data_dir: Path, cfg: Config, seconds_: float) -> int:
+    """Say "Hey Zach" a few times: prints what the local detector hears, live. Uses the
+    microphone only while it runs; nothing is sent anywhere (no Gnani, no API)."""
+    import json as _json
+
+    from zachary.voice.audio import FRAME_BYTES
+    from zachary.voice.pipeline import MicSource
+    from zachary.voice.wakeword import VoskSpotter, download_vosk
+
+    download_vosk(data_dir / "models")
+    spot = VoskSpotter(data_dir / "models")
+    import vosk
+
+    free = vosk.KaldiRecognizer(vosk.Model(str(spot.model_dir)), 16000)  # what was *said*
+    src = MicSource(device=cfg.load().mic_device)
+    src.start()
+    print(f"Listening for {seconds_:.0f} s on {src.mic.source_name if src.mic else 'the mic'}"
+          " (local only). Say “Hey Zach” a few times, and some other sentences.")  # fmt: skip
+    t_end = time.monotonic() + seconds_
+    wakes = 0
+    try:
+        while time.monotonic() < t_end:
+            f = src.get(0.2)
+            if f is None or len(f) != FRAME_BYTES:
+                continue
+            if spot.feed(f):
+                wakes += 1
+                print(f"  >>> WAKE ({wakes})")
+                spot.reset()
+            if free.AcceptWaveform(f):
+                said = _json.loads(free.Result()).get("text", "")
+                if said:
+                    print(f"  heard: {said!r}   (wake phrases list: {spot.last_heard!r})")
+    finally:
+        src.stop()
+    print(f"{wakes} wake(s). Paste these lines to tune the wake word.")
+    return 0
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     """Answer a question from your files (LLM if enabled, else the best passage)."""
     from zachary.actions.safe_actions import SafeActions
@@ -438,10 +479,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
     t0 = time.perf_counter()
     from zachary.brain.intents import parse
 
-    explain = parse(question).kind == "explain"  # "explain my last project" stays itself
-    reply = handler.submit(
-        question if explain or question.startswith("ask ") else f"ask {question}"
-    )
+    # "explain my last project" / "what is the zachary project about" stay themselves.
+    as_is = parse(question).kind in {"explain", "ask", "stats"}
+    reply = handler.submit(question if as_is or question.startswith("ask ") else f"ask {question}")
     ms = (time.perf_counter() - t0) * 1e3
     print(f"zach: {reply.say}")
     if reply.detail:
@@ -812,7 +852,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="voice: usage | setup | mics [ID] | latency [N] | transcribe WAV | say TEXT | listen",
     )
     s.add_argument(
-        "action", choices=["usage", "setup", "mics", "latency", "transcribe", "say", "listen"]
+        "action",
+        choices=["usage", "setup", "mics", "latency", "transcribe", "say", "listen", "wake-test"],
     )
     s.add_argument("text", nargs="?", default=None, help="WAV path, text to say, or a mic id")
     s.add_argument("--offline", action="store_true", help="local speech recognition only")

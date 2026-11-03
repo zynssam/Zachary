@@ -1365,3 +1365,10 @@ def test_real_vosk_hears_hey_zach_not_hey_jack() -> None:
         assert fires(clips[no]) == [], no
     audio_s = sum(len(c) for c in clips.values()) / 32000
     assert (time.perf_counter() - t) / audio_s < 0.2  # well under real time
+    # The bug that made it deaf in the real app: listening continuously, after the
+    # first sentence it never matched again. Talk, then "Hey Zach", in ONE stream:
+    talk = clips["talk"] + silence(1.0)
+    stream = talk + clips["Hey Zach, open the fee receipt."]
+    got = fires(stream)
+    start = len(talk) / 32000
+    assert len(got) == 1 and start < got[0] < start + 1.5, got

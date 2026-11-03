@@ -658,7 +658,78 @@ class Handler:
         return Reply(text or "I don't know.", "answer", [], intent,
                      detail=f"Answered by {llm.model} (not from your files).")  # fmt: skip
 
+    def _project_question(self, intent: Intent, *, execute: bool) -> Reply:
+        """ "what is the zachary project about", "how do I run my hackfest project": the
+        LLM answers from that project's own files (README, docs, matching passages).
+        "this / my project" = the project of your last work session."""
+        question = intent.query.strip()
+        q_words = words(question)
+        projects = list_projects(self.conn)
+
+        def score(p: Project) -> int:
+            pw = [w for w in words(p.name) if len(w) >= 3]
+            return sum(any(n.startswith(w) or w.startswith(n) for n in pw)
+                       for w in q_words if len(w) >= 3)  # fmt: skip
+
+        named = max(projects, key=score, default=None)
+        proj: Project | None = named if named is not None and score(named) > 0 else None
+        if proj is None:
+            proj = self._folder_named(q_words)  # "durdrsti": a folder, not a code project
+        if proj is None:
+            proj = self._which_project([], True)  # "this project": your last one
+        if proj is None:
+            return self._ask(Intent("ask", query=question), execute=execute)
+        passages = qa.retrieve(self.conn, question, semantic=self.semantic, rules=self.rules(),
+                               k=EXPLAIN_PASSAGES, within=proj.path)  # fmt: skip
+        folder_item = Item(proj.folder_id, proj.path, proj.name, "project", True,
+                           proj.last_activity, ["project"])  # fmt: skip
+        items = [folder_item] + [
+            Item(p.file_id, p.path, p.name, p.kind, False, p.mtime, [f"“{p.snippet}”"], p.score)
+            for p in passages
+        ]
+        unique: dict[int, Item] = {}
+        for it in items:
+            unique.setdefault(it.file_id, it)
+        items = list(unique.values())
+        self.context.set_results(items, question, "answer")
+        if not passages:
+            return Reply(f"I have nothing readable in {proj.name} yet.", "answer", items, intent)
+        best = passages[0]
+        quote = f"“{best.snippet}”\n— {best.name}"
+        llm = self.llm()
+        if not execute:
+            say = "Enter to ask." if llm is not None else f"About {proj.name}: {best.name}."
+            return Reply(say, "answer", items, intent, selected=0, detail=quote)
+        if llm is None:
+            return Reply(f"From {proj.name}'s files, starting with {best.name}.", "answer",
+                         items, intent, selected=0, detail=quote)  # fmt: skip
+        try:
+            ans = llm.answer(f"{question} (about the project “{proj.name}”)",
+                             [Excerpt(p.name, p.mtime, p.text) for p in passages])  # fmt: skip
+        except LLMError as e:
+            return Reply(f"Couldn't ask the LLM ({e}). Best match: {best.name}.", "answer",
+                         items, intent, selected=0, detail=quote)  # fmt: skip
+        used = ", ".join(dict.fromkeys(passages[i].name for i in ans.sources)) or best.name
+        return Reply(ans.text or f"About {proj.name}: see {best.name}.", "answer", items, intent,
+                     selected=0, detail=f"From {proj.name}: {used}")  # fmt: skip
+
+    def _folder_named(self, q_words: list[str]) -> Project | None:
+        """A folder whose name is one of the question's words (newest first)."""
+        for w in q_words:
+            if len(w) < 4 or w in {"project", "projects", "about", "what", "does", "this"}:
+                continue
+            row = self.conn.execute(
+                "SELECT id, path, name, mtime FROM files WHERE is_dir = 1 AND lower(name) = ?"
+                " ORDER BY mtime DESC LIMIT 1",
+                (w,),
+            ).fetchone()
+            if row is not None and not self.rules().is_excluded(row[1], True):
+                return Project(int(row[0]), row[1], row[2], [], float(row[3]))
+        return None
+
     def _ask(self, intent: Intent, *, execute: bool) -> Reply:
+        if intent.project_hint:
+            return self._project_question(intent, execute=execute)
         question = intent.query.strip()
         personal = about_my_files(question)
         passages = qa.retrieve(self.conn, question, semantic=self.semantic, rules=self.rules())

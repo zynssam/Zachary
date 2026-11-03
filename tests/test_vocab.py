@@ -193,3 +193,54 @@ def test_stats_answers(store: FileStore, home: Path, fake_platform: FakePlatform
     r = h.submit("How many files do I have?")
     assert r.say.startswith("You have 7 files") and "Videos" in r.detail
     assert not asked  # counted locally, no LLM
+
+
+# -- questions about a project go to the LLM, from that project's files ------------------------
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [("what is the zachary project about", "ask"), ("what does this project do", "ask"),
+     ("how do i run the zachary project", "ask"), ("what is the durdrsti project", "ask"),
+     ("how many projects do i have", "stats"), ("what are my projects", "show_projects"),
+     ("show my projects", "show_projects"), ("open the zachary project", "open")],
+)  # fmt: skip
+def test_project_questions_parse(text: str, kind: str) -> None:
+    from zachary.brain.intents import parse
+
+    i = parse(text)
+    assert i.kind == kind and (kind != "ask" or i.project_hint)
+
+
+def test_project_question_answered_from_its_own_files(
+    store: FileStore, home: Path, fake_platform: FakePlatform
+) -> None:
+    from zachary.core.config import Config
+    from zachary.indexer.embedder import HashEmbedder
+    from zachary.indexer.semantic import SemanticIndexer
+
+    app = home / "code" / "Hydra"
+    (app / "hydra.egg-info").mkdir(parents=True)
+    (app / "pyproject.toml").write_text("[project]\nname='hydra'\n")
+    (app / "README.md").write_text("# Hydra\nTracks hostel water use from meter photos.\n")
+    (app / "hydra.egg-info" / "SOURCES.txt").write_text("hydra/__init__.py hydra hydra hydra")
+    (home / "Other").mkdir()
+    (home / "Other" / "notes.md").write_text("Hydra is also a Greek monster.")  # elsewhere
+    (home / "Durdrsti").mkdir()
+    (home / "Durdrsti" / "plan.md").write_text("Durdrsti forecasts port congestion.")
+    st = scan(store)
+    projects.apply_markers(store, st.markers, scope=None)
+    SemanticIndexer(store.conn, Config(store.conn, store.config.platform), HashEmbedder()).run(16)
+    msgs = Msgs([{"answer": "It tracks water use.", "found": True, "sources": [1]},
+                 {"answer": "It forecasts congestion.", "found": True, "sources": [1]}])  # fmt: skip
+    model = ClaudeLLM("k", client=SimpleNamespace(beta=SimpleNamespace(messages=msgs)))
+    h = Handler(store.conn, SafeActions(store.conn, fake_platform), store.config, None,
+                lambda: model)  # fmt: skip
+    r = h.submit("what is the hydra project about")
+    assert r.say == "It tracks water use." and r.items[0].name == "Hydra"
+    sent = msgs.calls[0]["messages"][0]["content"]
+    assert "meter photos" in sent and "Greek monster" not in sent  # only Hydra's files
+    assert "SOURCES.txt" not in sent  # build output skipped
+    r2 = h.submit("what is the durdrsti project")  # a folder, not a code project
+    assert (
+        r2.items[0].name == "Durdrsti"
+        and "port congestion" in msgs.calls[1]["messages"][0]["content"]
+    )

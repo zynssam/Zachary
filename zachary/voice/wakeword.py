@@ -13,6 +13,7 @@ Known trade-off (measured with synthetic speech): biasing whisper towards
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,8 @@ from typing import Any
 
 from zachary.voice.offline_stt import WhisperSTT, Word
 from zachary.voice.types import SAMPLE_RATE
+
+log = logging.getLogger(__name__)
 
 SPOT_SECONDS = 1.6  # audio from speech start that is checked for the wake phrase
 PROMPT = "Hey Zach,"
@@ -60,10 +63,15 @@ class WakeSpotter:
 # -- fast spotting: Vosk with a fixed phrase list (no training) -----------------------------
 VOSK_MODEL = "vosk-model-small-en-in-0.4"  # 36 MB download, Indian English
 VOSK_URL = f"https://alphacephei.com/vosk/models/{VOSK_MODEL}.zip"
-WAKE_PHRASES = ("hey zack", "hi zack", "ok zack", "okay zack")
+WAKE_PHRASES = ("hey zack", "ok zack", "okay zack")  # ("hi zack": "hey Sara" read as it)
 # Phrases that sound close but must *not* wake (without them the recognizer maps
 # "hey Jack" to "hey zack", the nearest phrase it knows). Measured with natural speech.
-DECOYS = ("hey jack", "hey jake", "hey sack", "zachary")
+DECOYS = (
+    "hey jack", "hey jake", "hey sack", "hey sara", "hi", "hello", "zachary",
+    # Everyday words: ordinary speech then has somewhere to go besides the wake phrase
+    # (without them "open the zachary project" ended as "hey zack").
+    "open", "the", "project", "what", "my", "is", "show", "find", "file",
+)  # fmt: skip
 STABLE_UPDATES = 3  # partial result must show the wake phrase this many times in a row
 # (a partial briefly read "hey zack" for "hey Sara" once; 3 updates = ~0.1 s, measured:
 # fires ~0.9 s into "Hey Zach, open ...", right after "Zach"; final results fire ~2 s)
@@ -80,6 +88,7 @@ class VoskSpotter:
         self._model: object | None = None
         self._rec: object | None = None
         self._streak = 0
+        self.last_heard = ""  # last finished phrase (for `cli voice wake-test` / logs)
 
     def available(self) -> bool:
         try:
@@ -113,6 +122,11 @@ class VoskSpotter:
         rec: Any = self._recognizer()
         if rec.AcceptWaveform(frame):
             self._streak = 0  # an utterance ended without a (stable) wake phrase
+            heard = json.loads(rec.Result()).get("text", "")
+            self.last_heard = heard
+            if heard and heard != "[unk]":
+                # Local log only (text, never audio): why "Hey Zach" didn't fire.
+                log.info("wake word: heard %r (not the wake phrase)", heard)
             return False
         partial = json.loads(rec.PartialResult()).get("partial", "")
         tail = " ".join(partial.split()[-2:])
