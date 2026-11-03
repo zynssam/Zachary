@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +38,7 @@ class MockGnani:
     tts_close_after_request: bool = False  # server closes the TTS socket after each reply
     transcript_delay_s: float = 0.0  # transcription time (the next segment may start first)
     numbered_segments: bool = False  # "<transcript> 1", "<transcript> 2", ...
+    tts_first_audio_delay_s: float = 0.0  # a slow network: audio starts this late
     calls: list[dict[str, Any]] = field(default_factory=list)
     http_port: int = 0
     ws_port: int = 0
@@ -187,6 +189,8 @@ def _ws_handler(mock: MockGnani):  # type: ignore[no-untyped-def]
             container = req.get("audio_config", {}).get("container", "wav")
             data = wav if container == "wav" else wav[44:]
             ws.send(json.dumps({"type": "start", "message": "ok", "request_id": "t-1"}))
+            if mock.tts_first_audio_delay_s:
+                time.sleep(mock.tts_first_audio_delay_s)
             parts = [data[:2001], data[2001:6000], data[6000:]]  # odd split: half samples
             for i, part in enumerate(parts):
                 ws.send(json.dumps({"type": "audio", "data": {"chunk_index": i,

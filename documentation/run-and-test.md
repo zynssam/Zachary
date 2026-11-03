@@ -371,6 +371,7 @@ Do these in the sandbox (`export ZACHARY_DB=/tmp/zach-test.db`) or on your real 
 
 | Problem | Fix |
 |---|---|
+| Voice replies slow / late (seen on a phone hotspot: 85% packet loss, DNS failures) | Check the stages with `cli voice latency`: large `stream_open`, `text … after you stopped` or `tts_first_audio` = the network, not Gnani. Limits now: connect 4–5 s, speech-to-text REST fallback 10 s in total, and a reply with no audio within 4 s isn't spoken (the text is on screen) instead of arriving late. Quick check: `ping -c 20 1.1.1.1` (loss) and `curl -4 -so /dev/null -w '%{time_connect}\n' https://api.vachana.ai/` |
 | "inotify limit" warning | `sudo sysctl fs.inotify.max_user_watches=524288` and persist with `echo fs.inotify.max_user_watches=524288 \| sudo tee /etc/sysctl.d/90-zachary.conf` |
 | Hotkey does nothing (GNOME) | GNOME's input-source binding still owns Super+Space (free it, see 3.3), or the dialog was dismissed: check Settings → Keyboard → Shortcuts → Apps, or use `--hotkey ctrl+alt+space`, or bind `--toggle` manually |
 | "Hotkey unavailable" message in the bar | follow the hint shown (bind `python -m zachary.assistant --toggle`) |

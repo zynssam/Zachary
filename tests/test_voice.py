@@ -1125,3 +1125,44 @@ def test_push_to_talk_twice_through_the_assistant(
     assert stages[:2] == ["mic_open", "stream_open"]
     assert stages[-3:] == ["intent_search", "tts_first_audio", "tts_done"]
     assert records[1]["audio_out_ms"] is not None and src.starts == 2
+
+
+def test_tts_gives_up_when_audio_is_too_late(gnani: MockGnani, ledger: UsageLedger) -> None:
+    """A flaky hotspot: a reply that would be spoken seconds late is dropped (the text is
+    on screen), and the next reply still works and isn't mixed with the late one."""
+    gnani.tts_first_audio_delay_s = 1.0
+    tts = GnaniWsTTS(KEY, url=gnani.tts_ws, ledger=ledger, first_audio_timeout=0.3)
+    t0 = time.monotonic()
+    with pytest.raises(VoiceError, match="too slow"):
+        list(tts.stream("Opening your file."))
+    assert time.monotonic() - t0 < 0.9
+    assert ledger.entries()[-1]["status"] == "late"
+    gnani.tts_first_audio_delay_s = 0.0
+    chunks = list(tts.stream("Hello"))
+    assert chunks and sum(len(c.pcm) for c in chunks) > 0
+
+
+def test_rest_fallback_only_gets_the_time_left(monkeypatch: pytest.MonkeyPatch) -> None:
+    from typing import Any
+
+    import httpx
+
+    from zachary.voice import net
+
+    seen: list[float] = []
+
+    class SlowV4:
+        def post(self, url: str, **kw: Any) -> httpx.Response:
+            time.sleep(0.3)
+            raise httpx.ConnectError("dns failed")
+
+    def default_post(url: str, *, timeout: httpx.Timeout, **kw: Any) -> httpx.Response:
+        seen.append(float(timeout.read or 0))
+        return httpx.Response(200)
+
+    monkeypatch.setattr(net, "http_client", lambda _t: SlowV4())
+    monkeypatch.setattr(httpx, "post", default_post)
+    assert net.post("https://x.test/", timeout=2.0).status_code == 200
+    assert seen and seen[0] <= 1.75  # 2.0 total minus the 0.3 s already spent
+    with pytest.raises(httpx.ConnectError):
+        net.post("https://x.test/", timeout=1.2)  # under 1 s left: no second try
