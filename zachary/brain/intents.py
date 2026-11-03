@@ -64,6 +64,14 @@ TOPIC_WORDS = frozenset("topic topics subject subjects collection collections".s
 YES_WORDS = frozenset(
     "yes yeah yep yup sure ok okay do it go ahead please haan han ha haa ji houdu hoon sari".split()
 )
+# "reopen them" / "re-open those 8 files" / "haan sab kholo": an answer to "Reopen them?".
+# Only these words (plus open verbs, yes words and numbers) may appear, and it needs a yes
+# word or "reopen", or an open verb with "them"/"all"/... ("open it" stays a follow-up).
+CONFIRM_ALL = frozenset("them those these all everything sab sabhi saare saari".split())
+CONFIRM_YES = (YES_WORDS - {"it", "do", "please"}) | {"reopen"}
+CONFIRM_WORDS = CONFIRM_ALL | frozenset(
+    "re open file files of the do it karo kar again dobara phir please ok okay just now".split()
+)
 NO_WORDS = frozenset("no nope nah cancel stop dont don't nahi na beda illa".split())
 WORK_WORDS = frozenset("working worked work doing do kaam busy".split())
 WHAT_WORDS = frozenset("what kya enu".split())
@@ -236,6 +244,18 @@ def parse(text: str) -> Intent:
     ordinal, ord_idx = _ordinal(toks)
     verbs = OPEN_VERBS | FIND_VERBS | SHOW_VERBS | REVEAL_VERBS
 
+    # --- yes: an answer to a proposal ("Reopen them?"); before follow-ups so that
+    # "yes open all of them" isn't taken as "open the first result" -------------------
+    joined_re = " ".join(toks).replace("re open", "reopen").split()
+    if all(
+        t in YES_WORDS or t in CONFIRM_YES or t in OPEN_VERBS or t in CONFIRM_WORDS or t.isdigit()
+        for t in joined_re
+    ) and (
+        any(t in CONFIRM_YES for t in joined_re)
+        or (any(t in OPEN_VERBS for t in joined_re) and any(t in CONFIRM_ALL for t in joined_re))
+    ):
+        return Intent("confirm", confidence=conf, corrected=corrected)
+
     # --- follow-ups: nothing but command words, ordinals and filler ---------------
     content = [
         t for i, t in enumerate(toks)
@@ -259,14 +279,8 @@ def parse(text: str) -> Intent:
             return Intent("select", ordinal=None, action="open", confidence=conf,
                           corrected=corrected)  # fmt: skip
 
-    # --- yes / no: answers to a proposal ("Reopen these 6 files?") -----------------
+    # --- no: an answer to a proposal ("Reopen these 6 files?") ----------------------
     plain = [t for t in toks if t not in {"please", "ok", "okay", "just", "now", "then"}]
-    if (
-        plain
-        and all(t in YES_WORDS or t in {"open", "them", "all", "reopen"} for t in toks)
-        and any(t in YES_WORDS or t in {"them", "all"} for t in toks)
-    ):
-        return Intent("confirm", confidence=conf, corrected=corrected)
     if (
         plain
         and all(t in NO_WORDS or t in FILLER for t in toks)

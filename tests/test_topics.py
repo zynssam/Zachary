@@ -231,6 +231,11 @@ def test_handler_timeline_and_resume_ask_before_reopening(
     # Typing (preview) never arms a proposal.
     h.preview("resume where I left off")
     assert h.submit("yes").say == "Nothing to confirm."
+    # Spoken answers: "re-open them" reopens instead of searching for "reopen".
+    h.submit("resume where I left off")
+    assert h.preview("Re-open them.").say.startswith("Enter to reopen")
+    r5 = h.submit("Re-open them.")
+    assert r5.say.startswith("Reopened") and fake_platform.opened
 
 
 def test_handler_records_choices(store: FileStore, home: Path,

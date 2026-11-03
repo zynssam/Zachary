@@ -199,6 +199,14 @@ def test_empty() -> None:
         ("yes", "confirm", ""),
         ("yes open them", "confirm", ""),
         ("haan", "confirm", ""),
+        ("reopen them", "confirm", ""),
+        ("Re-open them.", "confirm", ""),
+        ("re open those", "confirm", ""),
+        ("reopen these files", "confirm", ""),
+        ("reopen those 8 files", "confirm", ""),
+        ("yes open all of them", "confirm", ""),
+        ("open them all", "confirm", ""),
+        ("haan sab kholo", "confirm", ""),
         ("no", "cancel", ""),
         ("nahi", "cancel", ""),
     ],
@@ -206,6 +214,15 @@ def test_empty() -> None:
 def test_phase5_intents(text: str, kind: str, query: str) -> None:
     i = parse(text)
     assert (i.kind, i.query) == (kind, query)
+
+
+@pytest.mark.parametrize("text", ["open it", "open that file", "open the first one"])
+def test_confirm_words_dont_steal_followups(text: str) -> None:
+    assert parse(text).kind == "select"
+
+
+def test_all_files_stays_a_search() -> None:
+    assert parse("all files").kind == "find"
 
 
 @pytest.mark.parametrize(
