@@ -87,19 +87,46 @@ def test_settings_validate_then_save(qtbot: QtBot, conn: sqlite3.Connection,
 
 
 def test_first_run_steps_through_and_finishes(qtbot: QtBot, conn: sqlite3.Connection,
-                                              fake_platform: FakePlatform) -> None:  # fmt: skip
+                                              fake_platform: FakePlatform,
+                                              monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    from zachary.ui import settings as st
     from zachary.ui.settings import FirstRun
 
+    monkeypatch.setattr(st, "has_secret", lambda _name: False)  # (a fresh computer)
     cfg = _cfg(conn, fake_platform)
     setup = FirstRun(cfg, fake_platform)
     qtbot.addWidget(setup)
-    assert setup.step.text() == "Step 1 of 4" and not setup.back.isEnabled()
-    for _ in range(3):
-        setup.next.click()
+    assert setup.step.text() == "Step 1 of 5" and not setup.back.isEnabled()
+    setup.next.click()
+    setup.next.click()
+    assert setup.step.text() == "Step 3 of 5"  # the API keys
+    setup.next.click()  # none pasted: asks once, says what won't work
+    assert setup.step.text() == "Step 3 of 5"
+    msg = setup.form.message.text()
+    assert "Gnani.ai" in msg and "Groq" in msg and "Gemini" in msg and "voice" in msg
+    setup.next.click()  # Next again: add them later
+    assert setup.step.text() == "Step 4 of 5"
+    setup.next.click()
     assert setup.next.text() == "Finish"
     with qtbot.waitSignal(setup.finished, timeout=2000):
         setup.next.click()
     assert cfg.get_setting("setup_done") is True
+
+
+def test_keys_step_has_where_to_get_each_key(qtbot: QtBot, conn: sqlite3.Connection,
+                                            fake_platform: FakePlatform) -> None:  # fmt: skip
+    from zachary.ui.settings import KEY_HELP, KEYS, SettingsForm
+
+    form = SettingsForm(_cfg(conn, fake_platform), fake_platform)
+    qtbot.addWidget(form)
+    box = form.keys_box()
+    from PySide6.QtWidgets import QLabel
+
+    text = " ".join(lbl.text() for lbl in box.findChildren(QLabel))
+    for name, _label in KEYS:
+        assert KEY_HELP[name][0] in text  # a sign-up link for every key
+    form.keys["GNANI_API_KEY"].setText("vach_x")
+    assert "GNANI_API_KEY" not in form.missing_keys()
 
 
 def test_open_settings_from_the_bar() -> None:

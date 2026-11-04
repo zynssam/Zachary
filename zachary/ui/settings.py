@@ -47,6 +47,14 @@ from zachary.ui import style
 LANGUAGES = [("en-IN", "English (with Hinglish)"), ("hi-IN", "Hindi")]
 KEYS = [("GNANI_API_KEY", "Gnani.ai (voice)"), ("GROQ_API_KEY", "Groq (questions, free tier)"),
         ("GEMINI_API_KEY", "Gemini (questions, fallback)")]  # fmt: skip
+# Where to get each key, and what stops working without it.
+KEY_HELP = {
+    "GNANI_API_KEY": ("https://docs.gnani.ai/api/introduction/quick-start",
+                      "voice commands and spoken replies"),
+    "GROQ_API_KEY": ("https://console.groq.com/keys", "questions about your files and projects"),
+    "GEMINI_API_KEY": ("https://aistudio.google.com/apikey",
+                       "the backup for questions when Groq is busy"),
+}  # fmt: skip
 RESTART_KEYS = {"quickbar_hotkey", "voice_hotkey", "voice_enabled", "wake_word", "mic_device"}
 
 
@@ -173,6 +181,32 @@ class SettingsForm(QWidget):
                 f.addRow(label, self.keys[name])
         return box
 
+    def keys_box(self) -> QWidget:
+        """All three API keys, each with where to get it and what it's for."""
+        box = QWidget(self)
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        dim = style.theme().dim
+        for name, label in KEYS:
+            url, used_for = KEY_HELP[name]
+            head = QLabel(f"<b>{label}</b>", box)
+            hint = QLabel(f"For {used_for}. Get a key: <a href='{url}' style='color:"
+                          f"{style.ACCENT}'>{url}</a>", box)  # fmt: skip
+            hint.setOpenExternalLinks(True)
+            hint.setWordWrap(True)
+            hint.setStyleSheet(f"color: {dim};")
+            v.addWidget(head)
+            v.addWidget(self.keys[name])
+            v.addWidget(hint)
+            v.addSpacing(6)
+        v.addStretch(1)
+        return box
+
+    def missing_keys(self) -> list[str]:
+        """Keys neither typed in now nor saved before."""
+        return [name for name, _l in KEYS if not self.keys[name].text().strip()
+                and not has_secret(name)]  # fmt: skip
+
     def shortcuts_box(self) -> QWidget:
         box = QWidget(self)
         f = QFormLayout(box)
@@ -289,7 +323,8 @@ class SettingsWindow(QWidget):
         v = QVBoxLayout(inner)
         for title, box in (("Folders", self.form.folders_box()),
                            ("Shortcuts", self.form.shortcuts_box()),
-                           ("Voice & keys", self.form.voice_box()),
+                           ("Voice", self.form.voice_box(with_keys=False)),
+                           ("API keys", self.form.keys_box()),
                            ("Language & extras", self.form.extras_box())):  # fmt: skip
             head = QLabel(title, inner)
             head.setFont(style.font(head.font(), 1.2, 600))
@@ -317,8 +352,11 @@ class FirstRun(QWidget):
          "It indexes names, dates and the start of each document, on this computer only."),
         ("Talk to Zachary",
          "Voice uses Gnani.ai: only your voice command is sent, and only after you press "
-         "the talk key (or say “Hey Zach”). Questions use Groq or Gemini with short "
-         "excerpts. All keys are optional; search works without them."),
+         "the talk key (or say “Hey Zach”)."),
+        ("Your API keys",
+         "Paste your own keys for Gnani.ai, Groq and Gemini. They're saved only on this "
+         "computer (readable just by you) and used for your own requests. Questions send "
+         "only the question and a few short excerpts."),
         ("Your shortcut", "Press it anywhere to open Zachary."),
         ("Last touches", "You can change all of this later in Settings."),
     ]  # fmt: skip
@@ -333,8 +371,11 @@ class FirstRun(QWidget):
         self.setStyleSheet(style.window_css(style.theme()))
         self.form = SettingsForm(cfg, platform, self)
         self.pages = QStackedWidget(self)
-        bodies = [self.form.folders_box(), self.form.voice_box(),
-                  self.form.shortcuts_box(), self.form.extras_box()]  # fmt: skip
+        bodies = [self.form.folders_box(), self.form.voice_box(with_keys=False),
+                  self.form.keys_box(), self.form.shortcuts_box(),
+                  self.form.extras_box()]  # fmt: skip
+        self._keys_page = 2
+        self._warned_keys = False
         for (title, sub), body in zip(self.STEPS, bodies, strict=True):
             page = QWidget()
             v = QVBoxLayout(page)
@@ -367,6 +408,18 @@ class FirstRun(QWidget):
         self._go(0)
 
     def _go(self, d: int) -> None:
+        if d > 0 and self.pages.currentIndex() == self._keys_page:
+            missing = self.form.missing_keys()
+            if missing and not self._warned_keys:  # ask once; Next again continues
+                self._warned_keys = True
+                names = ", ".join(dict(KEYS)[m] for m in missing)
+                lost = "; ".join(KEY_HELP[m][1] for m in missing)
+                self.form.message.setText(
+                    f"Still missing: {names}. Without them: no {lost}. Paste them now, "
+                    "or click Next again to add them later in Settings."
+                )
+                return
+            self.form.message.setText("")
         i = self.pages.currentIndex() + d
         last = self.pages.count() - 1
         if i > last:

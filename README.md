@@ -36,14 +36,19 @@ python -m zachary                                      # (= the assistant)
 On Linux you may need `libportaudio2` (the microphone) and `libxcb-cursor0` (Qt on X11).
 
 ## First run
-A four-step setup opens on the first start:
+A five-step setup opens on the first start:
 1. **Folders to remember.** Your home folder by default; add or exclude any folder.
-2. **Voice and keys.** All optional; search works without them:
-   - **Gnani.ai** key for voice;
-   - **Groq** and/or **Gemini** key for questions (both have free tiers).
-3. **Shortcut.** Super+Space by default. On GNOME you confirm it once in a system
+2. **Voice.** Push-to-talk, "Hey Zach", spoken replies, microphone.
+3. **Your API keys.** Paste your own; they're saved only on your computer:
+   - **Gnani.ai** for voice (https://docs.gnani.ai/api/introduction/quick-start);
+   - **Groq** for questions, free tier (https://console.groq.com/keys);
+   - **Gemini** as the questions fallback, free tier (https://aistudio.google.com/apikey).
+
+   If any key is missing, the setup says what won't work without it. Click Next again
+   to add it later; search, notes and clean-up work without keys.
+4. **Shortcut.** Super+Space by default. On GNOME you confirm it once in a system
    dialog.
-4. **Language** (English with Hinglish, or Hindi), **OCR** for scanned files, and
+5. **Language** (English with Hinglish, or Hindi), **OCR** for scanned files, and
    **start at login**.
 
 Change anything later in **Settings**: the tray menu, or type "open settings" in the bar.
