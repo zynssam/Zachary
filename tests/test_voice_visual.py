@@ -100,10 +100,10 @@ def test_bar_fades_in_with_the_wave_and_is_usable_at_once(qtbot: QtBot) -> None:
 
     bar = QuickBar(Engine())  # type: ignore[arg-type]
     qtbot.addWidget(bar)
-    bar.intro = WaveIntro()
+    wave = bar.intro = WaveIntro()
     bar.show_bar()
-    assert bar.isVisible() and bar.intro.playing()
+    assert bar.isVisible() and wave.playing()
     assert bar._reveal < 1.0 and bar.edit.graphicsEffect() is not None
-    qtbot.waitUntil(lambda: bar._reveal == 1.0 and not bar.intro.playing(), timeout=3000)
+    qtbot.waitUntil(lambda: bar._reveal == 1.0 and not wave.playing(), timeout=3000)
     assert bar.edit.graphicsEffect() is None  # effects dropped once shown
     bar.hide()
