@@ -34,9 +34,16 @@ def test_entry_point_dispatches_parts(monkeypatch: pytest.MonkeyPatch) -> None:
     import zachary.cli
     import zachary.indexer.__main__ as idx
 
-    monkeypatch.setattr(zachary.cli, "main", lambda a: seen.append(("cli", a)) or 0)
-    monkeypatch.setattr(idx, "main", lambda a: seen.append(("indexer", a)) or 0)
-    monkeypatch.setattr(zachary.assistant, "main", lambda a: seen.append(("assistant", a)) or 0)
+    def fake(name: str):  # type: ignore[no-untyped-def]
+        def run(a: list[str]) -> int:
+            seen.append((name, a))
+            return 0
+
+        return run
+
+    monkeypatch.setattr(zachary.cli, "main", fake("cli"))
+    monkeypatch.setattr(idx, "main", fake("indexer"))
+    monkeypatch.setattr(zachary.assistant, "main", fake("assistant"))
     entry.main(["cli", "status"])
     entry.main(["indexer", "--once"])
     entry.main(["--show"])  # no part: the assistant (double-clicking the app)
