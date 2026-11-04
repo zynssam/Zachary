@@ -149,7 +149,12 @@ def main(argv: list[str] | None = None) -> int:
     app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(app_icon())
 
-    if send_to_running(b"talk" if args.talk else b"toggle"):
+    message = b"talk" if args.talk else b"toggle" if args.toggle else b"show"
+    if send_to_running(message):
+        if message == b"show":  # started by hand: say why no new window/log appears
+            print("Zachary is already running (its log isn't in this terminal); showing "
+                  "the bar.\nTo restart it here with logs:  pkill -f zachary.assistant && "
+                  "python -m zachary.assistant -v", file=sys.stderr)  # fmt: skip
         return 0  # another instance owns the quick bar
     if args.talk:
         log.warning("no running assistant to talk to")
@@ -183,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             log.warning("voice is off: python -m zachary.cli set voice_enabled true")
 
-    serve_commands(server, {b"toggle": bar.toggle, b"talk": talk})
+    serve_commands(server, {b"toggle": bar.toggle, b"show": bar.show_bar, b"talk": talk})
 
     tray = None
     if Tray.available():
