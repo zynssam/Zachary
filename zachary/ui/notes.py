@@ -22,8 +22,17 @@ import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QFont, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtCore import QPointF, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QGuiApplication,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPaintEvent,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -38,6 +47,7 @@ from PySide6.QtWidgets import (
 
 from zachary.actions.creator import base_folder, safe_name
 from zachary.brain.intents import NEW_PARAGRAPH, SCRATCH_THAT, STOP_DICTATION
+from zachary.ui import style
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +148,44 @@ def dictated(text: str, before: str) -> str:
     return out
 
 
+class RecDot(QWidget):
+    """(look) A small red dot that pulses while the note's mic is on."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(14, 14)
+        self.setVisible(False)
+        self._a = 1.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(1.0)
+        self._anim.setKeyValueAt(0.5, 0.25)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(1100)
+        self._anim.setLoopCount(-1)
+        self._anim.valueChanged.connect(self._step)
+
+    def set_on(self, on: bool) -> None:
+        self.setVisible(on)
+        if on:
+            self._anim.start()
+        else:
+            self._anim.stop()
+
+    def _step(self, v: object) -> None:
+        self._a = float(v)  # type: ignore[arg-type]
+        self.update()
+
+    def paintEvent(self, _e: QPaintEvent) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QColor(style.REC)
+        c.setAlphaF(self._a)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawEllipse(QPointF(7, 7), 4.5, 4.5)
+        p.end()
+
+
 class NotesWindow(QWidget):
     mic_toggled = Signal(bool)  # dictation on/off (VoiceController listens)
     closed = Signal()
@@ -151,6 +199,10 @@ class NotesWindow(QWidget):
         self._last_piece = ""  # for "scratch that"
         self._loading = False
 
+        self.theme = style.theme()  # (look)
+        self.setObjectName("zwindow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.setFont(style.font(self.font()))
         self.notes = QListWidget(self)
         self.notes.setMinimumWidth(200)
         self.notes.currentItemChanged.connect(self._picked)
@@ -159,16 +211,17 @@ class NotesWindow(QWidget):
         left = QWidget(self)
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
+        heading = QLabel("Notes", left)
+        heading.setFont(style.font(heading.font(), 1.25, 600))
+        lv.addWidget(heading)
         lv.addWidget(self.new_btn)
         lv.addWidget(self.notes, 1)
 
         self.editor = QPlainTextEdit(self)
         self.editor.setPlaceholderText("Write, paste (Ctrl+V) or press the mic and talk…")
-        f = QFont(self.editor.font())
-        f.setPointSizeF(f.pointSizeF() * 1.15)
-        self.editor.setFont(f)
+        self.editor.setFont(style.font(self.editor.font(), 1.12))
         self.editor.textChanged.connect(self._changed)
-        self.mic_btn = QPushButton("🎤 Dictate", self)
+        self.mic_btn = QPushButton("Dictate", self)
         self.mic_btn.setCheckable(True)
         self.mic_btn.setEnabled(False)
         self.mic_btn.setToolTip("Voice is off: python -m zachary.cli set voice_enabled true")
@@ -176,15 +229,28 @@ class NotesWindow(QWidget):
         self.paste_btn = QPushButton("Paste", self)
         self.paste_btn.clicked.connect(self.paste_clipboard)
         self.status = QLabel(self)
-        self.status.setStyleSheet("color: gray;")
+        # (look) flat icon buttons, a status pill, a pulsing red dot while dictating
+        t = self.theme
+        dpr = self.devicePixelRatioF()
+        for btn, icon in ((self.new_btn, "notebook-pen"), (self.paste_btn, "copy"),
+                          (self.mic_btn, "mic")):  # fmt: skip
+            btn.setStyleSheet(style.button_css(t))
+            btn.setIcon(QIcon(style.icon_pixmap(icon, t.text, 16, dpr)))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.status.setStyleSheet(style.pill_css(t))
+        self.rec = RecDot(self)
+        self.mic_btn.toggled.connect(self.rec.set_on)
         tools = QHBoxLayout()
+        tools.setSpacing(8)
         tools.addWidget(self.mic_btn)
+        tools.addWidget(self.rec)
         tools.addWidget(self.paste_btn)
         tools.addStretch(1)
         tools.addWidget(self.status)
         right = QWidget(self)
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(10)
         rv.addLayout(tools)
         rv.addWidget(self.editor, 1)
 
@@ -193,7 +259,9 @@ class NotesWindow(QWidget):
         split.addWidget(right)
         split.setStretchFactor(1, 1)
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 16)
         lay.addWidget(split)
+        self.setStyleSheet(style.window_css(t))
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -307,7 +375,7 @@ class NotesWindow(QWidget):
         self.mic_btn.setToolTip("Dictate (Ctrl+M)" if on else self.mic_btn.toolTip())
 
     def _mic(self, on: bool) -> None:
-        self.mic_btn.setText("⏹ Stop" if on else "🎤 Dictate")
+        self.mic_btn.setText("Stop" if on else "Dictate")
         self.status.setText("Listening… say “stop dictation” to finish" if on else "")
         self.mic_toggled.emit(on)
 

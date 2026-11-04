@@ -16,19 +16,35 @@ import os
 import time
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QObject,
+    QRectF,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
-    QFont,
     QGuiApplication,
     QKeyEvent,
     QKeySequence,
     QPainter,
     QPaintEvent,
+    QPen,
     QScreen,
     QShortcut,
 )
-from PySide6.QtWidgets import QLabel, QLineEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 from zachary.brain.handler import Reply
 from zachary.telemetry.latency import LATENCY
@@ -37,6 +53,7 @@ from zachary.ui.engine import Engine
 from zachary.ui.notes import NotesWindow
 from zachary.ui.plan_review import PlanReview
 from zachary.ui.results import ResultsView
+from zachary.ui.voice_dot import VoiceDot
 
 TYPE_DEBOUNCE_MS = 25
 HIDE_AFTER_ACTION_MS = 700
@@ -44,6 +61,7 @@ WIDTH = 720
 MAX_ROWS = 8
 SPACE_HOLD_MS = 400  # Space held this long while typing = talk (shorter = a space)
 THINKING_AFTER_MS = 300
+REVEAL_MS = 180  # (look only) the bar's content fades in when it opens
 
 
 class QuickBar(QWidget):
@@ -67,28 +85,31 @@ class QuickBar(QWidget):
         self.setFixedWidth(WIDTH)
 
         self.edit = QLineEdit(self)
-        self.edit.setPlaceholderText(
-            "Ask Zach: “fees yesterday”, “my projects”, “open the second one”"
-        )
-        f = QFont(self.edit.font())
-        f.setPointSizeF(f.pointSizeF() * 1.45)
-        self.edit.setFont(f)
+        self.edit.setPlaceholderText("Ask Zach…")
+        self.edit.setFont(style.font(self.edit.font(), 1.45))
         self.edit.setFrame(False)
         self.edit.setMinimumHeight(44)
         self.status = QLabel(self)
         self.status.setWordWrap(True)  # answers/explanations can be two or three sentences
-        self.status.setStyleSheet("color: palette(placeholder-text); padding: 2px 4px;")
         # An answer's source passage ("ask your files"); hidden otherwise.
         self.answer = QLabel(self)
         self.answer.setWordWrap(True)
         self.answer.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.answer.setStyleSheet(style.ANSWER_CSS)
         self.answer.setVisible(False)
         self.list = ResultsView(self)
+        # (look) the voice dot, and the theme (follows the system's light/dark)
+        self.dot = VoiceDot(self)
+        self.theme = style.theme()
+        self._apply_theme()
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(10)
+        top.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        top.addWidget(self.edit, 1)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setContentsMargins(18, 12, 18, 14)
         lay.setSpacing(6)
-        lay.addWidget(self.edit)
+        lay.addLayout(top)
         lay.addWidget(self.status)
         lay.addWidget(self.answer)
         lay.addWidget(self.list)
@@ -110,9 +131,7 @@ class QuickBar(QWidget):
 
         self._last_applied = 0
         self.review: PlanReview | None = None
-        self.notes: NotesWindow | None = (
-            None  # Zachary's notes app  # clean/organize plans (Phase 7)
-        )
+        self.notes: NotesWindow | None = None  # Zachary's notes app
         self._explicit_selection = False  # user moved with arrows since the last reply
         self._holding_space = False
         # In a box with text, Space is a space when tapped and talk when held longer
@@ -125,6 +144,16 @@ class QuickBar(QWidget):
         self._open_t0: float | None = None
         self._pending_initial = False
         self._resize_rows(0)
+        # (look) opening fade
+        self._reveal = 1.0
+        self._reveal_anim = QVariantAnimation(self)
+        self._reveal_anim.setStartValue(0.0)
+        self._reveal_anim.setEndValue(1.0)
+        self._reveal_anim.setDuration(REVEAL_MS)
+        self._reveal_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._reveal_anim.valueChanged.connect(self._set_reveal)
+        self._reveal_anim.finished.connect(self._end_reveal)
+        self.reply_applied.connect(self.voice_replied)  # (look) dot: thinking -> speaking
 
     # -- show / hide ---------------------------------------------------------------------
     def toggle(self, activation_token: str | None = None, t0: float | None = None) -> None:
@@ -139,6 +168,9 @@ class QuickBar(QWidget):
             os.environ["XDG_ACTIVATION_TOKEN"] = activation_token
         self.edit.selectAll()
         self._place()
+        if not self.isVisible():
+            self._set_reveal(0.0)
+            self._reveal_anim.start()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -259,6 +291,11 @@ class QuickBar(QWidget):
     def changeEvent(self, ev: QEvent) -> None:
         if ev.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
             self._maybe_hide()
+        elif ev.type() in (QEvent.Type.PaletteChange, QEvent.Type.ThemeChange):
+            new = style.theme()  # (look) the system switched light/dark
+            if new != self.theme:
+                self.theme = new
+                self._apply_theme()
         super().changeEvent(ev)
 
     def showEvent(self, ev: Any) -> None:
@@ -267,6 +304,9 @@ class QuickBar(QWidget):
 
     def hideEvent(self, ev: Any) -> None:
         super().hideEvent(ev)
+        if self._reveal < 1.0:
+            self._reveal_anim.stop()
+            self._end_reveal()
         self.visibility.emit(False)
 
     def _maybe_hide(self) -> None:
@@ -331,14 +371,58 @@ class QuickBar(QWidget):
             self.opened.emit(ms)
 
     # -- look ----------------------------------------------------------------------------
+    def _apply_theme(self) -> None:
+        t = self.theme
+        self.edit.setStyleSheet(style.edit_css(t))
+        self.status.setStyleSheet(style.status_css(t))
+        self.status.setFont(style.font(self.status.font()))
+        self.answer.setStyleSheet(style.answer_css(t))
+        self.answer.setFont(style.font(self.answer.font()))
+        self.list.set_theme(t)
+        self.update()
+
+    def set_voice_state(self, state: str) -> None:
+        """(look) The voice dot follows the voice controller's states. "idle" while it's
+        thinking means "heard, now working": the dot keeps thinking until ``voice_done``."""
+        if state == "idle" and self.dot.state in {"thinking", "speaking"}:
+            return
+        self.dot.set_state(state)
+
+    def voice_replied(self, _reply: object = None) -> None:
+        if self.dot.state == "thinking":
+            self.dot.set_state("speaking")
+
+    def voice_done(self, _rec: object = None) -> None:
+        self.dot.set_state("idle")
+
+    def _content(self) -> tuple[QWidget, ...]:
+        return (self.dot, self.edit, self.status, self.answer, self.list)
+
+    def _set_reveal(self, v: object) -> None:
+        self._reveal = float(v)  # type: ignore[arg-type]
+        for wdg in self._content():
+            eff = wdg.graphicsEffect()
+            if not isinstance(eff, QGraphicsOpacityEffect):
+                eff = QGraphicsOpacityEffect(wdg)
+                wdg.setGraphicsEffect(eff)
+            eff.setOpacity(self._reveal)
+        self.update()
+
+    def _end_reveal(self) -> None:
+        self._reveal = 1.0
+        for wdg in self._content():
+            wdg.setGraphicsEffect(None)  # type: ignore[arg-type]  # (costs a render pass)
+        self.update()
+
     def paintEvent(self, e: QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        bg = self.palette().window().color()
-        bg.setAlpha(245)
-        p.setBrush(bg)
-        p.setPen(QColor(*style.BORDER_RGBA))
-        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 14, 14)
+        p.setOpacity(self._reveal)
+        t = self.theme
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setBrush(QColor(*t.glass))
+        p.setPen(QPen(QColor(*t.border), 1.0))
+        p.drawRoundedRect(r, style.RADIUS, style.RADIUS)
 
 
 def _performed(reply: Reply) -> bool:

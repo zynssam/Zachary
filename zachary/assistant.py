@@ -25,6 +25,7 @@ from zachary.core.config import Config, default_db_path
 from zachary.core.db import get_state, open_db
 from zachary.core.hotkeys import HotkeyError, parse_hotkey
 from zachary.core.platform import Platform, get_platform
+from zachary.ui import style
 from zachary.ui.engine import Engine
 from zachary.ui.quickbar import QuickBar
 from zachary.ui.tray import Tray, app_icon
@@ -147,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("Zachary")
     app.setDesktopFileName("ai.zachary.Zachary")
     app.setQuitOnLastWindowClosed(False)
+    style.use_dark(app)  # (look)
     app.setWindowIcon(app_icon())
 
     message = b"talk" if args.talk else b"toggle" if args.toggle else b"show"
@@ -244,6 +246,8 @@ def main(argv: list[str] | None = None) -> int:
             wake_word=settings.wake_word,
             latency_path=data_dir / "latency.jsonl",
         )
+        voice.state.connect(bar.set_voice_state)  # (look) the voice dot
+        voice.spoken.connect(bar.voice_done)
         voice.start()
         talk_handlers.append(voice.push_to_talk)
         bar.talk.connect(voice.push_to_talk)

@@ -8,28 +8,33 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap, QRadialGradient
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
 from zachary.ui import style
 
 
 def app_icon() -> QIcon:
-    """A simple drawn icon (no asset files): a rounded square with a "Z"."""
+    """The app icon: a soft violet dot with a halo, drawn in code (like the voice dot)."""
     pm = QPixmap(64, 64)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QColor(style.ACCENT))
+    c = QColor(style.ACCENT)
+    halo = QRadialGradient(QPointF(32, 32), 30)
+    for pos, a in ((0.0, 0.45), (1.0, 0.0)):
+        h = QColor(c)
+        h.setAlphaF(a)
+        halo.setColorAt(pos, h)
     p.setPen(Qt.PenStyle.NoPen)
-    p.drawRoundedRect(4, 4, 56, 56, 14, 14)
-    f = QFont()
-    f.setBold(True)
-    f.setPixelSize(40)
-    p.setFont(f)
-    p.setPen(QColor("white"))
-    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "Z")
+    p.setBrush(halo)
+    p.drawEllipse(QPointF(32, 32), 30, 30)
+    core = QRadialGradient(QPointF(27, 26), 22)
+    core.setColorAt(0.0, c.lighter(150))
+    core.setColorAt(1.0, c)
+    p.setBrush(core)
+    p.drawEllipse(QPointF(32, 32), 15, 15)
     p.end()
     return QIcon(pm)
 
