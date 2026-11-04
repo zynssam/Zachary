@@ -356,6 +356,19 @@ class LinuxPlatform:
         except OSError as e:
             log.warning("could not write %s: %s", target, e)
 
+    def autostart(self, exec_argv: list[str], enabled: bool | None = None) -> tuple[bool, str]:
+        """An XDG autostart entry (~/.config/autostart): GNOME, KDE, XFCE... run it at
+        login, so "Hey Zach" and the hotkey work without starting Zachary yourself."""
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        target = Path(base) / "autostart" / DESKTOP_FILE_NAME
+        if enabled is True:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(desktop_entry(exec_argv) + "X-GNOME-Autostart-enabled=true\n"
+                              "NoDisplay=true\n", encoding="utf-8")  # fmt: skip
+        elif enabled is False:
+            target.unlink(missing_ok=True)
+        return target.exists(), str(target)
+
     def global_hotkey(
         self,
         hotkey: Hotkey,

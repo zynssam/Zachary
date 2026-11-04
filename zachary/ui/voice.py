@@ -162,8 +162,9 @@ class VoiceController(QObject):
         if state in ("listening", "thinking"):
             log.info("voice: %s", state)
         if state == "wake":
-            if not self.bar.isVisible():
-                self.bar.show_bar()
+            # Every "Hey Zach" brings the bar up: opened if hidden, raised and focused if
+            # it was left open behind other windows.
+            self.bar.show_bar()
             self.orb_state.emit("wake")  # pops, then listening
             return
         if state in ("listening", "thinking"):

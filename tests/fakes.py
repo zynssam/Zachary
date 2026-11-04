@@ -116,6 +116,11 @@ class FakePlatform:
 
     def ensure_app_registration(self, exec_argv: list[str]) -> None: ...
 
+    def autostart(self, exec_argv: list[str], enabled: bool | None = None) -> tuple[bool, str]:
+        if enabled is not None:
+            self.autostart_on = enabled
+        return getattr(self, "autostart_on", False), "fake"
+
     def global_hotkey(
         self,
         hotkey: Hotkey,

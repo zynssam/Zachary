@@ -35,18 +35,29 @@ frame is drawn once and cached.
 Levels are smoothed (fast attack, slow release) and *pulled* by the UI timer, so no
 audio thread touches the widget. `reduce_motion = True` makes it static.
 
-## Opening wave (`ui/wave_intro.py`)
+## Opening animation: "volcanic" (`ui/wave_intro.py`)
 When the bar opens (hotkey or "Hey Zach"), a glowing wave rises along the bottom of the
-screen, flows together under the bar and fades (0.9 s). Sparks drift up from it, and on
-"Hey Zach" it also moves with your voice. The bar is usable at once (type straight away)
-and fades in over ~0.4 s while the wave gathers.
+screen and erupts (1.3 s). Three vents push the wave lines up into pointed plumes over a
+heat glow. Embers shoot up, arc back down under gravity, and cool from white-hot to
+magenta, violet and blue as they fade. On "Hey Zach" the plumes grow with your voice. The
+bar is usable at once (type straight away) and fades in over ~0.4 s.
 - The overlay is click-through and never takes focus; it's hidden after the animation
-  (no CPU after).
-- On X11 and Windows it's a strip at the bottom of the screen. On Wayland a window can't
-  place itself, so it covers the work area (transparent) and draws at its bottom.
-- Speed: about 5 ms a frame at 1920 px wide and 11 ms at 4K. The glow is drawn at ¼
-  resolution and scaled up; the bright lines are 1 px (Qt's fast path).
+  (no CPU after). It belongs to the bar, so it's cleaned up with it.
+- On X11 and Windows it's a strip at the bottom of the screen (520 px). On Wayland a
+  window can't place itself, so it covers the work area (transparent) and draws at its
+  bottom.
+- Speed: ≤ 14 ms a frame at 1920 px wide. The glow is drawn at ¼ resolution; lines are
+  1 px (Qt's fast path); embers are drawn in ~16 batches.
 - Off: `python -m zachary.cli set open_animation false`
+
+## "Hey Zach" any time
+- `python -m zachary.cli autostart on` starts Zachary when you log in (`autostart off` /
+  `autostart` to check). Linux: `~/.config/autostart/ai.zachary.Zachary.desktop`;
+  Windows: `HKCU\...\Run\Zachary` (pythonw, no console). With `wake_word` on, the
+  microphone is listened to locally (Vosk) from login; only what follows "Hey Zach" goes
+  to Gnani.
+- Every "Hey Zach" brings the bar up: it opens if hidden, or is raised and focused if it
+  was left open behind other windows.
 
 ## Assets (`zachary/ui/assets/`, licences in `LICENSES.md`)
 - Lucide icons (ISC)

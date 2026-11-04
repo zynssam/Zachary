@@ -65,7 +65,7 @@ WIDTH = 720
 MAX_ROWS = 8
 SPACE_HOLD_MS = 400  # Space held this long while typing = talk (shorter = a space)
 THINKING_AFTER_MS = 300
-REVEAL_DELAY_MS = 160  # opening animation: the bar fades in as the wave gathers
+REVEAL_DELAY_MS = 220  # opening animation: the bar fades in as the wave rises
 REVEAL_MS = 420
 
 
@@ -164,6 +164,11 @@ class QuickBar(QWidget):
         self._reveal_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._reveal_anim.valueChanged.connect(self._set_reveal)
         self._reveal_anim.finished.connect(self._end_reveal)
+        # (a timer owned by the bar: dies with it, never fires into a deleted widget)
+        self._reveal_timer = QTimer(self)
+        self._reveal_timer.setSingleShot(True)
+        self._reveal_timer.setInterval(REVEAL_DELAY_MS)
+        self._reveal_timer.timeout.connect(self._reveal_anim.start)
 
     # -- show / hide ---------------------------------------------------------------------
     def toggle(self, activation_token: str | None = None, t0: float | None = None) -> None:
@@ -192,12 +197,11 @@ class QuickBar(QWidget):
         """A wave along the bottom of the screen; the bar (already usable) fades in."""
         assert self.intro is not None
         screen = self.screen()
-        on_wayland = QGuiApplication.platformName() == "wayland"
         self.intro.level_source = self.orb.level_source
-        self.intro.play(screen, None if on_wayland else self.x() + WIDTH // 2)
+        self.intro.play(screen)
         self._set_reveal(0.0)
         self._reveal_anim.stop()
-        QTimer.singleShot(REVEAL_DELAY_MS, self._reveal_anim.start)
+        self._reveal_timer.start()
 
     def _set_reveal(self, v: object) -> None:
         self._reveal = float(v)  # type: ignore[arg-type]
@@ -333,6 +337,7 @@ class QuickBar(QWidget):
     def hideEvent(self, ev: Any) -> None:
         super().hideEvent(ev)
         if self._reveal < 1.0:
+            self._reveal_timer.stop()
             self._reveal_anim.stop()
             self._end_reveal()
         if self.intro is not None and self.intro.playing():

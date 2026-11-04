@@ -172,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     if settings.open_animation:
         from zachary.ui.wave_intro import WaveIntro
 
-        bar.intro = WaveIntro()
+        bar.intro = WaveIntro(bar)
 
     server = QLocalServer()
     server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)  # only this user
