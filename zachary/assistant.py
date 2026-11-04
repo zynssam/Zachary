@@ -25,6 +25,7 @@ from zachary.core.config import Config, default_db_path
 from zachary.core.db import get_state, open_db
 from zachary.core.hotkeys import HotkeyError, parse_hotkey
 from zachary.core.platform import Platform, get_platform
+from zachary.launch import self_command
 from zachary.ui import style
 from zachary.ui.engine import Engine
 from zachary.ui.quickbar import QuickBar
@@ -41,7 +42,7 @@ def server_name() -> str:
 
 
 def toggle_cmd() -> list[str]:
-    return [sys.executable, "-m", "zachary.assistant", "--toggle"]
+    return self_command("zachary.assistant", "--toggle")
 
 
 def send_to_running(message: bytes, timeout_ms: int = 3000) -> bool:
@@ -113,7 +114,7 @@ def ensure_indexer(platform: Platform, db_path: Path) -> bool:
     """Start the indexer daemon unless it is alive. It refuses to run twice (lock)."""
     if indexer_running(db_path):
         return False
-    platform.spawn_detached([sys.executable, "-m", "zachary.indexer", "--db", str(db_path)])
+    platform.spawn_detached(self_command("zachary.indexer", "--db", str(db_path)))
     return True
 
 
@@ -210,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_hotkey:
         try:
             hk = parse_hotkey(args.hotkey or settings.quickbar_hotkey)
-            platform.ensure_app_registration([sys.executable, "-m", "zachary.assistant"])
+            platform.ensure_app_registration(self_command("zachary.assistant"))
             backend = platform.global_hotkey(
                 hk, lambda tok: bridge.pressed.emit(tok, time.perf_counter()), "Open Zachary"
             )
