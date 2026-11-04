@@ -21,6 +21,10 @@ ASSETS = Path(__file__).with_name("assets")
 ACCENT = "#7C5CFF"  # violet
 ACCENT_2 = "#3B82F6"  # blue (gradient end)
 ACCENT_RGBA = (124, 92, 255)
+# The orb and the opening wave: blue -> violet -> magenta.
+ORB_BLUE = "#3B6BFF"
+ORB_VIOLET = "#8B5CF6"
+ORB_MAGENTA = "#E040FB"
 WARN = "#F59E0B"  # amber: errors / no microphone
 REC = "#EF4444"  # dictation recording dot
 SELECTION_ALPHA = 46  # highlighted row: accent at this alpha

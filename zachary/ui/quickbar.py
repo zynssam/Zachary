@@ -17,7 +17,16 @@ import os
 import time
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QObject,
+    QRectF,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -32,7 +41,14 @@ from PySide6.QtGui import (
     QScreen,
     QShortcut,
 )
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 from zachary.brain.handler import Reply
 from zachary.telemetry.latency import LATENCY
@@ -41,6 +57,7 @@ from zachary.ui.engine import Engine
 from zachary.ui.plan_review import PlanReview
 from zachary.ui.results import ResultsView
 from zachary.ui.voice_visual import VoiceOrb
+from zachary.ui.wave_intro import WaveIntro
 
 TYPE_DEBOUNCE_MS = 25
 HIDE_AFTER_ACTION_MS = 700
@@ -48,6 +65,8 @@ WIDTH = 720
 MAX_ROWS = 8
 SPACE_HOLD_MS = 400  # Space held this long while typing = talk (shorter = a space)
 THINKING_AFTER_MS = 300
+REVEAL_DELAY_MS = 160  # opening animation: the bar fades in as the wave gathers
+REVEAL_MS = 420
 
 
 class QuickBar(QWidget):
@@ -135,6 +154,16 @@ class QuickBar(QWidget):
         self._open_t0: float | None = None
         self._pending_initial = False
         self._resize_rows(0)
+        # Opening animation (the assistant turns it on: setting open_animation).
+        self.intro: WaveIntro | None = None
+        self._reveal = 1.0
+        self._reveal_anim = QVariantAnimation(self)
+        self._reveal_anim.setStartValue(0.0)
+        self._reveal_anim.setEndValue(1.0)
+        self._reveal_anim.setDuration(REVEAL_MS)
+        self._reveal_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._reveal_anim.valueChanged.connect(self._set_reveal)
+        self._reveal_anim.finished.connect(self._end_reveal)
 
     # -- show / hide ---------------------------------------------------------------------
     def toggle(self, activation_token: str | None = None, t0: float | None = None) -> None:
@@ -149,6 +178,8 @@ class QuickBar(QWidget):
             os.environ["XDG_ACTIVATION_TOKEN"] = activation_token
         self.edit.selectAll()
         self._place()
+        if self.intro is not None and not self.isVisible():
+            self._play_intro()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -156,6 +187,33 @@ class QuickBar(QWidget):
         # Fresh data in the background; the cached list is already on screen.
         self._pending_initial = True
         self.engine.ask("preview", self.edit.text())
+
+    def _play_intro(self) -> None:
+        """A wave along the bottom of the screen; the bar (already usable) fades in."""
+        assert self.intro is not None
+        screen = self.screen()
+        on_wayland = QGuiApplication.platformName() == "wayland"
+        self.intro.level_source = self.orb.level_source
+        self.intro.play(screen, None if on_wayland else self.x() + WIDTH // 2)
+        self._set_reveal(0.0)
+        self._reveal_anim.stop()
+        QTimer.singleShot(REVEAL_DELAY_MS, self._reveal_anim.start)
+
+    def _set_reveal(self, v: object) -> None:
+        self._reveal = float(v)  # type: ignore[arg-type]
+        for wdg in (self.orb, self.edit, self.status, self.answer, self.list):
+            eff = wdg.graphicsEffect()
+            if not isinstance(eff, QGraphicsOpacityEffect):
+                eff = QGraphicsOpacityEffect(wdg)
+                wdg.setGraphicsEffect(eff)
+            eff.setOpacity(self._reveal)
+        self.update()
+
+    def _end_reveal(self) -> None:
+        self._reveal = 1.0
+        for wdg in (self.orb, self.edit, self.status, self.answer, self.list):
+            wdg.setGraphicsEffect(None)  # type: ignore[arg-type]  # (drop: costs a render pass)
+        self.update()
 
     def _place(self) -> None:
         # Either call can return None at runtime (no screen under the cursor / headless).
@@ -274,6 +332,11 @@ class QuickBar(QWidget):
 
     def hideEvent(self, ev: Any) -> None:
         super().hideEvent(ev)
+        if self._reveal < 1.0:
+            self._reveal_anim.stop()
+            self._end_reveal()
+        if self.intro is not None and self.intro.playing():
+            self.intro.stop()
         self.visibility.emit(False)
 
     def _maybe_hide(self) -> None:
@@ -369,6 +432,7 @@ class QuickBar(QWidget):
     def paintEvent(self, e: QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(self._reveal)
         t = self.theme
         r = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
         # A soft accent edge glow, then the glass card.

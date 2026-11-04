@@ -167,6 +167,8 @@ class Settings:
     speak_replies: bool = True
     offline_stt_model: str = "tiny"
     mic_device: str = ""  # "" = system default input; see `cli voice mics`
+    # A wave along the bottom of the screen when the bar opens (hotkey / "Hey Zach").
+    open_animation: bool = True
 
 
 _SETTING_KEYS: tuple[str, ...] = tuple(Settings.__dataclass_fields__)

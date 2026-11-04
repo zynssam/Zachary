@@ -63,3 +63,47 @@ def test_every_state_paints_in_both_themes(qtbot: QtBot) -> None:
         orb.set_state(s)
         assert not orb.grab().isNull()
     assert style.DARK.dark and not style.LIGHT.dark
+
+
+def test_wave_draws_every_moment_and_hides_itself(qtbot: QtBot) -> None:
+    from PySide6.QtGui import QImage, QPainter
+
+    from zachary.ui.wave_intro import DURATION_S, WaveIntro
+
+    wave = WaveIntro()
+    qtbot.addWidget(wave)
+    img = QImage(800, 280, QImage.Format.Format_ARGB32_Premultiplied)
+    for t in (0.0, 0.2, 0.5, 0.8, DURATION_S + 0.1):
+        img.fill(0)
+        p = QPainter(img)
+        wave.draw(p, 800, 280, t)
+        p.end()
+    wave.level_source = lambda: 0.5
+    wave.play()
+    assert wave.playing() and wave.isVisible()
+    qtbot.waitUntil(lambda: not wave.playing(), timeout=3000)
+    assert not wave.isVisible()
+
+
+def test_bar_fades_in_with_the_wave_and_is_usable_at_once(qtbot: QtBot) -> None:
+    from PySide6.QtCore import QObject, Signal
+
+    from zachary.ui.quickbar import QuickBar
+    from zachary.ui.wave_intro import WaveIntro
+
+    class Engine(QObject):
+        replied = Signal(int, object)
+        failed = Signal(int, str)
+
+        def ask(self, *_a: object) -> int:
+            return 0
+
+    bar = QuickBar(Engine())  # type: ignore[arg-type]
+    qtbot.addWidget(bar)
+    bar.intro = WaveIntro()
+    bar.show_bar()
+    assert bar.isVisible() and bar.intro.playing()
+    assert bar._reveal < 1.0 and bar.edit.graphicsEffect() is not None
+    qtbot.waitUntil(lambda: bar._reveal == 1.0 and not bar.intro.playing(), timeout=3000)
+    assert bar.edit.graphicsEffect() is None  # effects dropped once shown
+    bar.hide()

@@ -169,6 +169,10 @@ def main(argv: list[str] | None = None) -> int:
     engine = Engine(db_path, platform)
     engine.start()
     bar = QuickBar(engine)
+    if settings.open_animation:
+        from zachary.ui.wave_intro import WaveIntro
+
+        bar.intro = WaveIntro()
 
     server = QLocalServer()
     server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)  # only this user
