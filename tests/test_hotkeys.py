@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -147,3 +148,18 @@ def test_portal_binds_all_shortcuts_in_one_session(monkeypatch: pytest.MonkeyPat
     toggle.stop()
     voice.stop()
     assert mgr.handles == []
+
+
+def test_portal_does_not_ask_again_for_known_shortcuts() -> None:
+    """BindShortcuts shows GNOME's "allow shortcuts" dialog: skip it once approved."""
+    from zachary.core.hotkeys import parse_hotkey
+    from zachary.core.platform import linux_portal as lp
+
+    hs = [
+        lp.PortalHotkey(parse_hotkey("super+space"), lambda _t: None, "Open", "toggle"),
+        lp.PortalHotkey(parse_hotkey("super+alt+space"), lambda _t: None, "Talk", "voice"),
+    ]
+    known: dict[str, Any] = {"shortcuts": ("a(sa{sv})", [("toggle", {}), ("voice", {})])}
+    assert not lp.needs_bind(known, hs)
+    assert lp.needs_bind({"shortcuts": ("a(sa{sv})", [("toggle", {})])}, hs)  # a new one
+    assert lp.needs_bind({}, hs)  # (ListShortcuts failed / first run)

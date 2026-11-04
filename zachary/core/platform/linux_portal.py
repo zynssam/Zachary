@@ -183,9 +183,18 @@ class _PortalSession:
             ({"session_handle_token": ("s", "zach" + secrets.token_hex(4))},),
         )
         session = res["session_handle"][1]
-        res = self._request(
-            conn, "BindShortcuts", "oa(sa{sv})sa{sv}", (session, shortcuts_body(handles), "", {})
-        )
+        # Already approved (GNOME remembers an app's shortcuts)? Then don't bind again:
+        # BindShortcuts shows the "allow these shortcuts" dialog every time.
+        res = {}
+        try:
+            res = self._request(conn, "ListShortcuts", "oa{sv}", (session, {}))
+        except PortalUnavailable as e:
+            log.debug("ListShortcuts failed (%s); binding", e)
+        if needs_bind(res, handles):
+            res = self._request(
+                conn, "BindShortcuts", "oa(sa{sv})sa{sv}",
+                (session, shortcuts_body(handles), "", {}),
+            )  # fmt: skip
         by_id = {h.shortcut_id: h for h in handles}
         for sid, props in res.get("shortcuts", ("", []))[1]:
             if sid in by_id:
@@ -212,6 +221,12 @@ class _PortalSession:
                     by_id[sid].callback(token or None)
                 except Exception:
                     log.exception("hotkey callback failed")
+
+
+def needs_bind(listed: dict[str, Any], handles: list[PortalHotkey]) -> bool:
+    """Bind (and show GNOME's dialog) only if a shortcut isn't known to the portal yet."""
+    have = {sid for sid, _props in listed.get("shortcuts", ("", []))[1]}
+    return not {h.shortcut_id for h in handles} <= have
 
 
 def shortcuts_body(handles: list[PortalHotkey]) -> list[tuple[str, dict[str, Any]]]:

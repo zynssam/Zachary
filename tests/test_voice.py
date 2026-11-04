@@ -1475,3 +1475,34 @@ def test_ptt_in_wake_mode_borrows_the_earbuds_when_the_open_mic_is_silent(
         lis.stop()
         lis.join(3)
     assert got[0].text == gnani.transcript and Borrowing.borrowed_for == 1
+
+
+def test_noise_in_other_scripts_is_not_a_command() -> None:
+    """Offline Whisper turns background noise into text in random languages."""
+    from zachary.voice.pipeline import plausible
+
+    assert plausible("open the fee receipt") and plausible("मेरी फ़ाइल खोलो")
+    assert plausible("kal wali file kholo") and plausible("Café notes")
+    assert not plausible("وحيث أن تكون هناك.") and not plausible("ご視聴ありがとうございました")
+    assert not plausible("...") and not plausible("")
+
+
+def test_holding_space_during_a_wake_command_starts_hold_to_talk(gnani: MockGnani) -> None:
+    """A (false) "Hey Zach" is listening; you hold Space: that command is dropped and a
+    hold-to-talk starts, which ends when you let go (not "Listening..." forever)."""
+    src = CountingSource()
+    got: list[Heard] = []
+    fast = FakeFast(after=10)
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=fast)
+    try:
+        src.load(silence(0.3) + speech(0.4))  # the wake fires, its command is listening
+        wait_until(lambda: fast.fired == 1, timeout=5)
+        lis.push_to_talk(hold=True)  # Space down
+        src.load(speech(1.0) + silence(0.6))
+        time.sleep(0.8)
+        lis.release()  # Space up
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert len(got) == 1 and got[0].via == "ptt" and got[0].text == gnani.transcript

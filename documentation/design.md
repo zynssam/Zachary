@@ -58,6 +58,13 @@ bar is usable at once (type straight away) and fades in over ~0.4 s.
   to Gnani.
 - Every "Hey Zach" brings the bar up: it opens if hidden, or is raised and focused if it
   was left open behind other windows.
+- False wakes: if nothing usable is said after "Hey Zach", the bar closes again quietly.
+  Text that's mostly not Latin/Devanagari is ignored as noise (offline Whisper turns
+  background sound into random languages, e.g. Arabic); see `pipeline.plausible`.
+- Holding Space while a wake command is listening drops that command and starts a fresh
+  hold-to-talk, which ends when you let go.
+- GNOME's "allow shortcuts" dialog: both hotkeys are registered together (one request),
+  and not again once GNOME knows them (`ListShortcuts` first).
 
 ## Assets (`zachary/ui/assets/`, licences in `LICENSES.md`)
 - Lucide icons (ISC)

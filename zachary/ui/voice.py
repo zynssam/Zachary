@@ -78,6 +78,7 @@ class VoiceController(QObject):
         # Voice dictation: listen again after each piece (after any spoken reply ended,
         # so the speaker isn't recorded) until "stop dictation".
         self.dictating = False
+        self._wake_opened = False  # the bar was opened by "Hey Zach" (not by you)
         self.spoken.connect(self._rearm)
         # The orb moves with the real audio: your mic while listening, Zach's voice while
         # speaking (levels are plain floats, read on the UI thread at ~60 fps).
@@ -164,6 +165,7 @@ class VoiceController(QObject):
         if state == "wake":
             # Every "Hey Zach" brings the bar up: opened if hidden, raised and focused if
             # it was left open behind other windows.
+            self._wake_opened = not self.bar.isVisible()
             self.bar.show_bar()
             self.orb_state.emit("wake")  # pops, then listening
             return
@@ -189,6 +191,15 @@ class VoiceController(QObject):
             self.bar.status.setText(state)
 
     def _on_heard(self, h: Heard) -> None:
+        wake_opened, self._wake_opened = self._wake_opened, False
+        if not h.text and h.via == "wake" and wake_opened:
+            # Probably not "Hey Zach" at all (a similar word, the TV...): nothing was
+            # said after it, so close the bar again instead of showing an error.
+            log.info("voice: nothing after the wake word; closing the bar")
+            self.bar.hide()
+            h.timeline.info["error"] = "false_wake"
+            h.timeline.finish(str(self.latency_path) if self.latency_path else None)
+            return
         if not h.text:
             msg = str(h.error) if h.error else "I didn't catch that."
             log.info("voice: %s", msg)

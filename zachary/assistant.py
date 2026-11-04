@@ -227,6 +227,21 @@ def main(argv: list[str] | None = None) -> int:
 
     voice = None
     voice_backend = None
+    vbridge = _HotkeyBridge()
+    vbridge.pressed.connect(lambda _tok, _t0: voice.push_to_talk() if voice else None)
+    if settings.voice_enabled and not args.no_voice and not args.no_hotkey:
+        # Registered right away, with the bar's hotkey: the portal binds both in one
+        # request (one dialog at most), not a second one after voice has loaded.
+        try:
+            voice_backend = platform.global_hotkey(
+                parse_hotkey(settings.voice_hotkey),
+                lambda tok: vbridge.pressed.emit(tok, time.perf_counter()),
+                "Talk to Zachary",
+                "voice",
+            )
+            voice_backend.start()
+        except HotkeyError as e:
+            log.error("bad voice hotkey setting: %s", e)
     if settings.voice_enabled and not args.no_voice:
         from zachary.ui.voice import VoiceController
         from zachary.voice.factory import build_voice
@@ -248,20 +263,6 @@ def main(argv: list[str] | None = None) -> int:
         bar.talk.connect(voice.push_to_talk)
         bar.hold_talk.connect(voice.hold_talk)
         bar.visibility.connect(voice.bar_visible)
-        vbridge = _HotkeyBridge()
-        vbridge.pressed.connect(lambda _tok, _t0: voice.push_to_talk())
-        if not args.no_hotkey:
-            try:
-                voice_backend = platform.global_hotkey(
-                    parse_hotkey(settings.voice_hotkey),
-                    lambda tok: vbridge.pressed.emit(tok, time.perf_counter()),
-                    "Talk to Zachary",
-                    "voice",
-                )
-                voice_backend.start()
-            except HotkeyError as e:
-                log.error("bad voice hotkey setting: %s", e)
-
     if args.show or args.toggle:
         QTimer.singleShot(0, bar.show_bar)
     # Warm the engine's DB connection and the cached list so the first open is fast.
