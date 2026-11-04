@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    branches: ["**"]
     paths: ["packaging/**", ".github/workflows/build.yml"]
 jobs:
   app:
