@@ -47,6 +47,8 @@ class Tray(QSystemTrayIcon):
         on_quit: Callable[[], None],
         paused: bool,
         parent: QWidget | None = None,
+        on_settings: Callable[[], None] | None = None,
+        on_exclude: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(app_icon(), parent)
         self.setToolTip("Zachary")
@@ -56,6 +58,10 @@ class Tray(QSystemTrayIcon):
         self.pause_action.setChecked(paused)
         self.pause_action.toggled.connect(on_pause)
         menu.addAction(self.pause_action)
+        if on_exclude is not None:
+            menu.addAction("Exclude a folder…", on_exclude)
+        if on_settings is not None:
+            menu.addAction("Settings…", on_settings)
         menu.addSeparator()
         menu.addAction("Quit", on_quit)
         self._menu = menu  # keep a reference

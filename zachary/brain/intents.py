@@ -287,7 +287,7 @@ _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show",
 class Intent:
     kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|topic|
     #            resume|timeline|confirm|cancel|ask|explain|clean|organize|undo|create|
-    #            dictate|stats|notes|none
+    #            dictate|stats|notes|settings|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
@@ -377,6 +377,7 @@ def _ordinal(tokens: list[str]) -> tuple[int | None, set[int]]:
 _QUESTION_TYPOS = {"whn": "when", "wen": "when", "wat": "what", "wht": "what", "hw": "how"}
 
 
+_SETTINGS_FILLER = frozenset("open show change my the zachary zach zachs app please".split())
 _NOTES_FILLER = frozenset(
     "please zach zack hey the my a an zachary zacharys app application window now up".split()
 )
@@ -442,6 +443,11 @@ def parse(text: str) -> Intent:
         or (any(t in OPEN_VERBS for t in joined_re) and any(t in CONFIRM_ALL for t in joined_re))
     ):
         return Intent("confirm", confidence=conf, corrected=corrected)
+
+    # --- Zachary's settings ("open settings", "preferences") ------------------------------
+    if tuple(t for t in toks if t not in _SETTINGS_FILLER) in {("settings",), ("setting",),
+                                                               ("preferences",)}:  # fmt: skip
+        return Intent("settings", query=text.strip(), confidence=conf, corrected=corrected)
 
     # --- Zachary's own notes app ("open my notes", "new note", "take a note") -----------
     notes = notes_action(toks)

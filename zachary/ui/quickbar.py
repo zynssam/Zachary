@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import (
@@ -132,6 +133,7 @@ class QuickBar(QWidget):
         self._last_applied = 0
         self.review: PlanReview | None = None
         self.notes: NotesWindow | None = None  # Zachary's notes app
+        self.open_settings: Callable[[], None] | None = None  # (set by the assistant)
         self._explicit_selection = False  # user moved with arrows since the last reply
         self._holding_space = False
         # In a box with text, Space is a space when tapped and talk when held longer
@@ -339,6 +341,11 @@ class QuickBar(QWidget):
         if rid < self._last_applied:
             return  # an older reply arrived late
         self._last_applied = rid
+        if reply.settings and self.open_settings is not None:  # "open settings"
+            self.open_settings()
+            self.hide()
+            self.reply_applied.emit(reply)
+            return
         if reply.notes:  # "open my notes" / "new note" / "take a note"
             self.status.setText(reply.say)
             self.notes_window().present(reply.notes)

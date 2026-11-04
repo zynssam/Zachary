@@ -19,7 +19,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from zachary.core.config import Config, default_db_path
 from zachary.core.db import get_state, open_db
@@ -169,10 +169,17 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config(conn, platform)
     cfg.seed_defaults()
     settings = cfg.load()
+    from zachary.ui.settings import FirstRun, SettingsWindow, needs_first_run
+
+    first_run = needs_first_run(cfg)
     conn.close()
 
-    if not args.no_indexer:
-        ensure_indexer(platform, db_path)
+    def start_indexer() -> None:
+        if not args.no_indexer:
+            ensure_indexer(platform, db_path)
+
+    if not first_run:  # (first start: only once you've chosen your folders)
+        start_indexer()
 
     engine = Engine(db_path, platform)
     engine.start()
@@ -193,6 +200,26 @@ def main(argv: list[str] | None = None) -> int:
 
     serve_commands(server, {b"toggle": bar.toggle, b"show": bar.show_bar, b"talk": talk})
 
+    windows: dict[str, QWidget] = {}
+
+    def open_settings() -> None:
+        w = SettingsWindow(Config(open_db(db_path), platform), platform)
+        windows["settings"] = w  # (keep a reference while it's open)
+        w.show()
+        w.raise_()
+        w.activateWindow()
+
+    def exclude_folder() -> None:
+        from PySide6.QtWidgets import QFileDialog
+
+        d = QFileDialog.getExistingDirectory(None, "Never look in this folder", str(Path.home()))
+        if d:
+            c = Config(open_db(db_path), platform)
+            c.add_exclude(d, "path")
+            c.conn.close()
+            bar.status.setText(f"Excluded {d}: forgotten and never read again.")
+
+    bar.open_settings = open_settings  # "open settings" in the bar (no tray on GNOME)
     tray = None
     if Tray.available():
         tray = Tray(
@@ -200,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
             on_pause=lambda p: (engine.ask("pause", p), None)[1],
             on_quit=app.quit,
             paused=settings.indexing_paused,
+            on_settings=open_settings,
+            on_exclude=exclude_folder,
         )
         tray.show()
     else:
@@ -269,7 +298,18 @@ def main(argv: list[str] | None = None) -> int:
         bar.talk.connect(voice.push_to_talk)
         bar.hold_talk.connect(voice.hold_talk)
         bar.visibility.connect(voice.bar_visible)
-    if args.show or args.toggle:
+    if first_run:
+        setup = FirstRun(Config(open_db(db_path), platform), platform)
+        windows["setup"] = setup
+
+        def setup_done() -> None:
+            start_indexer()
+            bar.show_bar()
+            bar.status.setText("All set. Type anything, or press your shortcut later.")
+
+        setup.finished.connect(setup_done)
+        QTimer.singleShot(0, setup.show)
+    elif args.show or args.toggle:
         QTimer.singleShot(0, bar.show_bar)
     # Warm the engine's DB connection and the cached list so the first open is fast.
     QTimer.singleShot(0, lambda: engine.ask("preview", ""))

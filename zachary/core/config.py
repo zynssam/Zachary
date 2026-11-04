@@ -167,6 +167,10 @@ class Settings:
     speak_replies: bool = True
     offline_stt_model: str = "tiny"
     mic_device: str = ""  # "" = system default input; see `cli voice mics`
+    # Phase 8. First-run setup shown until done; OCR (Tesseract, installed separately)
+    # for scanned PDFs and images: off by default (slow, runs in the background).
+    setup_done: bool = False
+    ocr_enabled: bool = False
 
 
 _SETTING_KEYS: tuple[str, ...] = tuple(Settings.__dataclass_fields__)
