@@ -68,6 +68,19 @@ class Heard:
     extra: dict[str, object] = field(default_factory=dict)
 
 
+def plausible(text: str) -> bool:
+    """English / Hinglish / Hindi only: speech recognizers (offline Whisper especially)
+    turn background noise into confident text in random languages ("وحيث أن تكون هناك").
+    At least 70% of the letters must be Latin or Devanagari."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return False
+    ok = sum(
+        1 for c in letters if c.isascii() or "\u0900" <= c <= "\u097f" or "\u00c0" <= c <= "\u024f"
+    )
+    return ok / len(letters) >= 0.7
+
+
 class FrameSource(Protocol):
     """Anything that yields 1,024-byte frames (the mic, or a file in tests)."""
 
@@ -466,6 +479,13 @@ class VoiceListener(threading.Thread):
                     with contextlib.suppress(Exception):
                         self.source.stop()
         heard.via = "wake" if after_wake else "ptt"
+        if tl.info.get("superseded"):
+            log.info("voice: wake command replaced by hold-to-talk")
+            return
+        if heard.text and not plausible(heard.text):
+            log.info("voice: ignored %r (not English/Hindi: background noise)", heard.text)
+            tl.info["rejected"] = heard.text
+            heard = Heard("", None, tl, None, heard.audio_s, heard.via, {"noise": True})
         self.on_state("thinking" if heard.text else "idle")
         self.on_heard(heard)
 
@@ -536,6 +556,11 @@ class VoiceListener(threading.Thread):
         released = False
         while not self._stop_ev.is_set():
             now = time.monotonic()
+            if self._ptt.is_set() and not hold and self._hold:
+                # Space held while a wake-word command was listening: drop that one and
+                # start a fresh hold-to-talk (the main loop picks up the press).
+                tl.info["superseded"] = True
+                break
             if self._ptt.is_set() and not hold:  # pressed again: that's the end
                 self._ptt.clear()
                 if stream is not None:
@@ -666,6 +691,8 @@ class VoiceListener(threading.Thread):
             box["cancel"] = True
         if stream is not None:
             stream.close()
+        if tl.info.get("superseded"):
+            return Heard("", None, tl)
         if "speech_end" not in tl.stages():
             tl.mark("speech_end")
         mic = self._mic_name()

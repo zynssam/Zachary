@@ -79,6 +79,7 @@ class VoiceController(QObject):
         # Voice dictation: listen again after each piece (after any spoken reply ended,
         # so the speaker isn't recorded) until "stop dictation".
         self.dictating = False
+        self._wake_opened = False  # the bar was opened by "Hey Zach" (not by you)
         self.spoken.connect(self._rearm)
         # The notes app: while its mic is on, speech is typed into the note (not run as
         # a command); listening again after each piece until it's turned off.
@@ -225,6 +226,8 @@ class VoiceController(QObject):
             return
         if state == "listening":
             if not self.bar.isVisible():
+                # opened by voice (e.g. "Hey Zach"), not by you: a false wake closes it again
+                self._wake_opened = True
                 self.bar.show_bar()
             held = self.listener is not None and self.listener._hold
             self.bar.status.setText("Listening… (release Space to send)" if held
@@ -240,6 +243,15 @@ class VoiceController(QObject):
     def _on_heard(self, h: Heard) -> None:
         if self._note_session or self._note_on:  # dictating into a note: never a command
             self._note_heard(h)
+            return
+        wake_opened, self._wake_opened = self._wake_opened, False
+        if not h.text and h.via == "wake" and wake_opened:
+            # Probably not "Hey Zach" at all (a similar word, the TV...): nothing was
+            # said after it, so close the bar again instead of showing an error.
+            log.info("voice: nothing after the wake word; closing the bar")
+            self.bar.hide()
+            h.timeline.info["error"] = "false_wake"
+            h.timeline.finish(str(self.latency_path) if self.latency_path else None)
             return
         if not h.text:
             msg = str(h.error) if h.error else "I didn't catch that."

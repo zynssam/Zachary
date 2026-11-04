@@ -1557,3 +1557,70 @@ def test_a_hand_chosen_mic_is_never_swapped_for_another(monkeypatch: pytest.Monk
     monkeypatch.setattr(audio, "auto_input", other_mic)
     src = MicSource(device="zdemo_mic")
     assert src.try_next() is None and src.mic.device == "zdemo_mic" and not asked
+
+
+def test_noise_in_other_scripts_is_not_a_command() -> None:
+    """Offline Whisper turns background noise into text in random languages."""
+    from zachary.voice.pipeline import plausible
+
+    assert plausible("open the fee receipt") and plausible("मेरी फ़ाइल खोलो")
+    assert plausible("kal wali file kholo") and plausible("Café notes")
+    assert not plausible("وحيث أن تكون هناك.") and not plausible("ご視聴ありがとうございました")
+    assert not plausible("...") and not plausible("")
+
+
+def test_holding_space_during_a_wake_command_starts_hold_to_talk(gnani: MockGnani) -> None:
+    """A (false) "Hey Zach" is listening; you hold Space: that command is dropped and a
+    hold-to-talk starts, which ends when you let go (not "Listening..." forever)."""
+    src = CountingSource()
+    got: list[Heard] = []
+    fast = FakeFast(after=10)
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=fast)
+    try:
+        src.load(silence(0.3) + speech(0.4))  # the wake fires, its command is listening
+        wait_until(lambda: fast.fired == 1, timeout=5)
+        lis.push_to_talk(hold=True)  # Space down
+        src.load(speech(1.0) + silence(0.6))
+        time.sleep(0.8)
+        lis.release()  # Space up
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert len(got) == 1 and got[0].via == "ptt" and got[0].text == gnani.transcript
+
+
+def test_a_false_wake_closes_the_bar_it_opened(qtbot: object) -> None:
+    """ "Hey Zach" fired (the TV, a similar word) and nothing usable followed: the bar it
+    opened closes again quietly. A bar you opened yourself stays open."""
+    from PySide6.QtCore import QObject, Signal
+
+    from zachary.telemetry.latency import Timeline
+    from zachary.ui.quickbar import QuickBar
+    from zachary.ui.voice import VoiceController
+    from zachary.voice.factory import VoiceKit
+
+    class Engine(QObject):
+        replied = Signal(int, object)
+        failed = Signal(int, str)
+
+        def ask(self, *_a: object) -> int:
+            return 0
+
+    engine = Engine()
+    bar = QuickBar(engine)  # type: ignore[arg-type]
+    kit = VoiceKit(rest_stt=None, stream_stt=None, offline_stt=None, spotter=None,  # type: ignore[arg-type]
+                   tts=None, ledger=UsageLedger(None), has_key=True)  # fmt: skip
+    voice = VoiceController(engine, bar, kit, wake_word=True)  # type: ignore[arg-type]
+    try:
+        voice._on_state("listening")  # the wake word opened the bar
+        assert bar.isVisible()
+        voice._on_heard(Heard("", None, Timeline("voice"), via="wake"))
+        assert not bar.isVisible()
+        bar.show_bar()  # you opened it
+        voice._on_state("listening")
+        voice._on_heard(Heard("", None, Timeline("voice"), via="wake"))
+        assert bar.isVisible()
+    finally:
+        bar.hide()
+        voice.stop()
