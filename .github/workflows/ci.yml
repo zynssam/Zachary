@@ -37,6 +37,15 @@ jobs:
           # CI never calls the real API and has no GNANI_API_KEY.
           ZACHARY_TEST_WHISPER: ${{ matrix.python == '3.12' && '1' || '' }}
         run: xvfb-run -a pytest
+      - name: diagnose (temporary)
+        if: runner.os == 'Linux' && always()
+        continue-on-error: true
+        env:
+          QT_DEBUG_PLUGINS: "0"
+          QT_FATAL_WARNINGS: "0"
+        run: |
+          xvfb-run -a python -X faulthandler -m pytest -v -s -p no:cacheprovider tests/test_voice.py -k "dictation_rearms or push_to_talk_twice" 2>&1 | tail -80
+          xvfb-run -a python -X faulthandler -m pytest -v -p no:cacheprovider tests/test_voice.py 2>&1 | tail -40
       - name: pytest (Windows)
         if: runner.os == 'Windows'
         run: pytest
