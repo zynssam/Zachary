@@ -30,7 +30,9 @@ Ctrl+V (as plain text), the **Paste** button, or say "paste" while dictating.
 - What you say is typed at the cursor. Sentences are capitalised and ended with a full
   stop. "new paragraph" adds a blank line, "scratch that" removes the last piece, and
   "paste" inserts what you copied.
-- Speech here is never run as a command, and the bar doesn't pop up.
+- Speech here is never run as a command, and the bar doesn't pop up. "Hey Zach"
+  listening is paused while the note's mic is on (continuous dictation would sooner or
+  later sound like it), and resumes when you stop.
 - Audio goes to Gnani only while the mic is on. A listen with no speech ends after
   10 s; after 3 silent listens in a row the mic turns off by itself.
 

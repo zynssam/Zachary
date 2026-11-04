@@ -145,6 +145,8 @@ class VoiceController(QObject):
     def _note_mic(self, on: bool) -> None:
         self._note_on = on
         self._note_empty = 0
+        if self.listener is not None:
+            self.listener.pause_wake(on)
         if on:
             self.dictating = False  # (a document dictation in the bar, if any, ends)
             self._note_listen()
@@ -213,7 +215,7 @@ class VoiceController(QObject):
     def _on_state(self, state: str) -> None:
         if state in ("listening", "thinking"):
             log.info("voice: %s", state)
-        if self._note_session and self.note is not None:  # dictating into a note
+        if (self._note_session or self._note_on) and self.note is not None:  # into a note
             if state == "listening":
                 self.note.set_status("Listening… say “stop dictation” to finish")
             elif state == "thinking":
@@ -236,7 +238,7 @@ class VoiceController(QObject):
             self.bar.status.setText(state)
 
     def _on_heard(self, h: Heard) -> None:
-        if self._note_session:
+        if self._note_session or self._note_on:  # dictating into a note: never a command
             self._note_heard(h)
             return
         if not h.text:

@@ -1475,3 +1475,69 @@ def test_ptt_in_wake_mode_borrows_the_earbuds_when_the_open_mic_is_silent(
         lis.stop()
         lis.join(3)
     assert got[0].text == gnani.transcript and Borrowing.borrowed_for == 1
+
+
+@pytest.mark.parametrize("wake", [False, True])
+def test_note_dictation_never_pops_up_the_bar(
+    qtbot: object, gnani: MockGnani, db_path: Path, fake_platform: FakePlatform, tmp_path: Path,
+    wake: bool,
+) -> None:  # fmt: skip
+    """Clicking Dictate in the notes window: speech is typed into the note; the quick bar
+    stays hidden (it used to pop up with the last command)."""
+    from zachary.ui.engine import Engine
+    from zachary.ui.notes import NotesStore
+    from zachary.ui.quickbar import QuickBar
+    from zachary.ui.voice import VoiceController
+    from zachary.voice.audio import Player
+    from zachary.voice.factory import VoiceKit
+
+    engine = Engine(db_path, fake_platform, semantic_factory=lambda _c, _cfg: None)
+    engine.start()
+    bar = QuickBar(engine)
+    kit = VoiceKit(
+        rest_stt=GnaniRestSTT(KEY, url=gnani.stt_url),
+        stream_stt=lambda: GnaniStreamingSTT(KEY, url=gnani.stt_ws),
+        offline_stt=FakeOffline(), spotter=FakeSpotter(),  # type: ignore[arg-type]
+        tts=None, ledger=UsageLedger(None), has_key=True,
+        fast_spotter=FakeFast(after=10**6) if wake else None,  # type: ignore[arg-type]
+    )  # fmt: skip
+    voice = VoiceController(
+        engine, bar, kit, wake_word=wake, player=Player(open_stream=FakeOut().open)
+    )
+    src = CountingSource()
+    voice.start(src)
+    shown: list[bool] = []
+    bar.visibility.connect(shown.append)
+    try:
+        bar.edit.setText("Take a note.")  # (the last command, still in the box)
+        win = bar.notes_window()
+        win.store = NotesStore(tmp_path / "Notes")
+        win.present("new")
+        gnani.transcript = "my name is samrat"
+        win.mic_btn.click()
+        src.load(speech(0.8) + silence(1.8))
+        qtbot.waitUntil(lambda: "My name is samrat." in win.editor.toPlainText(), timeout=15000)  # type: ignore[attr-defined]
+        assert True not in shown and not bar.isVisible()
+        win.mic_btn.click()
+    finally:
+        voice.stop()
+        engine.stop()
+
+
+def test_wake_word_paused_while_dictating_into_a_note(gnani: MockGnani) -> None:
+    """Between dictation pieces your continuing speech must not trigger "Hey Zach"."""
+    src = CountingSource()
+    got: list[Heard] = []
+    fast = FakeFast(after=5)
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=fast)
+    try:
+        lis.pause_wake(True)
+        src.load(silence(0.2) + speech(1.5) + silence(0.5))
+        time.sleep(2.2)
+        assert fast.fired == 0 and not got and not gnani.calls
+        lis.pause_wake(False)
+        src.load(speech(1.0) + silence(1.0))
+        wait_until(lambda: fast.fired == 1, timeout=5)  # listening for it again
+    finally:
+        lis.stop()
+        lis.join(3)

@@ -251,6 +251,7 @@ class VoiceListener(threading.Thread):
         self._pause_ms: int | None = None
         self._released = threading.Event()
         self._warm = threading.Event()  # bar is open: keep the mic running locally
+        self._wake_paused = threading.Event()  # dictating into a note
         self._warmed = False
         self._zero_frames = 0  # digital silence in a row: wrong input device or muted
         self._warned_silent = False
@@ -267,6 +268,16 @@ class VoiceListener(threading.Thread):
         self._hold = hold or pause_ms is not None
         self._released.clear()
         self._ptt.set()
+
+    def pause_wake(self, on: bool) -> None:
+        """While dictating into a note, don't listen for "Hey Zach" between pieces:
+        continuous speech would sooner or later sound like it."""
+        if on:
+            self._wake_paused.set()
+        else:
+            self._wake_paused.clear()
+            if self.fast_spotter is not None:
+                self.fast_spotter.reset()
 
     def set_warm(self, on: bool) -> None:
         """While the quick bar is open, keep the mic open and remember the last
@@ -367,6 +378,10 @@ class VoiceListener(threading.Thread):
             frame = self._frame()
             if frame is None:
                 continue
+            if self._wake_paused.is_set():
+                recent.clear()
+                preroll.clear()
+                continue  # dictating into a note: what you say isn't a wake word
             if self.wake_word and self.fast_spotter is not None:
                 self._fast_wake(frame, recent)
                 continue
