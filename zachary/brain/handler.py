@@ -126,6 +126,7 @@ class Reply:
     plan_id: int = 0  # a clean/organize plan to review (the UI opens the review window)
     plan: planner.Plan | None = None  # ...and the plan itself (no DB reads on the UI thread)
     dictating: bool = False  # dictation mode is on (the UI keeps listening)
+    words: int = 0  # ...and how many words the document has so far
 
 
 def clear_winner(results: list[SearchResult] | list[Item]) -> bool:
@@ -229,6 +230,9 @@ class Dictation:
         if para:
             out.append(" ".join(para))
         return "\n\n".join(out)
+
+    def words(self) -> int:
+        return sum(len(p.split()) for p in self.parts if p != "\n")
 
     def tail(self, n: int = 600) -> str:
         t = self.text()
@@ -1284,7 +1288,8 @@ class Handler:
         intent = Intent("dictate", query=text)
         if not execute:
             return Reply("Dictating… Enter adds this. Say “stop dictation” to finish.",
-                         "dictation", [], intent, detail=d.tail(), dictating=True)  # fmt: skip
+                         "dictation", [], intent, detail=d.tail(), dictating=True,
+                         words=d.words())  # fmt: skip
         if CANCEL_DICTATION.search(text):
             self.dictation = None
             self._save_draft()
@@ -1295,11 +1300,15 @@ class Handler:
             if d.parts:
                 d.parts.pop()
             self._save_draft()
-            return Reply("", "dictation", [], intent, detail=d.tail(), dictating=True)
+            return Reply(
+                "", "dictation", [], intent, detail=d.tail(), dictating=True, words=d.words()
+            )
         d.add(body)
         self._save_draft()
         if not stop:
-            return Reply("", "dictation", [], intent, detail=d.tail(), dictating=True)
+            return Reply(
+                "", "dictation", [], intent, detail=d.tail(), dictating=True, words=d.words()
+            )
         self.dictation = None
         content = d.text()
         if not content.strip():

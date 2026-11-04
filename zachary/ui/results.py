@@ -1,6 +1,7 @@
 """Clickable result list used for files, projects and recent items.
 
-Each row: a kind badge, the name, how long ago, the folder, and why it matched.
+Each row: a file-type icon, the name, how long ago, the folder, and why it matched
+(as small pills). Colours and icons come from ``ui/style.py``.
 Double-click / Enter opens; the context menu also offers "Show in folder" and
 "Copy path". Painting is cheap (no I/O); data comes from the engine.
 """
@@ -17,11 +18,20 @@ from PySide6.QtCore import (
     QModelIndex,
     QPersistentModelIndex,
     QRect,
+    QRectF,
     QSize,
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPaintEvent
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QPainter,
+    QPaintEvent,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QListView,
@@ -95,7 +105,11 @@ class ResultsModel(QAbstractListModel):
 
 
 class ResultsDelegate(QStyledItemDelegate):
-    ROW_H = 54
+    ROW_H = style.ROW_HEIGHT
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.theme = style.theme()
 
     def sizeHint(self, option: QStyleOptionViewItem, index: _Index) -> QSize:
         return QSize(option.rect.width(), self.ROW_H)
@@ -104,56 +118,91 @@ class ResultsDelegate(QStyledItemDelegate):
         it: Item | None = index.data(ItemRole)
         if it is None:
             return
+        t = self.theme
         p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r: QRect = option.rect
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        card = QRectF(r).adjusted(4, 2, -4, -2)
         if selected:
-            p.fillRect(r, QColor(*style.ACCENT_RGBA, style.SELECTION_ALPHA))
-        # badge
-        letter, color = BADGES.get(it.kind, BADGES["other"])
-        badge = QRect(r.left() + 12, r.top() + 13, 28, 28)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            sel = QColor(*style.ACCENT_RGBA, 52 if t.dark else 36)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(sel)
+            p.drawRoundedRect(card, 10, 10)
+            p.setBrush(QColor(style.ACCENT))
+            p.drawRoundedRect(QRectF(card.left(), card.top() + 10, 3, card.height() - 20), 1.5, 1.5)
+        elif hovered:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(t.surface))
+            p.drawRoundedRect(card, 10, 10)
+        # icon tile
+        name_icon, color = style.icon_for(it.kind, it.path)
+        tile = QRectF(r.left() + 14, r.top() + 11, 32, 32)
+        tint = QColor(color)
+        tint.setAlpha(46 if t.dark else 34)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(color))
-        p.drawRoundedRect(badge, 7, 7)
-        p.setPen(QColor(style.BADGE_TEXT))
-        bf = QFont(option.font)
-        bf.setBold(True)
-        p.setFont(bf)
-        p.drawText(badge, Qt.AlignmentFlag.AlignCenter, letter)
+        p.setBrush(tint)
+        p.drawRoundedRect(tile, 9, 9)
+        dpr = p.device().devicePixelRatioF() if p.device() is not None else 1.0
+        pix: QPixmap = style.icon_pixmap(name_icon, color, 18, dpr)
+        p.drawPixmap(int(tile.left() + 7), int(tile.top() + 7), pix)
         # text
-        left = badge.right() + 12
-        right = r.right() - 12
+        left = int(tile.right()) + 12
+        right = r.right() - 14
         when = ago(it.ts)
-        nf = QFont(option.font)
-        nf.setPointSizeF(nf.pointSizeF() * 1.05)
-        nf.setBold(True)
+        base = QFont(option.font)
+        if self.family:
+            base.setFamily(self.family)
+        nf = QFont(base)
+        nf.setPointSizeF(base.pointSizeF() * 1.05)
+        nf.setWeight(QFont.Weight.DemiBold)
         fm = QFontMetrics(nf)
-        tf = QFont(option.font)
-        tf.setPointSizeF(tf.pointSizeF() * 0.85)
+        tf = QFont(base)
+        tf.setPointSizeF(base.pointSizeF() * 0.86)
         tfm = QFontMetrics(tf)
         when_w = tfm.horizontalAdvance(when) + 4 if when else 0
-        text_color = option.palette.text().color()
-        dim = QColor(text_color)
-        dim.setAlpha(150)
         p.setFont(nf)
-        p.setPen(text_color)
+        p.setPen(QColor(t.text))
         name = fm.elidedText(it.name, Qt.TextElideMode.ElideMiddle, right - left - when_w - 8)
-        p.drawText(QRect(left, r.top() + 7, right - left, fm.height()), 0, name)
+        p.drawText(QRect(left, r.top() + 8, right - left, fm.height()), 0, name)
         p.setFont(tf)
-        p.setPen(dim)
+        p.setPen(QColor(t.dim))
         if when:
-            p.drawText(QRect(right - when_w, r.top() + 9, when_w, tfm.height()),
+            p.drawText(QRect(right - when_w, r.top() + 10, when_w, tfm.height()),
                        int(Qt.AlignmentFlag.AlignRight), when)  # fmt: skip
-        if it.kind in ("topic", "session"):
-            sub = ""  # not a place on disk: the "why" line says what it is
+        if it.kind in ("topic", "session", "app"):
+            sub = ""  # not a place on disk: the pills say what it is
         else:
             sub = short_path(it.path) if it.kind == "project" else short_folder(it.path)
-        extra = " · ".join([*it.why[:2], it.detail] if it.detail else it.why[:2])
-        line2 = f"{sub}   {extra}" if extra and sub else (extra or sub)
-        line2 = tfm.elidedText(line2, Qt.TextElideMode.ElideMiddle, right - left)
-        p.drawText(QRect(left, r.top() + 9 + fm.height(), right - left, tfm.height()), 0, line2)
+        y2 = r.top() + 11 + fm.height()
+        x = left
+        if sub:
+            sub_w = min(
+                tfm.horizontalAdvance(sub) + 6, int((right - left) * 0.55)
+            )  # (+6: rounding)
+            p.drawText(QRect(x, y2, sub_w, tfm.height()), 0,
+                       tfm.elidedText(sub, Qt.TextElideMode.ElideMiddle, sub_w))  # fmt: skip
+            x += sub_w + 10
+        # "why it matched" as small pills
+        pills = [w for w in ([*it.why[:2], it.detail] if it.detail else it.why[:2]) if w]
+        for w in pills:
+            if x > right - 40:
+                break
+            text = tfm.elidedText(w, Qt.TextElideMode.ElideRight, min(260, right - x - 14))
+            pw = tfm.horizontalAdvance(text) + 14
+            pill = QRectF(x, y2 - 1, pw, tfm.height() + 2)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(t.chip))
+            p.drawRoundedRect(pill, pill.height() / 2, pill.height() / 2)
+            p.setPen(QColor(t.dim))
+            p.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), text)
+            x += int(pw) + 6
         p.restore()
+
+    @property
+    def family(self) -> str:
+        return style.load_fonts()
 
 
 class ResultsView(QListView):
@@ -172,11 +221,19 @@ class ResultsView(QListView):
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # typing stays in the search box
         self.setFrameShape(QListView.Shape.NoFrame)
+        self.setMouseTracking(True)  # hover highlight
         # One click opens (a double-click would otherwise open twice).
         self.clicked.connect(lambda i: self.chosen.emit(i.row(), "open"))
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
         self.menu_open = False
+
+    def set_theme(self, t: style.Theme) -> None:
+        delegate = self.itemDelegate()
+        if isinstance(delegate, ResultsDelegate):
+            delegate.theme = t
+        self.setStyleSheet("QListView { background: transparent; border: none; }")
+        self.viewport().update()
 
     def set_items(self, items: list[Item], selected: int | None = None) -> None:
         self.results.set_items(items)

@@ -240,6 +240,7 @@ class VoiceListener(threading.Thread):
         self.fast_spotter = fast_spotter
         self.wake_word = wake_word and (spotter is not None or fast_spotter is not None)
         self._pushback: collections.deque[bytes] = collections.deque()
+        self.level = 0.0  # mic RMS while a command is being heard (0..1), for the orb
         # Push-to-talk only: the mic is open only during a command (privacy; and
         # Bluetooth earbuds stay in high-quality music mode the rest of the time).
         self.mic_always_open = self.wake_word if mic_always_open is None else mic_always_open
@@ -395,6 +396,7 @@ class VoiceListener(threading.Thread):
             return
         self.fast_spotter.reset()
         log.info("voice: wake word")
+        self.on_state("wake")
         self._pushback.extend(recent)
         recent.clear()
         try:
@@ -447,6 +449,7 @@ class VoiceListener(threading.Thread):
                 if opened_here:
                     with contextlib.suppress(Exception):
                         self.source.stop()
+        self.level = 0.0
         heard.via = "wake" if after_wake else "ptt"
         self.on_state("thinking" if heard.text else "idle")
         self.on_heard(heard)
@@ -547,6 +550,7 @@ class VoiceListener(threading.Thread):
                 audio += f
                 ev = vad.push(f)
                 peak = max(peak, vad.last_rms)
+                self.level = vad.last_rms  # your voice right now (the orb)
                 if ev is not None and ev.kind == "start":
                     local_started = True
                 elif ev is not None and ev.kind == "end" and local_started:
@@ -785,6 +789,7 @@ class VoiceListener(threading.Thread):
                 continue
             ev = vad.push(f)
             peak = max(peak, vad.last_rms)
+            self.level = vad.last_rms
             if ev is not None and ev.kind == "start":
                 started = True
             if not started and not vad.in_speech:

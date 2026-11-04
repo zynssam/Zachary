@@ -12,23 +12,27 @@ Esc = hide.
 
 from __future__ import annotations
 
+import html
 import os
 import time
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QFont,
     QGuiApplication,
     QKeyEvent,
     QKeySequence,
+    QLinearGradient,
     QPainter,
     QPaintEvent,
+    QPen,
     QScreen,
     QShortcut,
 )
-from PySide6.QtWidgets import QLabel, QLineEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
 
 from zachary.brain.handler import Reply
 from zachary.telemetry.latency import LATENCY
@@ -36,6 +40,7 @@ from zachary.ui import style
 from zachary.ui.engine import Engine
 from zachary.ui.plan_review import PlanReview
 from zachary.ui.results import ResultsView
+from zachary.ui.voice_visual import VoiceOrb
 
 TYPE_DEBOUNCE_MS = 25
 HIDE_AFTER_ACTION_MS = 700
@@ -64,29 +69,39 @@ class QuickBar(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedWidth(WIDTH)
 
+        self.theme = style.theme()
+        family = style.load_fonts()
         self.edit = QLineEdit(self)
         self.edit.setPlaceholderText(
-            "Ask Zach: “fees yesterday”, “my projects”, “open the second one”"
+            "Ask Zach anything…  “fees yesterday”, “open zachary in vscode”"
         )
         f = QFont(self.edit.font())
+        if family:
+            f.setFamily(family)
         f.setPointSizeF(f.pointSizeF() * 1.45)
         self.edit.setFont(f)
         self.edit.setFrame(False)
         self.edit.setMinimumHeight(44)
+        # The voice orb: what voice is doing, moving with the real audio.
+        self.orb = VoiceOrb(self)
         self.status = QLabel(self)
         self.status.setWordWrap(True)  # answers/explanations can be two or three sentences
-        self.status.setStyleSheet("color: palette(placeholder-text); padding: 2px 4px;")
         # An answer's source passage ("ask your files"); hidden otherwise.
         self.answer = QLabel(self)
         self.answer.setWordWrap(True)
         self.answer.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.answer.setStyleSheet(style.ANSWER_CSS)
         self.answer.setVisible(False)
         self.list = ResultsView(self)
+        self._apply_theme()
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(10)
+        top.addWidget(self.orb, 0, Qt.AlignmentFlag.AlignVCenter)
+        top.addWidget(self.edit, 1)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setContentsMargins(16, 12, 18, 14)
         lay.setSpacing(6)
-        lay.addWidget(self.edit)
+        lay.addLayout(top)
         lay.addWidget(self.status)
         lay.addWidget(self.answer)
         lay.addWidget(self.list)
@@ -247,14 +262,11 @@ class QuickBar(QWidget):
     def _thinking(self, rid: int) -> None:
         if self._last_applied < rid:
             self.status.setText("Thinking…")
+            if self.orb.state == "idle":
+                self.orb.set_state("thinking")
 
     def _choose(self, row: int, action: str) -> None:
         self.engine.ask("act", (row, action))
-
-    def changeEvent(self, ev: QEvent) -> None:
-        if ev.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
-            self._maybe_hide()
-        super().changeEvent(ev)
 
     def showEvent(self, ev: Any) -> None:
         super().showEvent(ev)
@@ -294,11 +306,23 @@ class QuickBar(QWidget):
             self.edit.blockSignals(True)  # a dictated line was added: clear the box
             self.edit.clear()
             self.edit.blockSignals(False)
-            self.status.setText("Dictating… say “stop dictation” when you're done.")
+        if reply.dictating:  # REC + word count above the growing "notepad"
+            n, hint = reply.words, reply.say or "say “stop dictation” when done"
+            self.status.setText(
+                f"<span style='color:{style.REC}'>●</span> <b>REC</b> · {n} word"
+                f"{'s' if n != 1 else ''} · {html.escape(hint)}"
+            )
         else:
             self.status.setText(reply.say)
+        self.answer.setStyleSheet(
+            style.notepad_css(self.theme) if reply.dictating else style.answer_css(self.theme)
+        )
         self.answer.setText(reply.detail)
         self.answer.setVisible(bool(reply.detail))
+        if reply.dictating:
+            self.orb.set_state("dictating")
+        elif self.orb.state in {"thinking", "dictating"}:
+            self.orb.set_state("idle")  # (voice replies switch it to "speaking" themselves)
         self.list.set_items(reply.items, reply.selected)
         self._resize_rows(len(reply.items))
         self._explicit_selection = False
@@ -314,14 +338,49 @@ class QuickBar(QWidget):
             self.opened.emit(ms)
 
     # -- look ----------------------------------------------------------------------------
+    def _apply_theme(self) -> None:
+        t = self.theme
+        family = style.load_fonts()
+        self.edit.setStyleSheet(style.edit_css(t))
+        self.status.setStyleSheet(style.status_css(t))
+        self.answer.setStyleSheet(style.answer_css(t))
+        for w in (self.status, self.answer):
+            if family:
+                f = QFont(w.font())
+                f.setFamily(family)
+                w.setFont(f)
+        self.list.set_theme(t)
+
+    def changeEvent(self, ev: QEvent) -> None:
+        if ev.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
+            self._maybe_hide()
+        if ev.type() in (QEvent.Type.PaletteChange, QEvent.Type.ThemeChange):
+            new = style.theme()
+            if new != self.theme:
+                self.theme = new  # the desktop switched light/dark
+                self._apply_theme()
+                self.update()
+        super().changeEvent(ev)
+
+    def set_voice_state(self, state: str) -> None:
+        """listening / thinking / speaking / dictating / wake / error / idle."""
+        self.orb.set_state(state)
+
     def paintEvent(self, e: QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        bg = self.palette().window().color()
-        bg.setAlpha(245)
-        p.setBrush(bg)
-        p.setPen(QColor(*style.BORDER_RGBA))
-        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 14, 14)
+        t = self.theme
+        r = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+        # A soft accent edge glow, then the glass card.
+        edge = QLinearGradient(r.topLeft(), r.topRight())
+        a1, a2 = QColor(style.ACCENT), QColor(style.ACCENT_2)
+        a1.setAlpha(110 if t.dark else 80)
+        a2.setAlpha(60 if t.dark else 40)
+        edge.setColorAt(0.0, a1)
+        edge.setColorAt(1.0, a2)
+        p.setPen(QPen(QBrush(edge), 1.2))
+        p.setBrush(QColor(*t.card))
+        p.drawRoundedRect(r, style.RADIUS, style.RADIUS)
 
 
 def _performed(reply: Reply) -> bool:

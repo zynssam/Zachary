@@ -470,6 +470,13 @@ class MicStream:
                 return
 
 
+def _rms16(pcm: bytes) -> float:
+    if len(pcm) < 2:
+        return 0.0
+    x = np.frombuffer(pcm[: len(pcm) - len(pcm) % 2], dtype=np.int16).astype(np.float32)
+    return float(np.sqrt(np.mean(x * x)) / 32768.0) if x.size else 0.0
+
+
 class Player:
     """Plays PCM16 mono replies on one long-lived thread.
 
@@ -498,6 +505,7 @@ class Player:
         # Bluetooth earbuds (and some USB devices) put the link to sleep after a few
         # quiet seconds and take 1-3 s to wake up, which delayed every reply.
         self._keep_alive = threading.Event()
+        self.level = 0.0  # RMS of what is playing right now (0..1), for the voice orb
 
     def keep_alive(self, on: bool) -> None:
         if on:
@@ -615,8 +623,11 @@ class Player:
                         break
                     if self.first_audio_at is None:
                         self.first_audio_at = time.perf_counter()
-                    stream.write(pcm[i : i + block])
+                    chunk = pcm[i : i + block]
+                    self.level = _rms16(chunk)  # what Zach's voice sounds like now (the orb)
+                    stream.write(chunk)
                     self.played_bytes += min(block, len(pcm) - i)
+                self.level = 0.0
         finally:
             if stream is not None:
                 with contextlib.suppress(Exception):

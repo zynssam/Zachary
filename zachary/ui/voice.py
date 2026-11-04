@@ -42,6 +42,7 @@ class VoiceController(QObject):
     state = Signal(str)
     spoken = Signal(object)  # finished Timeline record (tests, telemetry)
     _status = Signal(str)
+    orb_state = Signal(str)  # the bar's voice orb (from any thread; delivered on the UI)
 
     def __init__(
         self,
@@ -78,6 +79,18 @@ class VoiceController(QObject):
         # so the speaker isn't recorded) until "stop dictation".
         self.dictating = False
         self.spoken.connect(self._rearm)
+        # The orb moves with the real audio: your mic while listening, Zach's voice while
+        # speaking (levels are plain floats, read on the UI thread at ~60 fps).
+        self.orb_state.connect(self.bar.set_voice_state)
+        self.bar.orb.level_source = self._orb_level
+
+    def _orb_level(self) -> float:
+        from zachary.ui.voice_visual import level_from_rms
+
+        if self.bar.orb.state == "speaking":
+            return level_from_rms(self.player.level)
+        lis = self.listener
+        return level_from_rms(lis.level) if lis is not None else 0.0
 
     def start(self, source: FrameSource | None = None) -> None:
         self._source = source or self._source or MicSource(device=self.kit.mic_device)
@@ -148,6 +161,18 @@ class VoiceController(QObject):
     def _on_state(self, state: str) -> None:
         if state in ("listening", "thinking"):
             log.info("voice: %s", state)
+        if state == "wake":
+            if not self.bar.isVisible():
+                self.bar.show_bar()
+            self.orb_state.emit("wake")  # pops, then listening
+            return
+        if state in ("listening", "thinking"):
+            self.orb_state.emit("dictating" if self.dictating and state == "listening"
+                                else state)  # fmt: skip
+        elif state == "idle" and self.bar.orb.state != "speaking":
+            self.orb_state.emit("dictating" if self.dictating else "idle")
+        elif state.startswith("error"):
+            self.orb_state.emit("error")
         if state == "listening":
             if not self.bar.isVisible():
                 self.bar.show_bar()
@@ -226,6 +251,7 @@ class VoiceController(QObject):
                     if first:
                         tl.mark("tts_first_audio")
                         first = False
+                        self.orb_state.emit("speaking")
                     self.player.play(chunk.pcm, chunk.sample_rate)
             self.player.end()
             tl.mark("tts_done")
@@ -248,6 +274,7 @@ class VoiceController(QObject):
             self.push_to_talk(pause_ms=DICTATION_PAUSE_MS)
 
     def _done(self, tl: Timeline) -> None:
+        self.orb_state.emit("dictating" if self.dictating else "idle")
         rec = tl.finish(str(self.latency_path) if self.latency_path else None)
         rec["total_from_speech_end_ms"] = tl.total_ms(since="speech_end")
         self.spoken.emit(rec)

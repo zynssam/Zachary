@@ -46,7 +46,7 @@ dev = [
 include = ["zachary*"]
 
 [tool.setuptools.package-data]
-zachary = ["py.typed"]
+zachary = ["py.typed", "ui/assets/*.svg", "ui/assets/*.md", "ui/assets/icons/*", "ui/assets/fonts/*"]
 
 [tool.ruff]
 line-length = 100

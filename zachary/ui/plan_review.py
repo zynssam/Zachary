@@ -11,7 +11,9 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -50,6 +52,17 @@ class PlanReview(QWidget):
         self.title.setFont(f)
         self.note = QLabel(self)
         self.note.setWordWrap(True)
+        # Summary header: one big number + a card per category.
+        self.theme = style.theme()
+        style.load_fonts()
+        self.big = QLabel(self)
+        bf = self.big.font()
+        bf.setPointSizeF(bf.pointSizeF() * 2.2)
+        bf.setBold(True)
+        self.big.setFont(bf)
+        self.big.setStyleSheet(f"color: {style.ACCENT};")
+        self.cards = QHBoxLayout()
+        self.cards.setSpacing(10)
         self.tree = QTreeWidget(self)
         self.tree.setColumnCount(len(COLS))
         self.tree.setHeaderLabels(COLS)
@@ -81,8 +94,16 @@ class PlanReview(QWidget):
         buttons.addWidget(self.approve_btn)
         lay = QVBoxLayout(self)
         lay.addWidget(self.title)
+        lay.addWidget(self.big)
+        lay.addLayout(self.cards)
         lay.addWidget(self.note)
         lay.addWidget(self.tree, 1)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+        self.tree.setStyleSheet(style.tree_css(self.theme))
+        self.tree.setAlternatingRowColors(True)
+        for b in (self.reject_btn, self.undo_btn, self.close_btn):
+            b.setStyleSheet(style.secondary_button_css(self.theme))
         lay.addWidget(self.result)
         lay.addLayout(buttons)
         self._filling = False
@@ -102,6 +123,7 @@ class PlanReview(QWidget):
         self.reject_btn.setEnabled(True)  # (a previous plan may have disabled them)
         self.undo_btn.setEnabled(True)
         self.tree.setColumnHidden(4, plan.kind != "organize")
+        self._fill_summary(plan)
         self._filling = True
         self.tree.clear()
         groups: dict[str, QTreeWidgetItem] = {}
@@ -109,6 +131,11 @@ class PlanReview(QWidget):
             g = groups.get(it.category)
             if g is None:
                 g = QTreeWidgetItem(self.tree, [planner.LABELS[it.category]])
+                icon, color = style.CATEGORY_ICONS.get(it.category, ("file", style.ACCENT))
+                g.setIcon(0, QIcon(style.icon_pixmap(icon, color, 16, self.devicePixelRatioF())))
+                gf = g.font(0)
+                gf.setBold(True)
+                g.setFont(0, gf)
                 g.setFlags(g.flags() | Qt.ItemFlag.ItemIsUserCheckable
                            | Qt.ItemFlag.ItemIsAutoTristate)  # fmt: skip
                 g.setExpanded(it.category != "large" or len(plan.items) < 30)
@@ -120,6 +147,8 @@ class PlanReview(QWidget):
                 it.reason,
                 planner._short(it.dst) if it.dst else "",
             ])  # fmt: skip
+            fi, fc = style.icon_for("dir" if it.is_dir else "", it.src)
+            row.setIcon(0, QIcon(style.icon_pixmap(fi, fc, 16, self.devicePixelRatioF())))
             row.setData(0, ITEM_ROLE, it.id)
             row.setToolTip(0, it.src)
             row.setFlags(row.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -129,6 +158,47 @@ class PlanReview(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def _fill_summary(self, plan: Plan) -> None:
+        while self.cards.count():
+            item = self.cards.takeAt(0)
+            w = item.widget() if item is not None else None
+            if w is not None:
+                w.deleteLater()
+        cats: dict[str, tuple[int, int]] = {}
+        for it in plan.items:
+            n, size = cats.get(it.category, (0, 0))
+            cats[it.category] = (n + 1, size + it.size)
+        total = sum(it.size for it in plan.items if it.op == "trash")
+        n_all = len(plan.items)
+        if plan.kind == "organize":
+            self.big.setText(f"{n_all} file{'s' if n_all != 1 else ''} to sort")
+        else:
+            self.big.setText(f"{planner.human(total)} can be freed" if total
+                             else f"{n_all} item{'s' if n_all != 1 else ''} to tidy")  # fmt: skip
+        for cat, (n, size) in cats.items():
+            self.cards.addWidget(self._card(cat, n, size))
+        self.cards.addStretch(1)
+
+    def _card(self, cat: str, n: int, size: int) -> QFrame:
+        card = QFrame(self)
+        card.setObjectName("card")
+        card.setStyleSheet(style.card_css(self.theme))
+        icon, color = style.CATEGORY_ICONS.get(cat, ("file", style.ACCENT))
+        pic = QLabel(card)
+        pic.setPixmap(style.icon_pixmap(icon, color, 22, self.devicePixelRatioF()))
+        head = QLabel(f"<b>{n}</b>  {planner.LABELS.get(cat, cat)}", card)
+        sub = QLabel(planner.human(size) if size else "", card)
+        sub.setStyleSheet(f"color: {self.theme.dim};")
+        text = QVBoxLayout()
+        text.setSpacing(0)
+        text.addWidget(head)
+        text.addWidget(sub)
+        row = QHBoxLayout(card)
+        row.setContentsMargins(12, 8, 14, 8)
+        row.addWidget(pic)
+        row.addLayout(text)
+        return card
 
     def _rows(self) -> list[QTreeWidgetItem]:
         out: list[QTreeWidgetItem] = []
