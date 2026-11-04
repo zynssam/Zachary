@@ -10,6 +10,9 @@ import sys
 
 
 def main(argv: list[str] | None = None) -> int:
+    import multiprocessing
+
+    multiprocessing.freeze_support()  # (frozen app: worker processes re-run this exe)
     args = list(sys.argv[1:] if argv is None else argv)
     part = args.pop(0) if args and args[0] in {"assistant", "indexer", "cli"} else "assistant"
     if part == "indexer":

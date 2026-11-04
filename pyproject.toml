@@ -41,6 +41,9 @@ dev = [
     "mypy>=1.11",
     "pytest-qt>=4.4",
 ]
+build = [
+    "pyinstaller>=6.10",  # Phase 8: the Windows / Linux app (packaging/zachary.spec)
+]
 
 [tool.setuptools.packages.find]
 include = ["zachary*"]
