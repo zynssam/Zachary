@@ -34,6 +34,7 @@ from zachary.brain.handler import Reply
 from zachary.telemetry.latency import LATENCY
 from zachary.ui import style
 from zachary.ui.engine import Engine
+from zachary.ui.notes import NotesWindow
 from zachary.ui.plan_review import PlanReview
 from zachary.ui.results import ResultsView
 
@@ -51,6 +52,7 @@ class QuickBar(QWidget):
     hold_talk = Signal(bool)  # Space held in an empty box: True = pressed, False = released
     visibility = Signal(bool)  # shown / hidden (voice keeps the mic warm while shown)
     reply_applied = Signal(object)
+    notes_opened = Signal(object)  # the notes window, the first time it's created
 
     def __init__(self, engine: Engine) -> None:
         super().__init__(
@@ -107,7 +109,10 @@ class QuickBar(QWidget):
         engine.failed.connect(lambda _rid, msg: self.status.setText(f"Error: {msg}"))
 
         self._last_applied = 0
-        self.review: PlanReview | None = None  # clean/organize plans (Phase 7)
+        self.review: PlanReview | None = None
+        self.notes: NotesWindow | None = (
+            None  # Zachary's notes app  # clean/organize plans (Phase 7)
+        )
         self._explicit_selection = False  # user moved with arrows since the last reply
         self._holding_space = False
         # In a box with text, Space is a space when tapped and talk when held longer
@@ -279,6 +284,12 @@ class QuickBar(QWidget):
             self.review.undo_requested.connect(lambda pid: self.engine.ask("undo_plan", pid))
         return self.review
 
+    def notes_window(self) -> NotesWindow:
+        if self.notes is None:
+            self.notes = NotesWindow()
+            self.notes_opened.emit(self.notes)
+        return self.notes
+
     def _on_reply(self, rid: int, reply: Reply) -> None:
         if reply.intent.kind in {"approve", "reject", "undo_plan"}:
             if reply.intent.kind != "reject":
@@ -288,6 +299,12 @@ class QuickBar(QWidget):
         if rid < self._last_applied:
             return  # an older reply arrived late
         self._last_applied = rid
+        if reply.notes:  # "open my notes" / "new note" / "take a note"
+            self.status.setText(reply.say)
+            self.notes_window().present(reply.notes)
+            self.hide()
+            self.reply_applied.emit(reply)
+            return
         if reply.plan is not None and reply.plan.status == "proposed" and reply.plan.items:
             self._review().show_plan(reply.plan)
         if reply.dictating and reply.intent.kind == "dictate" and not reply.say:

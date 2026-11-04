@@ -43,6 +43,7 @@ PREROLL_S = 0.4  # audio kept from before speech starts, so the first word isn't
 COMMAND_WAIT_S = 5.0  # after a bare "Hey Zach", how long to wait for the command
 MAX_COMMAND_S = 12.0
 MIN_COMMAND_S = 0.35
+DICTATION_IDLE_S = 10.0  # dictation: a listen with no speech at all ends (the next re-arms)
 NO_SPEECH_S = 6.0  # push-to-talk: give up if nothing is said within this time
 SEGMENT_GRACE_S = 0.12  # after a transcript, wait this long for more speech
 PREROLL_WARM_S = 0.6  # audio kept from just before the press (covers the long-press wait)
@@ -634,7 +635,9 @@ class VoiceListener(threading.Thread):
             ):
                 break  # no streaming configured
             if not (server_started or local_started) and (
-                released or (not hold and now - t0 > NO_SPEECH_S)
+                released
+                or (not hold and now - t0 > NO_SPEECH_S)
+                or (pause_ms is not None and now - t0 > DICTATION_IDLE_S)
             ):
                 break  # nothing was said
             if now - t0 > (MAX_HOLD_S if hold else MAX_COMMAND_S):

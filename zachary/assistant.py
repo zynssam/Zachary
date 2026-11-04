@@ -245,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         bar.hold_talk.connect(voice.hold_talk)
         bar.visibility.connect(voice.bar_visible)
         vbridge = _HotkeyBridge()
-        vbridge.pressed.connect(lambda _tok, _t0: voice.push_to_talk())
+        vbridge.pressed.connect(lambda _tok, _t0: voice.hotkey())
         if not args.no_hotkey:
             try:
                 voice_backend = platform.global_hotkey(

@@ -287,7 +287,7 @@ _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show",
 class Intent:
     kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|topic|
     #            resume|timeline|confirm|cancel|ask|explain|clean|organize|undo|create|
-    #            dictate|stats|none
+    #            dictate|stats|notes|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
@@ -377,6 +377,31 @@ def _ordinal(tokens: list[str]) -> tuple[int | None, set[int]]:
 _QUESTION_TYPOS = {"whn": "when", "wen": "when", "wat": "what", "wht": "what", "hw": "how"}
 
 
+_NOTES_FILLER = frozenset(
+    "please zach zack hey the my a an zachary zacharys app application window now up".split()
+)
+_NOTES_OPEN = {("notes",), ("note",), ("open", "notes"), ("open", "note"), ("show", "notes"),
+               ("launch", "notes"), ("start", "notes")}  # fmt: skip
+_NOTES_NEW = {("new", "note"), ("create", "note"), ("create", "new", "note"), ("make", "note"),
+              ("make", "new", "note"), ("start", "new", "note"), ("open", "new", "note"),
+              ("write", "note"), ("new", "notes")}  # fmt: skip
+_NOTES_DICTATE = {("take", "note"), ("dictate", "note"), ("dictate", "new", "note")}
+
+
+def notes_action(toks: list[str]) -> str:
+    """ "open | new | dictate" for the notes app, "" for anything else. Opening needs a
+    clear sign it's the app ("notes app", "my notes", "Zachary notes"): plain "open
+    notes" may be a file called notes."""
+    core = tuple(t for t in toks if t not in _NOTES_FILLER)
+    if core in _NOTES_DICTATE:
+        return "dictate"
+    if core in _NOTES_NEW:
+        return "new"
+    if core in _NOTES_OPEN and any(t in {"app", "application", "my", "zachary"} for t in toks):
+        return "open"
+    return ""
+
+
 def parse(text: str) -> Intent:
     raw = tokenize(text)
     if raw and raw[0] in _QUESTION_TYPOS:
@@ -417,6 +442,12 @@ def parse(text: str) -> Intent:
         or (any(t in OPEN_VERBS for t in joined_re) and any(t in CONFIRM_ALL for t in joined_re))
     ):
         return Intent("confirm", confidence=conf, corrected=corrected)
+
+    # --- Zachary's own notes app ("open my notes", "new note", "take a note") -----------
+    notes = notes_action(toks)
+    if notes:
+        return Intent("notes", query=text.strip(), action=notes, confidence=conf,
+                      corrected=corrected)  # fmt: skip
 
     # "new document" / "new text file": a new file, not "the newer one".
     if toks[0] == "new" and len(toks) <= 3 and any(t in CREATE_THINGS for t in toks[1:]):

@@ -126,6 +126,7 @@ class Reply:
     plan_id: int = 0  # a clean/organize plan to review (the UI opens the review window)
     plan: planner.Plan | None = None  # ...and the plan itself (no DB reads on the UI thread)
     dictating: bool = False  # dictation mode is on (the UI keeps listening)
+    notes: str = ""  # open the notes app: open | new | dictate (submit only)
 
 
 def clear_winner(results: list[SearchResult] | list[Item]) -> bool:
@@ -430,6 +431,8 @@ class Handler:
             reply = self._create(intent, execute=execute)
         elif intent.kind == "dictate":
             reply = self._start_dictation(intent, execute=execute)
+        elif intent.kind == "notes":
+            reply = self._notes(intent, execute=execute)
         elif intent.kind == "clean":
             reply = self._clean(intent, execute=execute)
         elif intent.kind == "organize":
@@ -1251,6 +1254,18 @@ class Handler:
                     [f"in {self._where(made.folder)}"])  # fmt: skip
         return Reply(say + " Say “undo” to remove it.", "none", [item], intent,
                      detail=content[:600])  # fmt: skip
+
+    def _notes(self, intent: Intent, *, execute: bool) -> Reply:
+        """Zachary's notes app (ui/notes.py): notes are .txt files in Documents/Zachary/Notes."""
+        what = intent.action or "open"
+        say = {
+            "open": "Opening your notes.",
+            "new": "New note.",
+            "dictate": "New note. Talk; say “stop dictation” when you're done.",
+        }[what]
+        if not execute:
+            return Reply(f"Enter: {say[0].lower()}{say[1:]}", "none", [], intent)
+        return Reply(say, "none", [], intent, notes=what)
 
     def _start_dictation(self, intent: Intent, *, execute: bool) -> Reply:
         spec = parse_create(intent.query)
