@@ -133,8 +133,10 @@ class MicSource:
 
     def try_next(self) -> str | None:
         """The current mic gives digital silence (e.g. a laptop mic with no Linux
-        driver): remember it as dead and switch to the next real microphone."""
-        if self.fixed:
+        driver): remember it as dead and switch to the next real microphone. Never for
+        a mic chosen by hand (``mic_device``): you picked it, so a quiet moment is no
+        reason to start listening on a different microphone."""
+        if self.fixed or (self.device and not self.auto):
             return None
         from zachary.voice.audio import auto_input
 

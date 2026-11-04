@@ -196,3 +196,19 @@ def test_safe_actions_refuse_unindexed_or_missing(
     assert not fake_platform.opened
     with pytest.raises(ActionNotAllowed):
         acts.perform("delete", Item(row.id, str(f), "x.txt", "other", False, 0))
+
+
+def test_follow_up_typed_letter_by_letter_refers_to_the_list_you_saw(handler: Handler) -> None:
+    """The bar previews every keystroke: "t", "th", "the s"... each show a list of their
+    own. "the second one" must still mean the projects you were looking at."""
+    handler.preview("my projects")
+    typed = "the second one"
+    r = None
+    for i in range(1, len(typed) + 1):
+        r = handler.preview(typed[:i])
+    assert r is not None and r.say == "Enter to open: dsa."
+    r = handler.submit(typed)
+    assert r.target is not None and r.target.name == "dsa"
+    # (backspacing to an empty box shows recent files: those then count)
+    handler.preview("")
+    assert handler.preview("the first one").say.startswith("Enter to open")

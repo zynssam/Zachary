@@ -1541,3 +1541,19 @@ def test_wake_word_paused_while_dictating_into_a_note(gnani: MockGnani) -> None:
     finally:
         lis.stop()
         lis.join(3)
+
+
+def test_a_hand_chosen_mic_is_never_swapped_for_another(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mic_device set by you: silence on it must not open a different (real) microphone."""
+    from zachary.voice import audio
+    from zachary.voice.pipeline import MicSource
+
+    asked: list[object] = []
+
+    def other_mic(**kw: object) -> str:
+        asked.append(kw)
+        return "alsa_input.usb-headset"  # (a real mic it must not switch to)
+
+    monkeypatch.setattr(audio, "auto_input", other_mic)
+    src = MicSource(device="zdemo_mic")
+    assert src.try_next() is None and src.mic.device == "zdemo_mic" and not asked

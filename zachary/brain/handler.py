@@ -285,6 +285,10 @@ class Handler:
         # Needed only to run approved clean/organize plans (trash / restore).
         self.platform = platform or getattr(actions, "platform", None)
         self.context = Context()
+        # Follow-ups refer to the last list you settled on, not to partial words: see
+        # _settle. (preview text, the context it showed) / the context that counts.
+        self._shown: tuple[str, Context] | None = None
+        self._committed: Context | None = None
         self._rules: PathRules | None = None
         self._rules_rev = -1
         self._semantic_provider = semantic
@@ -363,21 +367,43 @@ class Handler:
     # -- entry points ------------------------------------------------------------------
     def preview(self, text: str) -> Reply:
         """As-you-type: show what would happen. Never opens anything."""
-        return self._handle(text, execute=False)
+        self._settle(text)
+        reply = self._handle(text, execute=False)
+        self._shown = (text, self.context.copy())
+        return reply
 
     def submit(self, text: str, clipboard: str | None = None) -> Reply:
         """Enter / voice: may run a safe action per the confidence rule. ``clipboard``:
         what was copied, captured by the UI only when the request asks to paste."""
+        self._settle(text)
         self._clipboard = clipboard
         try:
             return self._handle(text, execute=True)
         finally:
             self._clipboard = None
+            self._committed, self._shown = self.context.copy(), None
 
     def act(self, index: int, action: str) -> Reply:
-        """A click / keyboard choice on a shown item."""
+        """A click / keyboard choice on a shown item (the list on screen right now)."""
         intent = Intent("select", ordinal=index + 1, action=action)
-        return self._followup(intent, execute=True)
+        reply = self._followup(intent, execute=True)
+        self._committed, self._shown = self.context.copy(), None
+        return reply
+
+    def _settle(self, text: str) -> None:
+        """Which list do follow-ups ("the second one") refer to? Each keystroke previews,
+        and the partial words ("t", "th", "the s"...) show lists of their own. The list
+        a preview showed counts only once you moved on to something else; while you're
+        still typing (or erasing) the same words, it's dropped. An empty box's list (your
+        recent files) always counts."""
+        if self._shown is not None:
+            prev, ctx = self._shown
+            a, b = prev.strip().lower(), text.strip().lower()
+            if not a or not (b.startswith(a) or a.startswith(b)):
+                self._committed = ctx
+            self._shown = None
+        if self._committed is not None:
+            self.context = self._committed.copy()
 
     def llm(self) -> LLM | None:
         """The configured LLM (None when off / no key). Asked on each use, so turning it

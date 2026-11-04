@@ -45,6 +45,10 @@ class Context:
         self.view = view
         self.updated_at = time.time() if now is None else now
 
+    def copy(self) -> Context:
+        return Context(list(self.items), self.focused, self.query, self.view,
+                       self.updated_at, self.current)  # fmt: skip
+
     def active(self, now: float | None = None) -> bool:
         now = time.time() if now is None else now
         return bool(self.items) and now - self.updated_at < CONTEXT_TTL_S
