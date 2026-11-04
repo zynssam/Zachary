@@ -5,6 +5,8 @@ The real Gnani API is never called here.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import queue
 import sys
@@ -13,6 +15,7 @@ import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -1150,7 +1153,6 @@ def test_tts_gives_up_when_audio_is_too_late(gnani: MockGnani, ledger: UsageLedg
 
 
 def test_rest_fallback_only_gets_the_time_left(monkeypatch: pytest.MonkeyPatch) -> None:
-    from typing import Any
 
     import httpx
 
@@ -1176,7 +1178,6 @@ def test_rest_fallback_only_gets_the_time_left(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_segments_join_in_gnani_order_not_arrival_order() -> None:
-    from typing import Any
 
     from zachary.voice.types import join_segments, segment_key
 
@@ -1185,3 +1186,441 @@ def test_segments_join_in_gnani_order_not_arrival_order() -> None:
                {"text": "please"}]  # fmt: skip
     parts = [(segment_key(m, i), str(m["text"])) for i, m in enumerate(arrived)]
     assert join_segments(parts) == "open the fees document I opened yesterday please"
+
+
+def test_voice_dictation_rearms_until_stop(
+    qtbot: object, gnani: MockGnani, store: FileStore, home: Path, db_path: Path,
+    fake_platform: FakePlatform, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """ "make a document I'll dictate" -> the mic re-opens by itself after each piece ->
+    "stop dictation" -> the document is written, then opened."""
+    from zachary.actions import creator
+    from zachary.ui import voice as voice_mod
+    from zachary.ui.engine import Engine
+    from zachary.ui.quickbar import QuickBar
+    from zachary.ui.voice import VoiceController
+    from zachary.voice.audio import Player
+    from zachary.voice.factory import VoiceKit
+
+    base = home / "Documents" / "Zachary"
+    monkeypatch.setattr(creator, "base_folder", lambda: base)
+    monkeypatch.setattr(voice_mod, "DICTATION_PAUSE_MS", 500)
+    engine = Engine(db_path, fake_platform, semantic_factory=lambda _c, _cfg: None)
+    engine.start()
+    bar = QuickBar(engine)
+    kit = VoiceKit(
+        rest_stt=GnaniRestSTT(KEY, url=gnani.stt_url),
+        stream_stt=lambda: GnaniStreamingSTT(KEY, url=gnani.stt_ws),
+        offline_stt=FakeOffline(), spotter=FakeSpotter(),  # type: ignore[arg-type]
+        tts=GnaniWsTTS(KEY, url=gnani.tts_ws), ledger=UsageLedger(None), has_key=True,
+    )  # fmt: skip
+    out = FakeOut()
+    voice = VoiceController(engine, bar, kit, wake_word=False, latency_path=tmp_path / "l.jsonl",
+                            player=Player(open_stream=out.open))  # fmt: skip
+    records: list[dict[str, object]] = []
+    voice.spoken.connect(records.append)
+    src = CountingSource()
+    voice.start(src)
+    try:
+        gnani.transcript = "make a document I'll dictate"
+        voice.push_to_talk()
+        src.load(speech(0.8) + silence(0.8))
+        qtbot.waitUntil(lambda: voice.dictating and len(records) == 1, timeout=15000)  # type: ignore[attr-defined]
+        # Nobody presses anything from here: the mic re-opens by itself.
+        qtbot.waitUntil(lambda: src.starts == 2, timeout=5000)  # type: ignore[attr-defined]
+        gnani.transcript = "the demo is on friday"
+        src.load(speech(0.8) + silence(1.0))
+        qtbot.waitUntil(lambda: len(records) == 2 and src.starts == 3, timeout=15000)  # type: ignore[attr-defined]
+        assert not list(base.rglob("*.docx")) and not fake_platform.opened
+        gnani.transcript = "stop dictation"
+        src.load(speech(0.8) + silence(1.0))
+        # Opened in the engine thread; the controller hears "done" when the reply lands.
+        qtbot.waitUntil(lambda: bool(fake_platform.opened) and not voice.dictating,  # type: ignore[attr-defined]
+                        timeout=15000)  # fmt: skip
+    finally:
+        voice.stop()
+        engine.stop()
+    (made,) = list(base.rglob("*.docx"))
+    assert fake_platform.opened == [made] and not voice.dictating
+    import docx
+
+    assert [p.text for p in docx.Document(str(made)).paragraphs] == ["The demo is on friday."]
+
+
+def test_keyterms_reach_gnani(gnani: MockGnani) -> None:
+    """Your names go as Prisma v3 keyterms (stream header + REST form); approved setting."""
+    names = lambda: ["Zachary", "Durdrsti"]  # noqa: E731
+    stt = GnaniStreamingSTT(KEY, url=gnani.stt_ws, keyterms=names)
+    stt.open()
+    stt.feed(silence(0.2))
+    stt.finish()
+    hdr = gnani.calls[-1]["headers"]
+    assert json.loads(hdr["keyterms"]) == ["Zachary", "Durdrsti"]
+    GnaniRestSTT(KEY, url=gnani.stt_url, keyterms=names).transcribe(speech(0.5))
+    assert json.loads(gnani.calls[-1]["fields"]["keyterms"]) == ["Zachary", "Durdrsti"]
+    GnaniRestSTT(KEY, url=gnani.stt_url).transcribe(speech(0.5))
+    assert "keyterms" not in gnani.calls[-1]["fields"]  # none when off
+
+
+def test_keyterms_setting_off_sends_nothing(
+    conn: Any, fake_platform: FakePlatform, tmp_path: Path
+) -> None:
+    from zachary.core.config import Config
+    from zachary.voice import factory
+
+    cfg = Config(conn, fake_platform)
+    cfg.set_setting("stt_keyterms", False)
+    kit = factory.build_voice(cfg, tmp_path, api_key="k")
+    assert kit.rest_stt is not None and kit.rest_stt.keyterms is None  # type: ignore[attr-defined]
+    cfg.set_setting("stt_keyterms", True)
+    kit = factory.build_voice(cfg, tmp_path, api_key="k")
+    assert isinstance(kit.rest_stt.keyterms, factory.Keyterms)  # type: ignore[union-attr]
+
+
+# -- fast "Hey Zach" (Vosk) ---------------------------------------------------------------------
+_REAL_MODELS = Path(os.path.expanduser("~")) / ".local" / "share" / "zachary" / "models"
+_CLIPS = Path(os.path.expanduser("~")) / ".cache" / "zachary-bench" / "wake_clips.pkl"
+
+
+class FakeFast:
+    """Fires after ``after`` loud frames (stands in for Vosk hearing "Hey Zach")."""
+
+    def __init__(self, after: int = 10) -> None:
+        self.after, self.loud, self.resets, self.fired = after, 0, 0, 0
+
+    def feed(self, frame: bytes) -> bool:
+        x = np.frombuffer(frame, dtype=np.int16)
+        self.loud = self.loud + 1 if x.size and np.abs(x).mean() > 500 else self.loud
+        if self.loud >= self.after:
+            self.fired += 1
+            return True
+        return False
+
+    def reset(self) -> None:
+        self.resets += 1
+        self.loud = 0
+
+
+def test_fast_wake_word_starts_a_command(gnani: MockGnani) -> None:
+    """ "Hey Zach, open the fees" in one breath: Vosk fires right after "Zach", the rest
+    is streamed to Gnani like push-to-talk (with ~0.3 s from just before the wake)."""
+    src = CountingSource()
+    got: list[Heard] = []
+    fast = FakeFast(after=10)
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=fast)
+    try:
+        src.load(silence(0.5) + speech(1.5) + silence(1.0))
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    h = got[0]
+    assert h.via == "wake" and h.text == gnani.transcript and fast.fired == 1
+    assert float(h.timeline.info["preroll_s"]) > 0.25  # type: ignore[arg-type]  # kept
+    assert fast.resets >= 2  # fresh after the wake and after the command
+    assert gnani.calls[0]["endpoint"] == "stt-stream"  # nothing sent before the wake word
+
+
+def test_no_wake_word_nothing_is_sent(gnani: MockGnani) -> None:
+    src = CountingSource()
+    got: list[Heard] = []
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=FakeFast(after=10**6))
+    try:
+        src.load(silence(0.3) + speech(1.5) + silence(1.0))
+        time.sleep(2.5)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert not got and not gnani.calls  # talking without "Hey Zach" never reaches Gnani
+
+
+@pytest.mark.skipif(
+    not (_REAL_MODELS / "vosk" / "vosk-model-small-en-in-0.4" / "am").is_dir()
+    or not _CLIPS.exists(),
+    reason="needs the Vosk model (cli voice setup) and recorded clips (local only)",
+)
+def test_real_vosk_hears_hey_zach_not_hey_jack() -> None:
+    import pickle
+
+    from zachary.voice.wakeword import VoskSpotter
+
+    clips: dict[str, bytes] = pickle.loads(_CLIPS.read_bytes())
+    spot = VoskSpotter(_REAL_MODELS)
+    assert spot.available()
+
+    def fires(pcm: bytes) -> list[float]:
+        spot.reset()
+        out = []
+        pcm = silence(0.5) + pcm + silence(0.5)
+        for i in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES):
+            if spot.feed(pcm[i : i + FRAME_BYTES]):
+                out.append(round(i / 32000 - 0.5, 2))
+                spot.reset()
+        return out
+
+    t = time.perf_counter()
+    wake = fires(clips["Hey Zach, open the fee receipt."])
+    assert len(wake) == 1 and wake[0] < 1.2  # right after "Zach"
+    assert fires(clips["okzach"])  # "Okay Zach"
+    for no in ("Hey Jack, what's up?", "Open the zachary project.", "talk"):
+        assert fires(clips[no]) == [], no
+    audio_s = sum(len(c) for c in clips.values()) / 32000
+    assert (time.perf_counter() - t) / audio_s < 0.2  # well under real time
+    # The bug that made it deaf in the real app: listening continuously, after the
+    # first sentence it never matched again. Talk, then "Hey Zach", in ONE stream:
+    talk = clips["talk"] + silence(1.0)
+    stream = talk + clips["Hey Zach, open the fee receipt."]
+    got = fires(stream)
+    start = len(talk) / 32000
+    assert len(got) == 1 and start < got[0] < start + 1.5, got
+
+
+class LaterMicSource(ListSource):
+    """A dead mic at start; a working one "appears" (earbuds connected) later."""
+
+    def __init__(self) -> None:
+        super().__init__(b"")
+        self.calls = 0
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def get(self, timeout: float) -> bytes | None:
+        time.sleep(0.001)
+        return b"\0" * FRAME_BYTES  # exact zeros: a mic with no driver
+
+    def try_next(self) -> str | None:
+        self.calls += 1
+        return "bluez_input.earbuds" if self.calls >= 2 else None
+
+
+def test_wake_mode_switches_to_a_mic_connected_later(gnani: MockGnani,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    from zachary.voice import pipeline
+
+    monkeypatch.setattr(pipeline, "RECHECK_FRAMES", 20)
+    monkeypatch.setattr(pipeline, "SILENT_FRAMES", 20)
+    src = LaterMicSource()
+    states: list[str] = []
+    fast: Any = FakeFast(after=10**6)
+    lis = VoiceListener(src, on_heard=lambda _h: None, on_state=states.append,
+                        rest_stt=None, stream_stt=None, offline_stt=FakeOffline(),
+                        spotter=None, wake_word=True, fast_spotter=fast)  # fmt: skip
+    lis.start()
+    try:
+        wait_until(lambda: any("using microphone bluez_input.earbuds" in s for s in states),
+                   timeout=10)  # fmt: skip
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert any("no microphone is giving sound" in s for s in states) and src.calls >= 2
+
+
+def test_wake_mode_uses_any_mic_that_gives_sound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """User's choice: whatever input is giving audio, earbuds included; a silent one is
+    skipped and given another chance after DEAD_RETRY_S."""
+    from zachary.voice import audio, pipeline
+    from zachary.voice.pipeline import MicSource
+
+    srcs = [{"name": "bluez_input.68_ED", "driver": "x"},
+            {"name": "alsa_input.pci-laptop.analog-stereo", "driver": "x"}]  # fmt: skip
+    monkeypatch.setattr(
+        audio, "_pactl_sources", lambda: (srcs, "alsa_input.pci-laptop.analog-stereo")
+    )
+    monkeypatch.setattr(audio, "_pactl_default_sink", lambda: "bluez_output.68_ED.1")
+    src = MicSource()
+    fast: Any = FakeFast()
+    VoiceListener(src, on_heard=lambda _h: None, rest_stt=None, stream_stt=None,
+                  offline_stt=None, spotter=None, wake_word=True, fast_spotter=fast)  # fmt: skip
+    assert src.bluetooth is True
+    assert audio.auto_input(exclude=src.dead) == "bluez_input.68_ED"  # the earbuds
+    src.mark_dead("bluez_input.68_ED")  # silent (e.g. just disconnected)
+    assert audio.auto_input(exclude=src.dead) == "alsa_input.pci-laptop.analog-stereo"
+    t = time.monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: t + pipeline.DEAD_RETRY_S + 1)
+    assert src.dead == set()  # tried again later
+
+
+def test_ptt_in_wake_mode_borrows_the_earbuds_when_the_open_mic_is_silent(
+    gnani: MockGnani,
+) -> None:
+    class Borrowing(CountingSource):
+        borrowed_for = 0
+
+        def get(self, timeout: float) -> bytes | None:
+            try:
+                return self.q.get_nowait()
+            except queue.Empty:
+                time.sleep(0.005)
+                return b"\0" * FRAME_BYTES  # between commands: the dead laptop mic
+
+        @contextlib.contextmanager
+        def borrowed(self) -> Iterator[str | None]:
+            Borrowing.borrowed_for += 1
+            yield "bluez_input.earbuds"
+
+    src = Borrowing()
+    got: list[Heard] = []
+    fast: Any = FakeFast(after=10**6)
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=fast)
+    lis._warned_silent = True  # the always-open (laptop) mic gave only zeros
+    try:
+        lis.push_to_talk()
+        src.load(speech(1.0) + silence(1.0))
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert got[0].text == gnani.transcript and Borrowing.borrowed_for == 1
+
+
+@pytest.mark.parametrize("wake", [False, True])
+def test_note_dictation_never_pops_up_the_bar(
+    qtbot: object, gnani: MockGnani, db_path: Path, fake_platform: FakePlatform, tmp_path: Path,
+    wake: bool,
+) -> None:  # fmt: skip
+    """Clicking Dictate in the notes window: speech is typed into the note; the quick bar
+    stays hidden (it used to pop up with the last command)."""
+    from zachary.ui.engine import Engine
+    from zachary.ui.notes import NotesStore
+    from zachary.ui.quickbar import QuickBar
+    from zachary.ui.voice import VoiceController
+    from zachary.voice.audio import Player
+    from zachary.voice.factory import VoiceKit
+
+    engine = Engine(db_path, fake_platform, semantic_factory=lambda _c, _cfg: None)
+    engine.start()
+    bar = QuickBar(engine)
+    kit = VoiceKit(
+        rest_stt=GnaniRestSTT(KEY, url=gnani.stt_url),
+        stream_stt=lambda: GnaniStreamingSTT(KEY, url=gnani.stt_ws),
+        offline_stt=FakeOffline(), spotter=FakeSpotter(),  # type: ignore[arg-type]
+        tts=None, ledger=UsageLedger(None), has_key=True,
+        fast_spotter=FakeFast(after=10**6) if wake else None,  # type: ignore[arg-type]
+    )  # fmt: skip
+    voice = VoiceController(
+        engine, bar, kit, wake_word=wake, player=Player(open_stream=FakeOut().open)
+    )
+    src = CountingSource()
+    voice.start(src)
+    shown: list[bool] = []
+    bar.visibility.connect(shown.append)
+    try:
+        bar.edit.setText("Take a note.")  # (the last command, still in the box)
+        win = bar.notes_window()
+        win.store = NotesStore(tmp_path / "Notes")
+        win.present("new")
+        gnani.transcript = "my name is samrat"
+        win.mic_btn.click()
+        src.load(speech(0.8) + silence(1.8))
+        qtbot.waitUntil(lambda: "My name is samrat." in win.editor.toPlainText(), timeout=15000)  # type: ignore[attr-defined]
+        assert True not in shown and not bar.isVisible()
+        win.mic_btn.click()
+    finally:
+        voice.stop()
+        engine.stop()
+
+
+def test_wake_word_paused_while_dictating_into_a_note(gnani: MockGnani) -> None:
+    """Between dictation pieces your continuing speech must not trigger "Hey Zach"."""
+    src = CountingSource()
+    got: list[Heard] = []
+    fast = FakeFast(after=5)
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=fast)
+    try:
+        lis.pause_wake(True)
+        src.load(silence(0.2) + speech(1.5) + silence(0.5))
+        time.sleep(2.2)
+        assert fast.fired == 0 and not got and not gnani.calls
+        lis.pause_wake(False)
+        src.load(speech(1.0) + silence(1.0))
+        wait_until(lambda: fast.fired == 1, timeout=5)  # listening for it again
+    finally:
+        lis.stop()
+        lis.join(3)
+
+
+def test_a_hand_chosen_mic_is_never_swapped_for_another(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mic_device set by you: silence on it must not open a different (real) microphone."""
+    from zachary.voice import audio
+    from zachary.voice.pipeline import MicSource
+
+    asked: list[object] = []
+
+    def other_mic(**kw: object) -> str:
+        asked.append(kw)
+        return "alsa_input.usb-headset"  # (a real mic it must not switch to)
+
+    monkeypatch.setattr(audio, "auto_input", other_mic)
+    src = MicSource(device="zdemo_mic")
+    assert src.try_next() is None and src.mic.device == "zdemo_mic" and not asked
+
+
+def test_noise_in_other_scripts_is_not_a_command() -> None:
+    """Offline Whisper turns background noise into text in random languages."""
+    from zachary.voice.pipeline import plausible
+
+    assert plausible("open the fee receipt") and plausible("मेरी फ़ाइल खोलो")
+    assert plausible("kal wali file kholo") and plausible("Café notes")
+    assert not plausible("وحيث أن تكون هناك.") and not plausible("ご視聴ありがとうございました")
+    assert not plausible("...") and not plausible("")
+
+
+def test_holding_space_during_a_wake_command_starts_hold_to_talk(gnani: MockGnani) -> None:
+    """A (false) "Hey Zach" is listening; you hold Space: that command is dropped and a
+    hold-to-talk starts, which ends when you let go (not "Listening..." forever)."""
+    src = CountingSource()
+    got: list[Heard] = []
+    fast = FakeFast(after=10)
+    lis = _ptt_listener(gnani, src, got, wake_word=True, fast_spotter=fast)
+    try:
+        src.load(silence(0.3) + speech(0.4))  # the wake fires, its command is listening
+        wait_until(lambda: fast.fired == 1, timeout=5)
+        lis.push_to_talk(hold=True)  # Space down
+        src.load(speech(1.0) + silence(0.6))
+        time.sleep(0.8)
+        lis.release()  # Space up
+        wait_until(lambda: got, timeout=10)
+    finally:
+        lis.stop()
+        lis.join(3)
+    assert len(got) == 1 and got[0].via == "ptt" and got[0].text == gnani.transcript
+
+
+def test_a_false_wake_closes_the_bar_it_opened(qtbot: object) -> None:
+    """ "Hey Zach" fired (the TV, a similar word) and nothing usable followed: the bar it
+    opened closes again quietly. A bar you opened yourself stays open."""
+    from PySide6.QtCore import QObject, Signal
+
+    from zachary.telemetry.latency import Timeline
+    from zachary.ui.quickbar import QuickBar
+    from zachary.ui.voice import VoiceController
+    from zachary.voice.factory import VoiceKit
+
+    class Engine(QObject):
+        replied = Signal(int, object)
+        failed = Signal(int, str)
+
+        def ask(self, *_a: object) -> int:
+            return 0
+
+    engine = Engine()
+    bar = QuickBar(engine)  # type: ignore[arg-type]
+    kit = VoiceKit(rest_stt=None, stream_stt=None, offline_stt=None, spotter=None,  # type: ignore[arg-type]
+                   tts=None, ledger=UsageLedger(None), has_key=True)  # fmt: skip
+    voice = VoiceController(engine, bar, kit, wake_word=True)  # type: ignore[arg-type]
+    try:
+        voice._on_state("listening")  # the wake word opened the bar
+        assert bar.isVisible()
+        voice._on_heard(Heard("", None, Timeline("voice"), via="wake"))
+        assert not bar.isVisible()
+        bar.show_bar()  # you opened it
+        voice._on_state("listening")
+        voice._on_heard(Heard("", None, Timeline("voice"), via="wake"))
+        assert bar.isVisible()
+    finally:
+        bar.hide()
+        voice.stop()

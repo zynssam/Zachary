@@ -237,7 +237,7 @@ def device_key(node: str) -> str:
     return node
 
 
-def auto_input(exclude: set[str] | frozenset[str] = frozenset()) -> str:
+def auto_input(exclude: set[str] | frozenset[str] = frozenset(), *, bluetooth: bool = True) -> str:
     """Pick the microphone the user is most likely talking into, right now.
 
     1. the mic of the device they're *listening on* (Bluetooth earbuds, a USB or
@@ -250,6 +250,8 @@ def auto_input(exclude: set[str] | frozenset[str] = frozenset()) -> str:
     """
     sources, default = _pactl_sources()
     real = [str(x["name"]) for x in sources if not _is_virtual(x)]
+    if not bluetooth:  # (callers may still ask for "no Bluetooth"; default: any mic)
+        real = [n for n in real if not n.startswith("bluez_input")]
     names = [n for n in real if n not in exclude]
     if not names:
         return ""

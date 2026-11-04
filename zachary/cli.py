@@ -229,6 +229,12 @@ def cmd_voice(args: argparse.Namespace) -> int:
         t = time.perf_counter()
         kit.offline_stt.transcribe(b"\0\0" * 16000)  # downloads the model once
         print(f"local speech model ready ({time.perf_counter() - t:.1f}s)")
+        from zachary.voice.wakeword import download_vosk
+
+        t = time.perf_counter()
+        download_vosk(data_dir / "models")
+        print(f"\"Hey Zach\" model ready ({time.perf_counter() - t:.1f}s)"
+              " (turn on: cli set wake_word true)")  # fmt: skip
         try:
             import sounddevice as sd
 
@@ -236,6 +242,8 @@ def cmd_voice(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"microphone: unavailable ({e})")
         return 0
+    if args.action == "wake-test":
+        return _wake_test(data_dir, cfg, float(args.text or 20), args.save)
     if args.action == "transcribe":
         pcm, sr = wav_to_pcm(Path(args.text).read_bytes())
         pcm = resample(pcm, sr)
@@ -417,6 +425,63 @@ def _data_dir(args: argparse.Namespace) -> Path:
     return Path(args.db or default_db_path()).parent
 
 
+def _wake_test(data_dir: Path, cfg: Config, seconds_: float, save: str | None = None) -> int:
+    """Say "Hey Zach" a few times: prints what the local detector hears, live. Uses the
+    microphone only while it runs; nothing is sent anywhere (no Gnani, no API)."""
+    import json as _json
+
+    from zachary.voice.audio import FRAME_BYTES
+    from zachary.voice.pipeline import MicSource
+    from zachary.voice.wakeword import VoskSpotter, download_vosk
+
+    download_vosk(data_dir / "models")
+    spot = VoskSpotter(data_dir / "models")
+    import vosk
+
+    vosk.SetLogLevel(-1)  # (its start-up lines aren't useful here)
+    free = vosk.KaldiRecognizer(vosk.Model(str(spot.model_dir)), 16000)  # what was *said*
+    src = MicSource(device=cfg.load().mic_device)
+    src.start()
+    print(f"Listening for {seconds_:.0f} s on {src.mic.source_name if src.mic else 'the mic'}"
+          " (local only). Say “Hey Zach” a few times, and some other sentences.")  # fmt: skip
+    t_end = time.monotonic() + seconds_
+    wakes = 0
+    frames = zero = 0
+    recorded: list[bytes] = []
+    try:
+        while time.monotonic() < t_end:
+            f = src.get(0.2)
+            if f is None or len(f) != FRAME_BYTES:
+                continue
+            frames += 1
+            zero += f.count(0) == len(f)
+            if save:
+                recorded.append(f)
+            if spot.feed(f):
+                wakes += 1
+                print(f"  >>> WAKE ({wakes})")
+                spot.reset()
+            if free.AcceptWaveform(f):
+                said = _json.loads(free.Result()).get("text", "")
+                if said:
+                    print(f"  heard: {said!r}   (wake phrases list: {spot.last_heard!r})")
+    finally:
+        src.stop()
+    if save and recorded:
+        from zachary.voice.audio import pcm_to_wav
+
+        out = Path(save).expanduser()
+        out.write_bytes(pcm_to_wav(b"".join(recorded)))
+        print(f"saved the recording (stays on this laptop): {out}")
+    if frames and zero / frames > 0.95:
+        print("This microphone recorded only silence (e.g. the built-in mic without a Linux"
+              " driver). “Hey Zach” needs a wired or USB mic: plug one in and run this again."
+              " Bluetooth earbuds work with push-to-talk.")  # fmt: skip
+        return 1
+    print(f"{wakes} wake(s). Paste these lines to tune the wake word.")
+    return 0
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     """Answer a question from your files (LLM if enabled, else the best passage)."""
     from zachary.actions.safe_actions import SafeActions
@@ -432,10 +497,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
     t0 = time.perf_counter()
     from zachary.brain.intents import parse
 
-    explain = parse(question).kind == "explain"  # "explain my last project" stays itself
-    reply = handler.submit(
-        question if explain or question.startswith("ask ") else f"ask {question}"
-    )
+    # "explain my last project" / "what is the zachary project about" stay themselves.
+    as_is = parse(question).kind in {"explain", "ask", "stats"}
+    reply = handler.submit(question if as_is or question.startswith("ask ") else f"ask {question}")
     ms = (time.perf_counter() - t0) * 1e3
     print(f"zach: {reply.say}")
     if reply.detail:
@@ -482,6 +546,152 @@ def cmd_llm(args: argparse.Namespace) -> int:
     for k, d in by.items():
         print(f"  {k:14} {int(d['calls']):4} calls  {int(d['in']):7} in / {int(d['out']):6} out "
               f"tokens  {int(d['errors'])} errors  avg {d['ms'] / d['calls']:.0f} ms")  # fmt: skip
+    return 0
+
+
+def _print_plan(plan: Any) -> None:
+    from zachary.actions import planner
+
+    print(f"plan {plan.id} [{plan.status}]: {plan.title}")
+    print(f"  {plan.note}")
+    cat = ""
+    for it in plan.items:
+        if it.category != cat:
+            cat = it.category
+            print(f"\n  {planner.LABELS[cat]}")
+        mark = "x" if it.selected else " "
+        size = f"{planner.human(it.size):>9}" if it.size else " " * 9
+        dst = f"  ->  {planner._short(it.dst)}" if it.dst else ""
+        res = f"   [{it.result}]" if it.result else ""
+        print(f"  [{mark}] {it.id:>4}  {size}  {planner._short(it.src)}{dst}   ({it.reason}){res}")
+
+
+def _handler(args: argparse.Namespace) -> Any:
+    from zachary.actions.safe_actions import SafeActions
+    from zachary.brain.handler import Handler
+
+    conn, cfg = _open(args)
+    return Handler(conn, SafeActions(conn, cfg.platform), cfg, None, None, cfg.platform)
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Make a clean-up plan (nothing changes): ``clean``, ``clean downloads duplicates``."""
+    h = _handler(args)
+    t0 = time.perf_counter()
+    reply = h.submit("clean " + " ".join(args.what))
+    if reply.plan is None:
+        print(reply.say)
+        return 0
+    _print_plan(reply.plan)
+    print(f"\n{(time.perf_counter() - t0):.1f}s. Nothing has changed. To apply the ticked items:")
+    print(f"  python -m zachary.cli plan approve {reply.plan.id}"
+          "   [--only 1,2,5] [--skip 3,4]")  # fmt: skip
+    return 0
+
+
+def cmd_organize(args: argparse.Namespace) -> int:
+    h = _handler(args)
+    reply = h.submit("organize " + " ".join(args.what))
+    if reply.plan is None:
+        print(reply.say)
+        return 0
+    _print_plan(reply.plan)
+    print(f"\nNothing has changed. Apply: python -m zachary.cli plan approve {reply.plan.id}"
+          "   [--only ...] [--skip ...]")  # fmt: skip
+    return 0
+
+
+def _ids(text: str | None) -> set[int]:
+    return {int(x) for x in (text or "").replace(" ", "").split(",") if x}
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    from zachary.actions import planner
+
+    h = _handler(args)
+    if args.id is None:
+        rows = h.conn.execute(
+            "SELECT id, kind, status, created_at FROM action_plans ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        for r in rows:
+            when = datetime.fromtimestamp(r[3]).strftime("%d %b %H:%M")
+            print(f"  {r[0]:>4}  {when}  {r[1]:9} {r[2]}")
+        return 0
+    plan = planner.load(h.conn, args.id)
+    if plan is None:
+        print(f"no plan {args.id}")
+        return 1
+    if args.action == "show":
+        _print_plan(plan)
+        return 0
+    if args.action == "reject":
+        print(h.reject_plan(plan.id).say)
+        return 0
+    only, skip = _ids(args.only), _ids(args.skip)
+    select = {i.id: (i.id in only if only else i.selected) and i.id not in skip
+              for i in plan.items}  # fmt: skip
+    n = sum(select.values())
+    if not args.yes:
+        ans = input(f"Apply {n} item(s) of plan {plan.id}? Files go to the trash / are moved. "
+                    "[y/N] ")  # fmt: skip
+        if ans.strip().lower() not in {"y", "yes"}:
+            print("Nothing changed.")
+            return 0
+    reply = h.approve_plan(plan.id, select)
+    print(reply.say)
+    if reply.detail:
+        print(reply.detail)
+    return 0
+
+
+def cmd_undo(args: argparse.Namespace) -> int:
+    from zachary.actions import planner
+
+    h = _handler(args)
+    plan = (planner.load(h.conn, args.id) if args.id
+            else planner.latest(h.conn, ["executed", "failed"]))  # fmt: skip
+    if plan is None:
+        print("There's nothing to undo.")
+        return 0
+    reply = h.undo_plan(plan.id)
+    print(f"plan {plan.id} ({plan.title}): {reply.say}")
+    if reply.detail:
+        print(reply.detail)
+    return 0
+
+
+def cmd_rules(args: argparse.Namespace) -> int:
+    """Folder rules: never_touch (Zachary never proposes changes there), auto_tidy."""
+    conn, cfg = _open(args)
+    if args.action in {"add", "remove"}:
+        if not args.path or args.rule not in {"never_touch", "auto_tidy", "name_only"}:
+            print("usage: rules add|remove PATH never_touch|auto_tidy|name_only")
+            return 1
+        fn = cfg.add_folder_rule if args.action == "add" else cfg.remove_folder_rule
+        fn(Path(args.path).expanduser(), args.rule)
+    for path, rule in conn.execute("SELECT path, rule FROM folder_rules ORDER BY path"):
+        print(f"  {rule:12} {_short(path)}")
+    return 0
+
+
+def cmd_apps(args: argparse.Namespace) -> int:
+    """Installed apps Zachary can open ("open spotify"), or what a name matches."""
+    from zachary.core.platform import apps, get_platform
+
+    found = get_platform().list_apps()
+    if args.name:
+        name = " ".join(args.name)
+        m = apps.find_app(name, found)
+        if m is None or m[1] < 0.75:
+            print(f"no installed app matches “{name}”")
+            return 1
+        a, score = m
+        files = "can open files" if a.accepts_files else "doesn't open files"
+        print(f"“{name}” -> {a.name}  ({a.id}, match {score:.2f}, {files})")
+        return 0
+    for a in sorted(found, key=lambda x: x.name.lower()):
+        print(f"  {a.name:40} {a.id}")
+    print(f"{len(found)} apps")
     return 0
 
 
@@ -660,17 +870,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="voice: usage | setup | mics [ID] | latency [N] | transcribe WAV | say TEXT | listen",
     )
     s.add_argument(
-        "action", choices=["usage", "setup", "mics", "latency", "transcribe", "say", "listen"]
+        "action",
+        choices=["usage", "setup", "mics", "latency", "transcribe", "say", "listen", "wake-test"],
     )
     s.add_argument("text", nargs="?", default=None, help="WAV path, text to say, or a mic id")
     s.add_argument("--offline", action="store_true", help="local speech recognition only")
     s.add_argument("--no-speak", action="store_true", help="don't speak the reply (listen)")
+    s.add_argument("--save", default=None, help="wake-test: also save the recording to this WAV")
     s.set_defaults(fn=cmd_voice)
 
     s = sub.add_parser("topics", help="topics (virtual collections of related files)")
     s.add_argument("--rebuild", action="store_true", help="cluster now (otherwise nightly)")
     s.add_argument("--limit", type=int, default=50)
     s.set_defaults(fn=cmd_topics)
+
+    s = sub.add_parser("apps", help="installed apps Zachary can open | apps NAME")
+    s.add_argument("name", nargs="*")
+    s.set_defaults(fn=cmd_apps)
+
+    s = sub.add_parser("clean", help="plan a clean-up (nothing changes), e.g. clean downloads")
+    s.add_argument("what", nargs="*", help="duplicates | installers | junk | empty | large; "
+                   "downloads | desktop | documents ...")  # fmt: skip
+    s.set_defaults(fn=cmd_clean)
+
+    s = sub.add_parser("organize", help="plan moving a topic's files into one folder")
+    s.add_argument("what", nargs="+")
+    s.set_defaults(fn=cmd_organize)
+
+    s = sub.add_parser("plan", help="list plans | plan show|approve|reject ID")
+    s.add_argument("action", nargs="?", choices=["show", "approve", "reject"], default="show")
+    s.add_argument("id", nargs="?", type=int, default=None)
+    s.add_argument("--only", help="approve only these item numbers, e.g. 1,2,5")
+    s.add_argument("--skip", help="leave these item numbers alone")
+    s.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+    s.set_defaults(fn=cmd_plan)
+
+    s = sub.add_parser("undo", help="undo the last applied plan (or plan ID)")
+    s.add_argument("id", nargs="?", type=int, default=None)
+    s.set_defaults(fn=cmd_undo)
+
+    s = sub.add_parser("rules", help="folder rules: rules | rules add|remove PATH RULE")
+    s.add_argument("action", nargs="?", choices=["list", "add", "remove"], default="list")
+    s.add_argument("path", nargs="?")
+    s.add_argument("rule", nargs="?")
+    s.set_defaults(fn=cmd_rules)
 
     s = sub.add_parser("ask", help='answer from your files, e.g. ask "when is my fee due"')
     s.add_argument("question", nargs="+")

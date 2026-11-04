@@ -25,6 +25,7 @@ from zachary.core.config import Config, default_db_path
 from zachary.core.db import get_state, open_db
 from zachary.core.hotkeys import HotkeyError, parse_hotkey
 from zachary.core.platform import Platform, get_platform
+from zachary.ui import style
 from zachary.ui.engine import Engine
 from zachary.ui.quickbar import QuickBar
 from zachary.ui.tray import Tray, app_icon
@@ -147,9 +148,15 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("Zachary")
     app.setDesktopFileName("ai.zachary.Zachary")
     app.setQuitOnLastWindowClosed(False)
+    style.use_dark(app)  # (look)
     app.setWindowIcon(app_icon())
 
-    if send_to_running(b"talk" if args.talk else b"toggle"):
+    message = b"talk" if args.talk else b"toggle" if args.toggle else b"show"
+    if send_to_running(message):
+        if message == b"show":  # started by hand: say why no new window/log appears
+            print("Zachary is already running (its log isn't in this terminal); showing "
+                  "the bar.\nTo restart it here with logs:  pkill -f zachary.assistant && "
+                  "python -m zachary.assistant -v", file=sys.stderr)  # fmt: skip
         return 0  # another instance owns the quick bar
     if args.talk:
         log.warning("no running assistant to talk to")
@@ -171,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     bar = QuickBar(engine)
 
     server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)  # only this user
     QLocalServer.removeServer(server_name())
     server.listen(server_name())
 
@@ -182,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             log.warning("voice is off: python -m zachary.cli set voice_enabled true")
 
-    serve_commands(server, {b"toggle": bar.toggle, b"talk": talk})
+    serve_commands(server, {b"toggle": bar.toggle, b"show": bar.show_bar, b"talk": talk})
 
     tray = None
     if Tray.available():
@@ -222,6 +230,21 @@ def main(argv: list[str] | None = None) -> int:
 
     voice = None
     voice_backend = None
+    vbridge = _HotkeyBridge()
+    vbridge.pressed.connect(lambda _tok, _t0: voice.hotkey() if voice else None)
+    if settings.voice_enabled and not args.no_voice and not args.no_hotkey:
+        # Registered right away, with the bar's hotkey: the portal binds both in one
+        # request (one dialog at most), not a second one after voice has loaded.
+        try:
+            voice_backend = platform.global_hotkey(
+                parse_hotkey(settings.voice_hotkey),
+                lambda tok: vbridge.pressed.emit(tok, time.perf_counter()),
+                "Talk to Zachary",
+                "voice",
+            )
+            voice_backend.start()
+        except HotkeyError as e:
+            log.error("bad voice hotkey setting: %s", e)
     if settings.voice_enabled and not args.no_voice:
         from zachary.ui.voice import VoiceController
         from zachary.voice.factory import build_voice
@@ -238,25 +261,13 @@ def main(argv: list[str] | None = None) -> int:
             wake_word=settings.wake_word,
             latency_path=data_dir / "latency.jsonl",
         )
+        voice.state.connect(bar.set_voice_state)  # (look) the voice dot
+        voice.spoken.connect(bar.voice_done)
         voice.start()
         talk_handlers.append(voice.push_to_talk)
         bar.talk.connect(voice.push_to_talk)
         bar.hold_talk.connect(voice.hold_talk)
         bar.visibility.connect(voice.bar_visible)
-        vbridge = _HotkeyBridge()
-        vbridge.pressed.connect(lambda _tok, _t0: voice.push_to_talk())
-        if not args.no_hotkey:
-            try:
-                voice_backend = platform.global_hotkey(
-                    parse_hotkey(settings.voice_hotkey),
-                    lambda tok: vbridge.pressed.emit(tok, time.perf_counter()),
-                    "Talk to Zachary",
-                    "voice",
-                )
-                voice_backend.start()
-            except HotkeyError as e:
-                log.error("bad voice hotkey setting: %s", e)
-
     if args.show or args.toggle:
         QTimer.singleShot(0, bar.show_bar)
     # Warm the engine's DB connection and the cached list so the first open is fast.

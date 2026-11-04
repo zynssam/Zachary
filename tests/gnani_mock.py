@@ -87,7 +87,7 @@ def _http_handler(mock: MockGnani) -> type[BaseHTTPRequestHandler]:
             key = self.headers.get("X-API-Key-ID")
             if self.path == "/stt/v3":
                 fields: dict[str, str] = {}
-                for name in ("language_code", "model"):
+                for name in ("language_code", "model", "keyterms"):
                     marker = f'name="{name}"\r\n\r\n'.encode()
                     if marker in body:
                         fields[name] = body.split(marker, 1)[1].split(b"\r\n", 1)[0].decode()

@@ -1,6 +1,8 @@
 """Clickable result list used for files, projects and recent items.
 
-Each row: a kind badge, the name, how long ago, the folder, and why it matched.
+Each row: a file-type icon, the name, how long ago, the folder, and why it matched
+(faint pills). The selection is a soft pill that glides between rows; rows fade in
+when the list changes (look only, from ``ui/style.py``).
 Double-click / Enter opens; the context menu also offers "Show in folder" and
 "Copy path". Painting is cheap (no I/O); data comes from the engine.
 """
@@ -14,14 +16,17 @@ from typing import Any
 
 from PySide6.QtCore import (
     QAbstractListModel,
+    QEasingCurve,
     QModelIndex,
     QPersistentModelIndex,
     QRect,
+    QRectF,
     QSize,
     Qt,
+    QVariantAnimation,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPaintEvent
+from PySide6.QtGui import QColor, QFontMetrics, QGuiApplication, QPainter, QPaintEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QListView,
@@ -94,8 +99,17 @@ class ResultsModel(QAbstractListModel):
         return None
 
 
+FADE_MS = 160  # (look) each row fades in...
+STAGGER_MS = 15  # ...a little after the one above
+GLIDE_MS = 120  # the selection pill moves to the new row
+
+
 class ResultsDelegate(QStyledItemDelegate):
     ROW_H = 54
+
+    def __init__(self, view: ResultsView) -> None:
+        super().__init__(view)
+        self.view = view
 
     def sizeHint(self, option: QStyleOptionViewItem, index: _Index) -> QSize:
         return QSize(option.rect.width(), self.ROW_H)
@@ -104,55 +118,71 @@ class ResultsDelegate(QStyledItemDelegate):
         it: Item | None = index.data(ItemRole)
         if it is None:
             return
+        v = self.view
+        t = v.theme
         p.save()
-        r: QRect = option.rect
-        selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        if selected:
-            p.fillRect(r, QColor(*style.ACCENT_RGBA, style.SELECTION_ALPHA))
-        # badge
-        letter, color = BADGES.get(it.kind, BADGES["other"])
-        badge = QRect(r.left() + 12, r.top() + 13, 28, 28)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(v.row_alpha(index.row()))
+        r: QRect = option.rect
+        if option.state & QStyle.StateFlag.State_MouseOver and not (
+            option.state & QStyle.StateFlag.State_Selected
+        ):
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(*t.hover))
+            p.drawRoundedRect(QRectF(r).adjusted(2, 2, -2, -2), 10, 10)
+        # icon (thin line drawing in a faint tile)
+        name_icon, color = style.icon_for(it.kind, it.path)
+        tile = QRectF(r.left() + 12, r.top() + 13, 28, 28)
+        tint = QColor(color)
+        tint.setAlpha(34)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(color))
-        p.drawRoundedRect(badge, 7, 7)
-        p.setPen(QColor(style.BADGE_TEXT))
-        bf = QFont(option.font)
-        bf.setBold(True)
-        p.setFont(bf)
-        p.drawText(badge, Qt.AlignmentFlag.AlignCenter, letter)
+        p.setBrush(tint)
+        p.drawRoundedRect(tile, 8, 8)
+        dpr = v.devicePixelRatioF()
+        p.drawPixmap(
+            int(tile.left()) + 5, int(tile.top()) + 5, style.icon_pixmap(name_icon, color, 18, dpr)
+        )
         # text
-        left = badge.right() + 12
+        left = int(tile.right()) + 12
         right = r.right() - 12
         when = ago(it.ts)
-        nf = QFont(option.font)
-        nf.setPointSizeF(nf.pointSizeF() * 1.05)
-        nf.setBold(True)
+        nf = style.font(option.font, 1.04)
         fm = QFontMetrics(nf)
-        tf = QFont(option.font)
-        tf.setPointSizeF(tf.pointSizeF() * 0.85)
+        tf = style.font(option.font, 0.86)
         tfm = QFontMetrics(tf)
         when_w = tfm.horizontalAdvance(when) + 4 if when else 0
-        text_color = option.palette.text().color()
-        dim = QColor(text_color)
-        dim.setAlpha(150)
         p.setFont(nf)
-        p.setPen(text_color)
+        p.setPen(QColor(t.text))
         name = fm.elidedText(it.name, Qt.TextElideMode.ElideMiddle, right - left - when_w - 8)
-        p.drawText(QRect(left, r.top() + 7, right - left, fm.height()), 0, name)
+        p.drawText(QRect(left, r.top() + 8, right - left, fm.height()), 0, name)
         p.setFont(tf)
-        p.setPen(dim)
+        p.setPen(QColor(t.dim))
         if when:
-            p.drawText(QRect(right - when_w, r.top() + 9, when_w, tfm.height()),
+            p.drawText(QRect(right - when_w, r.top() + 10, when_w, tfm.height()),
                        int(Qt.AlignmentFlag.AlignRight), when)  # fmt: skip
         if it.kind in ("topic", "session"):
-            sub = ""  # not a place on disk: the "why" line says what it is
+            sub = ""  # not a place on disk: the "why" pills say what it is
         else:
             sub = short_path(it.path) if it.kind == "project" else short_folder(it.path)
-        extra = " · ".join([*it.why[:2], it.detail] if it.detail else it.why[:2])
-        line2 = f"{sub}   {extra}" if extra and sub else (extra or sub)
-        line2 = tfm.elidedText(line2, Qt.TextElideMode.ElideMiddle, right - left)
-        p.drawText(QRect(left, r.top() + 9 + fm.height(), right - left, tfm.height()), 0, line2)
+        y2 = r.top() + 10 + fm.height()
+        x = left
+        if sub:
+            sub_w = min(tfm.horizontalAdvance(sub) + 6, int((right - left) * 0.55))
+            p.drawText(QRect(x, y2, sub_w, tfm.height()), 0,
+                       tfm.elidedText(sub, Qt.TextElideMode.ElideMiddle, sub_w))  # fmt: skip
+            x += sub_w + 8
+        for why in [w for w in ([*it.why[:2], it.detail] if it.detail else it.why[:2]) if w]:
+            if x > right - 40:
+                break
+            text = tfm.elidedText(why, Qt.TextElideMode.ElideRight, min(240, right - x - 14))
+            pw = tfm.horizontalAdvance(text) + 14
+            pill = QRectF(x, y2 - 1, pw, tfm.height() + 2)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(*t.hover))
+            p.drawRoundedRect(pill, pill.height() / 2, pill.height() / 2)
+            p.setPen(QColor(t.dim))
+            p.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), text)
+            x += int(pw) + 6
         p.restore()
 
 
@@ -167,6 +197,21 @@ class ResultsView(QListView):
         self.results = ResultsModel()
         self.setModel(self.results)
         self.setItemDelegate(ResultsDelegate(self))
+        # (look) theme, hover, row fade-in and the gliding selection pill
+        self.theme = style.theme()
+        self.setMouseTracking(True)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self.setStyleSheet("QListView { background: transparent; }")
+        self._shown_at = 0.0
+        self._fade = QVariantAnimation(self)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.valueChanged.connect(lambda _v: self.viewport().update())
+        self._pill_y = -1.0  # where the selection pill is drawn (glides to the row)
+        self._glide = QVariantAnimation(self)
+        self._glide.setDuration(GLIDE_MS)
+        self._glide.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._glide.valueChanged.connect(self._glide_to)
         self.setUniformItemSizes(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -178,7 +223,42 @@ class ResultsView(QListView):
         self.customContextMenuRequested.connect(self._menu)
         self.menu_open = False
 
+    def set_theme(self, t: style.Theme) -> None:
+        self.theme = t
+        self.viewport().update()
+
+    def row_alpha(self, row: int) -> float:
+        """(look) rows fade in one after another when the list changes."""
+        if self._fade.state() != QVariantAnimation.State.Running:
+            return 1.0
+        ms = (time.monotonic() - self._shown_at) * 1e3 - row * STAGGER_MS
+        return max(0.0, min(1.0, ms / FADE_MS))
+
+    def _glide_to(self, v: object) -> None:
+        self._pill_y = float(v)  # type: ignore[arg-type]
+        self.viewport().update()
+
+    def currentChanged(self, current: QModelIndex, previous: QModelIndex) -> None:  # type: ignore[override]
+        super().currentChanged(current, previous)
+        if not current.isValid():
+            self._pill_y = -1.0
+            return
+        y = float(self.visualRect(current).top())
+        if self._pill_y < 0 or not previous.isValid():
+            self._pill_y = y  # (first selection: no glide)
+            self.viewport().update()
+            return
+        self._glide.stop()
+        self._glide.setStartValue(self._pill_y)
+        self._glide.setEndValue(y)
+        self._glide.start()
+
     def set_items(self, items: list[Item], selected: int | None = None) -> None:
+        if items and [i.path for i in items] != [i.path for i in self.results.items]:
+            self._shown_at = time.monotonic()
+            self._fade.stop()
+            self._fade.setDuration(FADE_MS + STAGGER_MS * min(len(items), 8))
+            self._fade.start()
         self.results.set_items(items)
         if selected is not None and 0 <= selected < len(items):
             self.select_row(selected)
@@ -218,5 +298,19 @@ class ResultsView(QListView):
             self.menu_open = False
 
     def paintEvent(self, e: QPaintEvent) -> None:
+        idx = self.currentIndex()
+        if idx.isValid():  # (look) the selection pill, under the rows
+            vp = QPainter(self.viewport())
+            vp.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = QRectF(self.visualRect(idx))
+            if self._glide.state() == QVariantAnimation.State.Running and self._pill_y >= 0:
+                r.moveTop(self._pill_y)
+            vp.setPen(Qt.PenStyle.NoPen)
+            vp.setBrush(QColor(*self.theme.select))
+            vp.drawRoundedRect(r.adjusted(2, 2, -2, -2), 10, 10)
+            accent = QColor(style.ACCENT)
+            vp.setBrush(accent)
+            vp.drawRoundedRect(QRectF(r.left() + 3, r.top() + 15, 3, r.height() - 30), 1.5, 1.5)
+            vp.end()
         super().paintEvent(e)
         self.painted.emit()

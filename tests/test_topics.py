@@ -3,6 +3,7 @@ through the handler. Synthetic vectors stand in for the embedding model."""
 
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -219,9 +220,14 @@ def test_handler_timeline_and_resume_ask_before_reopening(
     assert r2.say.endswith("Reopen them?") and not fake_platform.opened
     assert [i.name for i in r2.items] == ["pipeline.py", "pyproject.toml", "notes.md"]
     r3 = h.submit("yes")
-    assert r3.say == "Reopened 3 files."
-    assert sorted(p.name for p in fake_platform.opened) == ["notes.md", "pipeline.py",
-                                                            "pyproject.toml"]  # fmt: skip
+    if sys.platform == "win32":  # opening a .py runs it there: shown in its folder instead
+        assert r3.say == "Reopened 2 of 3 files."
+        assert fake_platform.revealed == [p for p in fake_platform.revealed
+                                          if p.name == "pipeline.py"]  # fmt: skip
+    else:
+        assert r3.say == "Reopened 3 files."
+        assert sorted(p.name for p in fake_platform.opened) == ["notes.md", "pipeline.py",
+                                                                "pyproject.toml"]  # fmt: skip
     # "resume where I left off" -> proposes; "no" -> nothing opens; "yes" alone -> nothing.
     fake_platform.opened.clear()
     r4 = h.submit("resume where I left off")

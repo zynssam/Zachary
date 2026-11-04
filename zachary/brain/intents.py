@@ -87,6 +87,131 @@ QUESTION_ANYWHERE = frozenset("kab kitna kitni kitne kaunsa kaunsi kyun yaavaga 
 FILE_ASK_WORDS = frozenset(
     "file files folder folders document documents doc docs pdf pdfs where kahan kidhar elli".split()
 )
+# Counting / sizes, answered from the index (never the LLM): "how many pdfs do I have".
+STAT_THINGS = frozenset(
+    """
+    file files document documents doc docs pdf pdfs photo photos picture pictures image
+    images pic pics video videos movie movies song songs music audio folder folders
+    directory directories project projects topic topics code script scripts space storage
+    size gb mb spreadsheet spreadsheets presentation presentations slides
+    """.split()
+)
+_EXT_WORD = re.compile(
+    r"\b(pdf|docx?|pptx?|xlsx?|csv|txt|md|zip|py|js|ts|java|cpp|jpe?g|png|mp4|mp3)s?\b"
+)
+# Cleaning / organizing (Phase 7): always a plan to review, never an action.
+CLEAN_WORDS = frozenset(
+    """
+    clean cleanup clear declutter tidy duplicates duplicate dupes junk safai saaf
+    """.split()
+)
+ORGANIZE_WORDS = frozenset("organize organise arrange sort jamao lagao group".split())
+UNDO_WORDS = frozenset("undo revert".split())
+REMOVE_VERBS = frozenset("remove delete trash hatao hata nikalo bin".split())
+# What a clean-up can be about ("remove old installers", "delete empty folders").
+CLEAN_TARGETS = frozenset(
+    """
+    duplicates duplicate dupes installer installers setup setups empty junk temp temporary
+    large big huge
+    """.split()
+)
+PLAN_FILLER = frozenset(
+    """
+    clean cleanup clear up declutter tidy organize organise arrange sort out jamao lagao karo
+    kar do my mine me the a an all of in on please stuff things files file folder folders
+    together into one place group everything some free space safai saaf undo revert that last
+    this it cleanup changes change find show remove delete trash hatao hata nikalo bin
+    """.split()
+)
+LOCATE_LEAD = frozenset("which where wich kaunsa kaunsi kahan kidhar".split())
+# Creating files/folders and dictation (new files only; never changes existing ones).
+CREATE_VERBS = frozenset("create make new start banao bana banana write".split())
+CREATE_THINGS = frozenset(
+    """
+    file document doc docx note notes folder directory txt textfile notepad markdown md word
+    """.split()
+)
+PASTE_WORDS = frozenset("paste pasted copied clipboard copy".split())
+DICTATE_WORDS = frozenset("dictate dictation dictating likh likho".split())
+# "take notes", "note down what I say", "write what I say"
+_DICTATE_PHRASES = ("take notes", "note down", "write what i say", "type what i say",
+                    "write down what i say", "i'll speak", "i will speak")  # fmt: skip
+STOP_DICTATION = re.compile(
+    r"\b(stop|end|finish|done|close)\s+(the\s+)?(dictation|dictating)\b|\bdone dictating\b"
+    r"|\bdictation (band|khatam|stop)\b",
+    re.IGNORECASE,
+)
+CANCEL_DICTATION = re.compile(r"\b(cancel|discard|abort)\s+(the\s+)?dictation\b", re.I)
+NEW_PARAGRAPH = re.compile(r"\b(?:new|next)\s+(?:paragraph|line)\b[.,!]?", re.IGNORECASE)
+SCRATCH_THAT = re.compile(r"^\s*(scratch that|delete that|undo that)[.!]?\s*$", re.I)
+
+
+@dataclass(frozen=True, slots=True)
+class CreateSpec:
+    what: str  # file | folder
+    fmt: str  # docx | txt | md
+    name: str  # as said ("Hackathon Ideas"), "" = from the content
+    place: str  # "downloads" / "the zachary project" / "" (= sorted into Documents/Zachary)
+    paste: bool  # content = what was copied last
+    dictate: bool  # content = what you say next, until "stop dictation"
+    content: str  # "... saying hello world"
+
+
+_NAME_RE = re.compile(
+    r"\b(?:called|named|titled|name it|naam)\s+[\"“']?(.+?)[\"”']?"
+    r"(?=\s+(?:in|inside|into|on|at|with|and|containing|saying|that says|mein)\b|[.,!?]?$)",
+    re.IGNORECASE,
+)
+_CONTENT_RE = re.compile(
+    r"\b(?:saying|that says|containing|with the text|with text|which says)\s+(.+)$",
+    re.IGNORECASE,
+)
+_PLACE_RE = re.compile(
+    r"\b(?:in|inside|into|on)\s+(?:my\s+|the\s+)?([\w .'-]+?)(?:\s+(?:folder|directory))?"
+    r"(?=\s+(?:and|with|called|named|containing|saying)\b|[.,!?]?$)",
+    re.IGNORECASE,
+)
+
+
+def parse_create(text: str) -> CreateSpec:
+    """Details of "create a text file called todo in downloads and paste what I copied"."""
+    low = text.lower()
+    toks = tokenize(text)
+    what = "folder" if any(t in {"folder", "directory"} for t in toks) and not any(
+        t in {"file", "document", "doc", "note", "txt", "docx", "markdown"} for t in toks
+    ) else "file"  # fmt: skip
+    fmt = "docx"
+    if "text file" in low or any(t in {"txt", "textfile", "notepad", "plain"} for t in toks):
+        fmt = "txt"
+    elif any(t in {"markdown", "md"} for t in toks):
+        fmt = "md"
+    m = _NAME_RE.search(text)
+    name = m.group(1).strip() if m else ""
+    c = _CONTENT_RE.search(text)
+    content = c.group(1).strip() if c and not name.endswith(c.group(1)) else ""
+    place = ""
+    for pm in _PLACE_RE.finditer(text):
+        cand = pm.group(1).strip()
+        low_c = cand.lower()
+        if low_c not in {"it", "that", "this", "there"} and not low_c.startswith(
+            ("a ", "an ", "new ", "the new ")
+        ):
+            place = cand  # the last "in X" wins ("... called notes in downloads")
+    if name and place and place in name:
+        place = ""
+    dictate = any(t in DICTATE_WORDS for t in toks) or any(p in low for p in _DICTATE_PHRASES)
+    paste = any(t in PASTE_WORDS for t in toks)
+    return CreateSpec(what, fmt, name, place, paste, dictate, content)
+
+
+def needs_clipboard(text: str) -> bool:
+    """True when this request uses what was copied (read only then)."""
+    toks = tokenize(text)
+    return any(t in PASTE_WORDS for t in toks) and (
+        any(t in CREATE_VERBS for t in toks) or any(t in CREATE_THINGS for t in toks)
+    )
+
+
 # "explain the last project I was working on", "summarize my dsa notes", "tell me about it"
 EXPLAIN_WORDS = frozenset(
     "explain summarize summarise summary describe overview recap samjhao samjha samjhana".split()
@@ -152,7 +277,8 @@ _FUZZY_VOCAB = sorted(
     {"open", "launch", "find", "search", "locate", "show", "list", "display", "projects",
      "project", "repository", "repositories", "recent", "recently", "folder", "directory",
      "first", "second", "third", "fourth", "fifth", "older", "newer", "latest",
-     "related", "similar", "explain", "summarize", "describe"}
+     "related", "similar", "explain", "summarize", "describe", "clean", "organize",
+     "duplicates", "undo"}
 )  # fmt: skip
 _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show", "list", "display"})
 
@@ -160,11 +286,16 @@ _VERB_TARGETS = frozenset({"open", "launch", "find", "search", "locate", "show",
 @dataclass(frozen=True, slots=True)
 class Intent:
     kind: str  # open|find|show_projects|recent|select|reveal|older|newer|related|topic|
-    #            resume|timeline|confirm|cancel|ask|explain|none
+    #            resume|timeline|confirm|cancel|ask|explain|clean|organize|undo|create|
+    #            dictate|stats|notes|none
     query: str = ""  # text to search (time phrases included; search parses them)
     ordinal: int | None = None  # 1-based; -1 = last
     action: str = "open"  # for follow-ups: open | reveal
     project_hint: bool = False  # "open the zachary project" -> prefer project folders
+    # "open zachary in vscode": the possible app ("vscode") and what to open with it
+    # ("zachary"). The handler checks the app is installed; otherwise it's a search.
+    app: str = ""
+    target: str = ""
     confidence: float = 1.0
     corrected: dict[str, str] = field(default_factory=dict)
 
@@ -246,6 +377,31 @@ def _ordinal(tokens: list[str]) -> tuple[int | None, set[int]]:
 _QUESTION_TYPOS = {"whn": "when", "wen": "when", "wat": "what", "wht": "what", "hw": "how"}
 
 
+_NOTES_FILLER = frozenset(
+    "please zach zack hey the my a an zachary zacharys app application window now up".split()
+)
+_NOTES_OPEN = {("notes",), ("note",), ("open", "notes"), ("open", "note"), ("show", "notes"),
+               ("launch", "notes"), ("start", "notes")}  # fmt: skip
+_NOTES_NEW = {("new", "note"), ("create", "note"), ("create", "new", "note"), ("make", "note"),
+              ("make", "new", "note"), ("start", "new", "note"), ("open", "new", "note"),
+              ("write", "note"), ("new", "notes")}  # fmt: skip
+_NOTES_DICTATE = {("take", "note"), ("dictate", "note"), ("dictate", "new", "note")}
+
+
+def notes_action(toks: list[str]) -> str:
+    """ "open | new | dictate" for the notes app, "" for anything else. Opening needs a
+    clear sign it's the app ("notes app", "my notes", "Zachary notes"): plain "open
+    notes" may be a file called notes."""
+    core = tuple(t for t in toks if t not in _NOTES_FILLER)
+    if core in _NOTES_DICTATE:
+        return "dictate"
+    if core in _NOTES_NEW:
+        return "new"
+    if core in _NOTES_OPEN and any(t in {"app", "application", "my", "zachary"} for t in toks):
+        return "open"
+    return ""
+
+
 def parse(text: str) -> Intent:
     raw = tokenize(text)
     if raw and raw[0] in _QUESTION_TYPOS:
@@ -287,6 +443,16 @@ def parse(text: str) -> Intent:
     ):
         return Intent("confirm", confidence=conf, corrected=corrected)
 
+    # --- Zachary's own notes app ("open my notes", "new note", "take a note") -----------
+    notes = notes_action(toks)
+    if notes:
+        return Intent("notes", query=text.strip(), action=notes, confidence=conf,
+                      corrected=corrected)  # fmt: skip
+
+    # "new document" / "new text file": a new file, not "the newer one".
+    if toks[0] == "new" and len(toks) <= 3 and any(t in CREATE_THINGS for t in toks[1:]):
+        return Intent("create", query=text.strip(), confidence=conf, corrected=corrected)
+
     # --- follow-ups: nothing but command words, ordinals and filler ---------------
     content = [
         t for i, t in enumerate(toks)
@@ -318,6 +484,57 @@ def parse(text: str) -> Intent:
         and any(t in NO_WORDS for t in toks)
     ):
         return Intent("cancel", confidence=conf, corrected=corrected)
+
+    # --- "which project was I working on about crime scenes", "where is my resume",
+    # "which file has my marks": the LLM picks among your things; then it's opened -----
+    if toks[0] in LOCATE_LEAD and len(toks) >= 3 and not has_open:
+        tr = parse_time(" ".join(toks)).range
+        about = any(t in {"about", "regarding", "related", "wala", "wali"} for t in toks)
+        if tr is not None and not about:  # "which project was I working on yesterday"
+            return Intent("timeline", query=" ".join(toks), confidence=conf,
+                          corrected=corrected)  # fmt: skip
+        is_project = any(t in PROJECT_WORDS or t in FOLDER_WORDS for t in toks)
+        return Intent("ask", query=text.strip(), action="locate", project_hint=is_project,
+                      confidence=conf, corrected=corrected)  # fmt: skip
+
+    # --- create a file / folder, dictation ---------------------------------------------
+    joined_low = " ".join(toks)
+    wants_dictation = any(t in DICTATE_WORDS for t in toks) or any(
+        p in joined_low for p in _DICTATE_PHRASES
+    )
+    makes = any(t in CREATE_VERBS for t in toks) and any(t in CREATE_THINGS for t in toks)
+    if wants_dictation and not has_open:
+        return Intent("dictate", query=text.strip(), confidence=conf, corrected=corrected)
+    if makes and not has_open and not any(t in CLEAN_WORDS for t in toks):
+        return Intent("create", query=text.strip(), confidence=conf, corrected=corrected)
+    if any(t in PASTE_WORDS for t in toks) and any(t in CREATE_THINGS for t in toks):
+        return Intent("create", query=text.strip(), confidence=conf, corrected=corrected)
+
+    # --- clean / organize / undo: destructive -> always a plan (CLAUDE.md) ---------------
+    if any(t in UNDO_WORDS for t in toks) and not any(t in ORGANIZE_WORDS for t in toks):
+        return Intent("undo", confidence=conf, corrected=corrected)
+    free_space = "free" in toks and "space" in toks
+    remove_kind = any(t in REMOVE_VERBS for t in toks) and any(t in CLEAN_TARGETS for t in toks)
+    if (any(t in CLEAN_WORDS for t in toks) or free_space or remove_kind) and not has_open:
+        rest = [t for t in toks if t not in PLAN_FILLER]
+        return Intent("clean", query=" ".join(rest), confidence=conf, corrected=corrected)
+    if any(t in ORGANIZE_WORDS for t in toks):
+        rest = [t for t in toks if t not in PLAN_FILLER]
+        return Intent("organize", query=" ".join(rest), confidence=conf, corrected=corrected)
+
+    # --- a question about a project ("what is the zachary project about", "how do I run
+    # my hackfest project", "what does this project do"): answered from its files -------
+    asks = toks[0] in QUESTION_LEAD or text.strip().endswith("?")
+    # Singular: one project ("what is the zachary project about"). "projects" asks for
+    # a list ("what are my projects", "which projects did I work on").
+    names_project = any(t in {"project", "repo", "repository"} for t in toks)
+    counting_projects = "many" in toks and any(
+        toks[i + 1] in PROJECT_WORDS for i, t in enumerate(toks[:-1]) if t == "many"
+    )  # "how many projects do I have" is a count
+    listing = any(t in SHOW_VERBS or t in {"list", "all"} for t in toks)
+    if asks and names_project and not counting_projects and not listing and len(toks) >= 3:
+        return Intent("ask", query=text.strip(), project_hint=True, confidence=conf,
+                      corrected=corrected)  # fmt: skip
 
     # --- explain / summarize a project, topic or the shown item ---------------------------
     tell_about = "tell" in toks and "about" in toks
@@ -393,6 +610,13 @@ def parse(text: str) -> Intent:
             return Intent("related", ordinal=ordinal, confidence=conf, corrected=corrected)
         return Intent("related", query=" ".join(rest), confidence=conf, corrected=corrected)
 
+    # --- stats: "how many files / pdfs / projects do I have", "how much space ..." -----
+    joined_q = " ".join(toks)
+    count_q = joined_q.startswith(("how many", "how much", "number of", "count ", "total "))
+    count_q = count_q or any(t in {"kitne", "kitni", "kitna", "eshtu", "yestu"} for t in toks)
+    if count_q and (any(t in STAT_THINGS for t in toks) or _EXT_WORD.search(joined_q)):
+        return Intent("stats", query=joined_q, confidence=conf, corrected=corrected)
+
     # --- projects -------------------------------------------------------------------
     if any(t in PROJECT_WORDS for t in toks):
         rest = [t for t in toks if t not in PROJECT_WORDS and t not in PROJECT_FILLER
@@ -401,8 +625,14 @@ def parse(text: str) -> Intent:
         if not rest:
             return Intent("show_projects", confidence=conf, corrected=corrected)
         query = " ".join(t for t in raw if corrected.get(t, t) not in verbs and t not in FILLER)
+        target, app = ("", "")
+        if has_open:  # split before filler removal ("in" is a filler word)
+            target, app = split_app(" ".join(t for t in raw if corrected.get(t, t) not in verbs))
+            target = " ".join(
+                t for t in target.split() if t not in PROJECT_WORDS and t not in FILLER
+            )
         return Intent("open" if has_open else "find", query=query, project_hint=True,
-                      confidence=conf, corrected=corrected)  # fmt: skip
+                      confidence=conf, corrected=corrected, app=app, target=target)  # fmt: skip
 
     # --- recent ---------------------------------------------------------------------
     tp = parse_time(" ".join(toks))
@@ -430,19 +660,68 @@ def parse(text: str) -> Intent:
     # --- open / find ----------------------------------------------------------------
     query = _strip_lead(" ".join(t for t, f in zip(raw, toks, strict=True) if f not in verbs))
     if has_open:
-        return Intent("open", query=query, confidence=conf, corrected=corrected)
+        target, app = split_app(query)
+        return Intent("open", query=query, confidence=conf, corrected=corrected, app=app,
+                      target=target)  # fmt: skip
     if has_find or has_show:
         return Intent("find", query=query, confidence=conf, corrected=corrected)
     return Intent("find", query=query, confidence=min(conf, 0.6), corrected=corrected)
 
 
+_APP_SEP = frozenset("in with using via mein me se".split())
+
+
+def split_app(query: str) -> tuple[str, str]:
+    """("zachary in vscode") -> ("zachary", "vscode"); ("", "") if there's no split.
+    The app part is 1-3 words after the last "in" / "with" / "using" / "mein"."""
+    toks = query.split()
+    # Hindi order: "zachary ko vscode mein (kholo)": the app comes before "mein"/"se".
+    if len(toks) >= 3 and toks[-1] in {"mein", "me", "se"}:
+        body = toks[:-1]
+        if "ko" in body:
+            k = len(body) - 1 - body[::-1].index("ko")
+            head, app = body[:k], body[k + 1 :]
+        else:
+            head, app = body[:-1], body[-1:]
+        if head and 1 <= len(app) <= 3:
+            return " ".join(head), " ".join(app)
+    for i in range(len(toks) - 1, 0, -1):
+        if toks[i] in _APP_SEP and 1 <= len(toks) - i - 1 <= 3:
+            head = [t for t in toks[:i] if t not in {"ko", "the", "my", "folder", "file"}]
+            if head:
+                return " ".join(head), " ".join(toks[i + 1 :])
+    return "", ""
+
+
 _LEAD = frozenset("hey ok okay zach zachary please pls plz can could would you".split())
 
 
+_WAKE = frozenset({"zach", "zachary"})
+_COMMAND_START = (
+    OPEN_VERBS
+    | FIND_VERBS
+    | SHOW_VERBS
+    | frozenset(
+        "please can could what when how who where which clean organize undo make create explain"
+        " summarize tell".split()
+    )
+)
+
+
 def _lead_fillers(tokens: list[str]) -> int:
+    """Leading "hey zach, please ..." words. "zach(ary)" counts as the wake word only
+    after hey/ok or right before a command ("zachary open fee receipt"), not when it's
+    the thing to open ("zachary ko vscode mein kholo" = the Zachary project)."""
     n = 0
-    for t in tokens:
-        if t in _LEAD:
+    for i, t in enumerate(tokens):
+        if t in _WAKE:
+            prev_greet = i > 0 and tokens[i - 1] in {"hey", "ok", "okay", "hi", "hello"}
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            before_command = nxt in _COMMAND_START
+            if not (prev_greet or before_command):
+                break
+            n += 1
+        elif t in _LEAD:
             n += 1
         else:
             break
@@ -451,6 +730,6 @@ def _lead_fillers(tokens: list[str]) -> int:
 
 def _strip_lead(query: str) -> str:
     toks = query.split()
-    while toks and toks[0] in _LEAD:
+    while toks and toks[0] in _LEAD and toks[0] not in _WAKE:
         toks.pop(0)
     return " ".join(toks)

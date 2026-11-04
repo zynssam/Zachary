@@ -20,6 +20,8 @@ from zachary.search.hybrid import STOPWORDS, search
 from zachary.search.tokens import words
 from zachary.search.vectors import SemanticSearch
 
+GROUNDED_MIN = 0.3  # all question words in a passage this relevant: about your files
+NAMED_MIN = 0.4  # ... or a question word in the best file's name
 CANDIDATE_FILES = 12  # from hybrid search (plus older versions of the top ones)
 MAX_FILES = 30
 TOP_PASSAGES = 4  # sent to the LLM / shown
@@ -55,6 +57,7 @@ class Passage:
     text: str  # the whole chunk (<= ~1,000 characters)
     snippet: str  # the part to show
     score: float
+    coverage: float = 0.0  # share of the question's words found in this passage
 
 
 def question_terms(question: str) -> list[str]:
@@ -130,6 +133,51 @@ def _candidates(
     return ids[:MAX_FILES]
 
 
+FOLDER_FILES = 120  # files of a project scored for a question (docs first)
+_DOC_EXT = (".md", ".txt", ".rst", ".pdf", ".docx", ".pptx")
+_BUILD_DIRS = frozenset("build dist out target .venv venv __pycache__ node_modules .git".split())
+_NOT_DOCS = frozenset(
+    "sources.txt top_level.txt dependency_links.txt requires.txt pkg-info license license.txt"
+    " license.md".split()
+)
+
+
+def _folder_candidates(conn: sqlite3.Connection, folder: str, terms: list[str]) -> list[int]:
+    """Files inside ``folder`` that have text: READMEs, then docs, then files whose name
+    has a question word, then the most recently changed ones."""
+    f = folder.rstrip("/\\")
+    sep = "\\" if "\\" in f and "/" not in f else "/"
+    lo, hi = f + sep, f + chr(ord(sep) + 1)
+    rows = conn.execute(
+        """SELECT f.id, f.name, f.mtime, f.path FROM files f
+           WHERE f.path >= ? AND f.path < ? AND f.is_dir = 0
+             AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+           ORDER BY f.mtime DESC LIMIT 2000""",
+        (lo, hi),
+    ).fetchall()
+    stems = [_stem(t) for t in terms]
+
+    def build_output(path: str) -> bool:
+        parts = path[len(lo) :].replace("\\", "/").split("/")[:-1]
+        return any(x.endswith(".egg-info") or x in _BUILD_DIRS for x in parts)
+
+    def rank(r: tuple[int, str, float, str]) -> tuple[int, int, float]:
+        n = r[1].lower()
+        depth = r[3][len(lo) :].replace("\\", "/").count("/")
+        if n.startswith("readme"):
+            pri = 0
+        elif n.endswith(_DOC_EXT) and n not in _NOT_DOCS:
+            pri = 1
+        elif any(s in n for s in stems):
+            pri = 2
+        else:
+            pri = 3
+        return (pri, depth, -r[2])  # top-level docs (claude.md) before deep ones
+
+    rows = [r for r in rows if not build_output(r[3]) and r[1].lower() not in _NOT_DOCS]
+    return [r[0] for r in sorted(rows, key=rank)[:FOLDER_FILES]]
+
+
 def retrieve(
     conn: sqlite3.Connection,
     question: str,
@@ -137,10 +185,16 @@ def retrieve(
     semantic: SemanticSearch | None = None,
     rules: PathRules | None = None,
     k: int = TOP_PASSAGES,
+    within: str | None = None,
 ) -> list[Passage]:
-    """The best passages for ``question``, best first (at most ``PER_FILE`` per file)."""
+    """The best passages for ``question``, best first (at most ``PER_FILE`` per file).
+    ``within``: only files inside this folder (a project), docs and READMEs first."""
     terms = question_terms(question)
-    ids = _candidates(conn, question, terms, semantic, rules)
+    ids = (
+        _folder_candidates(conn, within, terms)
+        if within
+        else _candidates(conn, question, terms, semantic, rules)
+    )
     if not ids:
         return []
     marks = ",".join("?" * len(ids))
@@ -178,12 +232,11 @@ def retrieve(
             excluded[fid] = rules is not None and rules.is_excluded(path, False)
         if excluded[fid]:
             continue
+        cov = _word_hits(text, patterns)
         s = (
-            W_MEANING * float(meaning[i])
-            + W_WORDS * _word_hits(text, patterns)
-            + W_RANK * (1.0 - rank[fid] / len(ids))
+            W_MEANING * float(meaning[i]) + W_WORDS * cov + W_RANK * (1.0 - rank[fid] / len(ids))
         ) * (1.0 if code_q else KIND_WEIGHT.get(kind, 0.9))
-        scored.append(Passage(fid, path, name, kind, float(mtime), cid, text, "", s))
+        scored.append(Passage(fid, path, name, kind, float(mtime), cid, text, "", s, cov))
     scored.sort(key=lambda p: -p.score)
     # Several files before a second passage from the same file: one file that happens
     # to repeat the question's words mustn't crowd out the others.
@@ -204,3 +257,22 @@ def retrieve(
             out.append(p)
     out.sort(key=lambda p: -p.score)
     return out
+
+
+def name_hit(question: str, passage: Passage) -> bool:
+    """A question word in the file's name ("hackfest pitch" -> hackfest-pitch-deck.pptx)."""
+    name = words(passage.name.rsplit(".", 1)[0])
+    return any(any(n.startswith(_stem(t)) for n in name) for t in question_terms(question)
+               if len(t) >= 3)  # fmt: skip
+
+
+def about_files(question: str, passages: list[Passage], personal: bool) -> bool:
+    """Answer from the user's files (else it's a general question for the LLM)."""
+    if personal:
+        return True
+    if not passages:
+        return False
+    top = passages[0]
+    return (top.coverage >= 0.99 and top.score >= GROUNDED_MIN) or (
+        top.score >= NAMED_MIN and name_hit(question, top)
+    )

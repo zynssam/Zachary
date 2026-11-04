@@ -14,11 +14,12 @@ import queue
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from zachary.brain.handler import Reply
 from zachary.telemetry.latency import Timeline
 from zachary.ui.engine import Engine
+from zachary.ui.notes import NotesWindow
 from zachary.ui.quickbar import QuickBar
 from zachary.voice.audio import Player
 from zachary.voice.factory import VoiceKit
@@ -31,6 +32,11 @@ STATE_TEXT = {
     "listening": "Listening…",
     "thinking": "…",
 }
+
+
+REARM_MS = 150  # dictation: pause between a piece and listening again
+NOTE_MAX_SILENT = 3  # notes: stop listening after this many listens with nothing said
+DICTATION_PAUSE_MS = 1500  # dictation: a breath doesn't end a sentence, a real pause does
 
 
 class VoiceController(QObject):
@@ -70,6 +76,20 @@ class VoiceController(QObject):
         self.state.connect(self._on_state)
         self._status.connect(self.bar.status.setText)
         engine.replied.connect(self._on_reply)
+        # Voice dictation: listen again after each piece (after any spoken reply ended,
+        # so the speaker isn't recorded) until "stop dictation".
+        self.dictating = False
+        self._wake_opened = False  # the bar was opened by "Hey Zach" (not by you)
+        self.spoken.connect(self._rearm)
+        # The notes app: while its mic is on, speech is typed into the note (not run as
+        # a command); listening again after each piece until it's turned off.
+        self.note: NotesWindow | None = None
+        self._note_on = False
+        self._note_session = False  # the current listen is for the note
+        self._note_empty = 0
+        bar.notes_opened.connect(self._attach_notes)
+        if bar.notes is not None:
+            self._attach_notes(bar.notes)
 
     def start(self, source: FrameSource | None = None) -> None:
         self._source = source or self._source or MicSource(device=self.kit.mic_device)
@@ -82,6 +102,7 @@ class VoiceController(QObject):
             offline_stt=self.kit.offline_stt,
             spotter=self.kit.spotter,
             wake_word=self.wake_word,
+            fast_spotter=self.kit.fast_spotter,
         )
         self.listener.start()
         warm = getattr(self.kit.tts, "warm", None)
@@ -107,14 +128,70 @@ class VoiceController(QObject):
             with contextlib.suppress(Exception):
                 close()
 
-    def push_to_talk(self, hold: bool = False) -> None:
+    def push_to_talk(self, hold: bool = False, pause_ms: int | None = None) -> None:
         log.info("voice: push-to-talk%s", " (hold)" if hold else "")
         self._cancel_speech()  # talking over the reply interrupts it
         if self.listener is None or not self.listener.is_alive():
             log.warning("voice: listener was not running; restarting it")
             self.start()
         assert self.listener is not None
-        self.listener.push_to_talk(hold=hold)
+        self.listener.push_to_talk(hold=hold, pause_ms=pause_ms)
+
+    # -- notes app ---------------------------------------------------------------------
+    def _attach_notes(self, win: NotesWindow) -> None:
+        self.note = win
+        win.set_voice_available(True)
+        win.mic_toggled.connect(self._note_mic)
+
+    def _note_mic(self, on: bool) -> None:
+        self._note_on = on
+        self._note_empty = 0
+        if self.listener is not None:
+            self.listener.pause_wake(on)
+        if on:
+            self.dictating = False  # (a document dictation in the bar, if any, ends)
+            self._note_listen()
+        elif self._note_session and self.listener is not None:
+            self.listener.release()  # what was being said still goes into the note
+
+    def _note_listen(self) -> None:
+        if not self._note_on:
+            return
+        self._note_session = True
+        self.push_to_talk(pause_ms=DICTATION_PAUSE_MS)
+
+    def hotkey(self) -> None:
+        """The voice hotkey: toggles the note's mic when the notes window is in front,
+        otherwise push-to-talk in the bar."""
+        if self.note is not None and self.note.isVisible() and self.note.isActiveWindow():
+            self.note.mic_btn.toggle()
+        else:
+            self.push_to_talk()
+
+    def _note_heard(self, h: Heard) -> None:
+        self._note_session = False
+        win = self.note
+        h.timeline.info.update({"via": "note", "audio_s": h.audio_s})
+        h.timeline.finish(str(self.latency_path) if self.latency_path else None)
+        if win is None:
+            return
+        if h.text:
+            log.info("voice: note dictation %r", h.text)
+            self._note_empty = 0
+            if not win.insert_dictation(h.text):
+                self._note_on = False  # "stop dictation"
+                return
+        elif h.error is not None and h.error.kind not in {"bad_request"}:
+            win.stop_dictation(f"Stopped: {h.error}")
+            return
+        else:
+            self._note_empty += 1
+            if self._note_empty >= NOTE_MAX_SILENT:
+                win.stop_dictation("Stopped listening (nothing said)")
+                return
+        if self._note_on:
+            win.set_status("Listening… say “stop dictation” to finish")
+            QTimer.singleShot(REARM_MS, self._note_listen)
 
     def bar_visible(self, shown: bool) -> None:
         """Keep the mic warm (local buffer only) while the bar is open."""
@@ -139,8 +216,18 @@ class VoiceController(QObject):
     def _on_state(self, state: str) -> None:
         if state in ("listening", "thinking"):
             log.info("voice: %s", state)
+        if (self._note_session or self._note_on) and self.note is not None:  # into a note
+            if state == "listening":
+                self.note.set_status("Listening… say “stop dictation” to finish")
+            elif state == "thinking":
+                self.note.set_status("Typing…")
+            elif state.startswith("error"):
+                self.note.set_status(state)
+            return
         if state == "listening":
             if not self.bar.isVisible():
+                # opened by voice (e.g. "Hey Zach"), not by you: a false wake closes it again
+                self._wake_opened = True
                 self.bar.show_bar()
             held = self.listener is not None and self.listener._hold
             self.bar.status.setText("Listening… (release Space to send)" if held
@@ -154,6 +241,18 @@ class VoiceController(QObject):
             self.bar.status.setText(state)
 
     def _on_heard(self, h: Heard) -> None:
+        if self._note_session or self._note_on:  # dictating into a note: never a command
+            self._note_heard(h)
+            return
+        wake_opened, self._wake_opened = self._wake_opened, False
+        if not h.text and h.via == "wake" and wake_opened:
+            # Probably not "Hey Zach" at all (a similar word, the TV...): nothing was
+            # said after it, so close the bar again instead of showing an error.
+            log.info("voice: nothing after the wake word; closing the bar")
+            self.bar.hide()
+            h.timeline.info["error"] = "false_wake"
+            h.timeline.finish(str(self.latency_path) if self.latency_path else None)
+            return
         if not h.text:
             msg = str(h.error) if h.error else "I didn't catch that."
             log.info("voice: %s", msg)
@@ -181,6 +280,7 @@ class VoiceController(QObject):
         tl.mark("intent_search")
         tl.info["handler_ms"] = round(reply.ms, 1)
         tl.info["intent"] = reply.intent.kind
+        self.dictating = reply.dictating
         if not self.speak or not reply.say:
             self._done(tl)
             return
@@ -228,6 +328,14 @@ class VoiceController(QObject):
             tl.info["tts_error"] = e.kind
             self._status.emit(f"{text}  (couldn't speak: {e})")
         self._done(tl)
+
+    def _rearm(self, _rec: object = None) -> None:
+        if self.dictating:
+            QTimer.singleShot(REARM_MS, self._rearm_now)
+
+    def _rearm_now(self) -> None:
+        if self.dictating:
+            self.push_to_talk(pause_ms=DICTATION_PAUSE_MS)
 
     def _done(self, tl: Timeline) -> None:
         rec = tl.finish(str(self.latency_path) if self.latency_path else None)

@@ -11,25 +11,46 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Protocol
 
+from zachary.actions import creator, executor, planner
+from zachary.actions import undo as undo_mod
 from zachary.brain import qa
 from zachary.brain import sessions as sess
 from zachary.brain.context import Context, Item
-from zachary.brain.intents import Intent, parse, tokenize
+from zachary.brain.intents import (
+    CANCEL_DICTATION,
+    NEW_PARAGRAPH,
+    SCRATCH_THAT,
+    STOP_DICTATION,
+    CreateSpec,
+    Intent,
+    parse,
+    parse_create,
+    tokenize,
+)
 from zachary.brain.llm import LLM, Excerpt, LLMError
 from zachary.brain.timeparse import parse_time
+from zachary.brain.vocab import Vocabulary
+from zachary.brain.workspaces import rank as ws_rank
+from zachary.brain.workspaces import workspaces
 from zachary.core.config import Config, PathRules
+from zachary.core.platform import Platform
+from zachary.core.platform import apps as app_index
+from zachary.core.platform.apps import App
+from zachary.core.safety import creation_problem
 from zachary.indexer import clustering
 from zachary.indexer.projects import Project, list_projects
 from zachary.indexer.relations import related as related_files
 from zachary.search import feedback
-from zachary.search.hybrid import SearchResult, recent, search, search_terms
+from zachary.search.hybrid import KIND_HINTS, SearchResult, recent, search, search_terms
 from zachary.search.tokens import words
 from zachary.search.vectors import SemanticSearch
 
@@ -41,6 +62,29 @@ CLEAR_GAP = 0.12  # top score must beat the runner-up by 12% to act without aski
 # The LLM reads a command only when it's a sentence the parser couldn't place
 # (no command word) and the search found nothing convincing.
 ROUTE_MIN_WORDS = 4
+LOCATE_CANDIDATES = 8  # ranked locally, then the LLM picks among these
+LOCATE_DESC = 250  # characters of description per candidate sent to the LLM
+APP_MIN_SCORE = 0.75  # "spotfy" still finds Spotify ...
+APP_SURE_SCORE = 0.9  # ... but below this a file with that name wins
+CLEAN_CATEGORIES = {
+    "duplicates": "duplicate", "duplicate": "duplicate", "dupes": "duplicate",
+    "installer": "installer", "installers": "installer", "setup": "installer",
+    "setups": "installer", "empty": "empty_folder", "junk": "junk", "temp": "junk",
+    "temporary": "junk", "large": "large", "big": "large", "huge": "large",
+}  # fmt: skip
+STANDARD_FOLDERS = frozenset("downloads desktop documents pictures music videos".split())
+KIND_LABELS = {"document": "documents", "code": "code files", "image": "images",
+               "video": "videos", "audio": "audio files", "archive": "archives",
+               "binary": "programs", "other": "other files", "dir": "folders"}  # fmt: skip
+EXT_NAMES = {"py": "Python", "js": "JavaScript", "ts": "TypeScript", "md": "Markdown",
+             "java": "Java", "cpp": "C++"}  # fmt: skip
+EXT_ALIASES = {"python": "py", "javascript": "js", "typescript": "ts", "excel": "xlsx",
+               "powerpoint": "pptx", "word": "docx", "markdown": "md"}  # fmt: skip
+_EXT_RE = re.compile(
+    r"\b(pdf|docx?|pptx?|xlsx?|csv|txt|md|zip|py|js|ts|java|cpp|jpe?g|png|mp4|mp3|python"
+    r"|javascript|typescript|excel|powerpoint|markdown)s?\b",
+    re.I,
+)
 EXPLAIN_PASSAGES = 6
 LAST_WORDS = frozenset(
     "last latest recent recently current currently working worked doing now".split()
@@ -60,6 +104,12 @@ class Actions(Protocol):
 
     def reveal(self, item: Item) -> bool: ...
 
+    def launch(self, app_id: str) -> bool: ...
+
+    def open_with(self, app_id: str, item: Item) -> bool: ...
+
+    def open_created(self, path: Path) -> bool: ...
+
 
 @dataclass(slots=True)
 class Reply:
@@ -73,6 +123,10 @@ class Reply:
     ms: float = 0.0
     timings: dict[str, float] = field(default_factory=dict)
     detail: str = ""  # longer on-screen text (an answer's source passage)
+    plan_id: int = 0  # a clean/organize plan to review (the UI opens the review window)
+    plan: planner.Plan | None = None  # ...and the plan itself (no DB reads on the UI thread)
+    dictating: bool = False  # dictation mode is on (the UI keeps listening)
+    notes: str = ""  # open the notes app: open | new | dictate (submit only)
 
 
 def clear_winner(results: list[SearchResult] | list[Item]) -> bool:
@@ -138,6 +192,68 @@ def _item(r: SearchResult, conn: sqlite3.Connection | None = None) -> Item:
     return it
 
 
+_PARA_SPLIT = re.compile(NEW_PARAGRAPH.pattern, re.IGNORECASE)
+
+
+@dataclass(slots=True)
+class Dictation:
+    """A document being dictated: pieces of speech/typing, paragraphs on request."""
+
+    spec: CreateSpec
+    folder: Path | None
+    parts: list[str]
+    started: float
+
+    def add(self, text: str) -> None:
+        """Append speech/typing; "new paragraph" / "next line" starts a new paragraph."""
+        for i, piece in enumerate(_PARA_SPLIT.split(text)):
+            if i > 0:
+                self.parts.append("\n")
+            piece = piece.strip(" ,")
+            if piece:
+                # Speech comes in sentence-sized pieces, often without punctuation.
+                piece = piece[0].upper() + piece[1:]
+                if piece[-1] not in ".!?:;\"')":
+                    piece += "."
+                self.parts.append(piece)
+
+    def text(self) -> str:
+        out: list[str] = []
+        para: list[str] = []
+        for p in self.parts:
+            if p == "\n":
+                if para:
+                    out.append(" ".join(para))
+                    para = []
+            else:
+                para.append(p)
+        if para:
+            out.append(" ".join(para))
+        return "\n\n".join(out)
+
+    def tail(self, n: int = 600) -> str:
+        t = self.text()
+        return ("…" + t[-n:]) if len(t) > n else t
+
+
+# A question is about *your* things when it says so ("my fee", "mera result", "in my
+# notes", "which file ..."; not just "I": "how do I reverse a string" is general): then
+# it's answered from your files only. Otherwise it's a
+# general question, and only the question goes to the LLM.
+MY_WORDS = frozenset(
+    """
+    my mine our ours myself mera meri mere maine hamara hamari hamare apna apni apne nanna
+    nanage
+    file files document documents doc docs notes note pdf folder folders project projects
+    receipt receipts assignment assignments
+    """.split()
+)
+
+
+def about_my_files(question: str) -> bool:
+    return any(t in MY_WORDS for t in tokenize(question))
+
+
 def _inside(path: str, folder: str) -> bool:
     f = folder.rstrip("/\\")
     return path.startswith(f + "/") or path.startswith(f + "\\")
@@ -161,11 +277,18 @@ class Handler:
         config: Config,
         semantic: Callable[[], SemanticSearch | None] | None = None,
         llm: Callable[[], LLM | None] | None = None,
+        platform: Platform | None = None,
     ) -> None:
         self.conn = conn
         self.actions = actions
         self.config = config
+        # Needed only to run approved clean/organize plans (trash / restore).
+        self.platform = platform or getattr(actions, "platform", None)
         self.context = Context()
+        # Follow-ups refer to the last list you settled on, not to partial words: see
+        # _settle. (preview text, the context it showed) / the context that counts.
+        self._shown: tuple[str, Context] | None = None
+        self._committed: Context | None = None
         self._rules: PathRules | None = None
         self._rules_rev = -1
         self._semantic_provider = semantic
@@ -173,6 +296,10 @@ class Handler:
         self._semantic_tried = 0.0
         self._llm_provider = llm
         self._last_strong = False  # did the last search have a strong top match?
+        self._open_with: App | None = None  # "which one?" for "open X in <app>"
+        self._clipboard: str | None = None
+        self._vocab: Vocabulary | None = None
+        self.dictation: Dictation | None = None
         self._sessions: dict[int, sess.Session] = {}  # timeline rows -> sessions
         # A proposal waiting for "yes": ("reopen", files, what). Only from submit().
         self._pending: tuple[str, list[Item], str] | None = None
@@ -240,16 +367,43 @@ class Handler:
     # -- entry points ------------------------------------------------------------------
     def preview(self, text: str) -> Reply:
         """As-you-type: show what would happen. Never opens anything."""
-        return self._handle(text, execute=False)
+        self._settle(text)
+        reply = self._handle(text, execute=False)
+        self._shown = (text, self.context.copy())
+        return reply
 
-    def submit(self, text: str) -> Reply:
-        """Enter / voice: may run a safe action per the confidence rule."""
-        return self._handle(text, execute=True)
+    def submit(self, text: str, clipboard: str | None = None) -> Reply:
+        """Enter / voice: may run a safe action per the confidence rule. ``clipboard``:
+        what was copied, captured by the UI only when the request asks to paste."""
+        self._settle(text)
+        self._clipboard = clipboard
+        try:
+            return self._handle(text, execute=True)
+        finally:
+            self._clipboard = None
+            self._committed, self._shown = self.context.copy(), None
 
     def act(self, index: int, action: str) -> Reply:
-        """A click / keyboard choice on a shown item."""
+        """A click / keyboard choice on a shown item (the list on screen right now)."""
         intent = Intent("select", ordinal=index + 1, action=action)
-        return self._followup(intent, execute=True)
+        reply = self._followup(intent, execute=True)
+        self._committed, self._shown = self.context.copy(), None
+        return reply
+
+    def _settle(self, text: str) -> None:
+        """Which list do follow-ups ("the second one") refer to? Each keystroke previews,
+        and the partial words ("t", "th", "the s"...) show lists of their own. The list
+        a preview showed counts only once you moved on to something else; while you're
+        still typing (or erasing) the same words, it's dropped. An empty box's list (your
+        recent files) always counts."""
+        if self._shown is not None:
+            prev, ctx = self._shown
+            a, b = prev.strip().lower(), text.strip().lower()
+            if not a or not (b.startswith(a) or a.startswith(b)):
+                self._committed = ctx
+            self._shown = None
+        if self._committed is not None:
+            self.context = self._committed.copy()
 
     def llm(self) -> LLM | None:
         """The configured LLM (None when off / no key). Asked on each use, so turning it
@@ -258,7 +412,14 @@ class Handler:
 
     def _handle(self, text: str, *, execute: bool, routed: bool = False) -> Reply:
         t0 = time.perf_counter()
+        if self.dictation is not None:
+            reply = self._dictation_input(text, execute=execute)
+            reply.ms = (time.perf_counter() - t0) * 1e3
+            return reply
+        text, fixed = self._correct_names(text)
         intent = parse(text)
+        if fixed:
+            log.info("names corrected: %s", fixed)
         if intent.kind == "related":  # before follow-ups: "related to the first one"
             reply = self._related(intent)
         elif intent.is_followup:
@@ -290,6 +451,20 @@ class Handler:
             reply = self._ask(intent, execute=execute)
         elif intent.kind == "explain":
             reply = self._explain(intent, execute=execute)
+        elif intent.kind == "stats":
+            reply = self._stats(intent)
+        elif intent.kind == "create":
+            reply = self._create(intent, execute=execute)
+        elif intent.kind == "dictate":
+            reply = self._start_dictation(intent, execute=execute)
+        elif intent.kind == "notes":
+            reply = self._notes(intent, execute=execute)
+        elif intent.kind == "clean":
+            reply = self._clean(intent, execute=execute)
+        elif intent.kind == "organize":
+            reply = self._organize(intent, execute=execute)
+        elif intent.kind == "undo":
+            reply = self._undo(intent, execute=execute)
         elif intent.kind == "recent":
             items = self._recent(intent.query)
             self.context.set_results(items, text, "recent")
@@ -304,7 +479,23 @@ class Handler:
                 if routed_reply is not None:
                     reply = routed_reply
         reply.ms = (time.perf_counter() - t0) * 1e3
+        if fixed:
+            reply.timings["names_corrected"] = float(len(fixed))
         return reply
+
+    def _correct_names(self, text: str) -> tuple[str, dict[str, str]]:
+        """Misheard/misspelled names -> your project/app/topic/folder names (local only)."""
+        if self._vocab is None:
+            self._vocab = Vocabulary(
+                self.conn,
+                lambda: [str(r) for r in self.config.index_roots()],
+                lambda: [a.name for a in self._apps()],
+            )
+        try:
+            return self._vocab.correct(text)
+        except Exception:
+            log.debug("name correction failed", exc_info=True)
+            return text, {}
 
     # -- Phase 6: ask your files, and the LLM for unclear commands ----------------------
     def _unclear(self, text: str, intent: Intent, reply: Reply) -> bool:
@@ -484,9 +675,178 @@ class Handler:
         return Reply(ans.text or fallback, "answer", items, intent, selected=0,
                      detail=f"From: {used}")  # fmt: skip
 
-    def _ask(self, intent: Intent, *, execute: bool) -> Reply:
+    def _general(self, question: str, intent: Intent, *, execute: bool) -> Reply:
+        """A question that isn't about your files ("how many planets are there"): only
+        the question goes to the LLM; nothing from your files."""
+        llm = self.llm()
+        self.context.set_results([], question, "answer")
+        if llm is None:
+            return Reply("That's a general question: turn on the LLM to answer it "
+                         "(cli set llm_enabled true).", "answer", [], intent)  # fmt: skip
+        if not execute:
+            return Reply("Enter to ask.", "answer", [], intent)
+        try:
+            text = llm.general(question)
+        except LLMError as e:
+            return Reply(f"Couldn't ask the LLM ({e}).", "answer", [], intent)
+        return Reply(text or "I don't know.", "answer", [], intent,
+                     detail=f"Answered by {llm.model} (not from your files).")  # fmt: skip
+
+    def _project_question(self, intent: Intent, *, execute: bool) -> Reply:
+        """ "what is the zachary project about", "how do I run my hackfest project": the
+        LLM answers from that project's own files (README, docs, matching passages).
+        "this / my project" = the project of your last work session."""
         question = intent.query.strip()
+        q_words = words(question)
+        projects = list_projects(self.conn)
+
+        def score(p: Project) -> int:
+            pw = [w for w in words(p.name) if len(w) >= 3]
+            return sum(any(n.startswith(w) or w.startswith(n) for n in pw)
+                       for w in q_words if len(w) >= 3)  # fmt: skip
+
+        named = max(projects, key=score, default=None)
+        proj: Project | None = named if named is not None and score(named) > 0 else None
+        if proj is None:
+            proj = self._folder_named(q_words)  # "durdrsti": a folder, not a code project
+        if proj is None:
+            proj = self._which_project([], True)  # "this project": your last one
+        if proj is None:
+            return self._ask(Intent("ask", query=question), execute=execute)
+        passages = qa.retrieve(self.conn, question, semantic=self.semantic, rules=self.rules(),
+                               k=EXPLAIN_PASSAGES, within=proj.path)  # fmt: skip
+        folder_item = Item(proj.folder_id, proj.path, proj.name, "project", True,
+                           proj.last_activity, ["project"])  # fmt: skip
+        items = [folder_item] + [
+            Item(p.file_id, p.path, p.name, p.kind, False, p.mtime, [f"“{p.snippet}”"], p.score)
+            for p in passages
+        ]
+        unique: dict[int, Item] = {}
+        for it in items:
+            unique.setdefault(it.file_id, it)
+        items = list(unique.values())
+        self.context.set_results(items, question, "answer")
+        if not passages:
+            return Reply(f"I have nothing readable in {proj.name} yet.", "answer", items, intent)
+        best = passages[0]
+        quote = f"“{best.snippet}”\n— {best.name}"
+        llm = self.llm()
+        if not execute:
+            say = "Enter to ask." if llm is not None else f"About {proj.name}: {best.name}."
+            return Reply(say, "answer", items, intent, selected=0, detail=quote)
+        if llm is None:
+            return Reply(f"From {proj.name}'s files, starting with {best.name}.", "answer",
+                         items, intent, selected=0, detail=quote)  # fmt: skip
+        try:
+            ans = llm.answer(f"{question} (about the project “{proj.name}”)",
+                             [Excerpt(p.name, p.mtime, p.text) for p in passages])  # fmt: skip
+        except LLMError as e:
+            return Reply(f"Couldn't ask the LLM ({e}). Best match: {best.name}.", "answer",
+                         items, intent, selected=0, detail=quote)  # fmt: skip
+        used = ", ".join(dict.fromkeys(passages[i].name for i in ans.sources)) or best.name
+        return Reply(ans.text or f"About {proj.name}: see {best.name}.", "answer", items, intent,
+                     selected=0, detail=f"From {proj.name}: {used}")  # fmt: skip
+
+    def _folder_named(self, q_words: list[str]) -> Project | None:
+        """A folder whose name is one of the question's words (newest first)."""
+        for w in q_words:
+            if len(w) < 4 or w in {"project", "projects", "about", "what", "does", "this"}:
+                continue
+            row = self.conn.execute(
+                "SELECT id, path, name, mtime FROM files WHERE is_dir = 1 AND lower(name) = ?"
+                " ORDER BY mtime DESC LIMIT 1",
+                (w,),
+            ).fetchone()
+            if row is not None and not self.rules().is_excluded(row[1], True):
+                return Project(int(row[0]), row[1], row[2], [], float(row[3]))
+        return None
+
+    # -- "which project was I working on about crime scenes" / "where is my resume" -------
+    def _locate(self, intent: Intent, *, execute: bool) -> Reply:
+        """Candidates are ranked locally (your projects by their READMEs, or files by
+        search); the LLM picks the one that answers (only names + short descriptions are
+        sent); it's then opened (or shown in its folder for "where ...")."""
+        question = intent.query.strip()
+        where = words(question)[:1] in (["where"], ["kahan"], ["kidhar"])
+        cands: list[tuple[Item, str]] = []
+        if intent.project_hint:
+            roots = [str(r) for r in self.config.index_roots()]
+            ranked = ws_rank(question, workspaces(self.conn, roots), self._embedder())
+            seen: set[str] = set()
+            for ws, score in ranked:
+                key = ws.name.lower() + ws.description[:80]
+                if key in seen:
+                    continue
+                seen.add(key)
+                it = Item(ws.folder_id, ws.path, ws.name, "project", True, ws.last_activity,
+                          [ws.description[:140] or "project"], score)  # fmt: skip
+                desc = ws.description[:LOCATE_DESC] or "no description"
+                cands.append((it, f"{ws.name} ({planner._short(ws.path)}): {desc}"))
+                if len(cands) >= LOCATE_CANDIDATES:
+                    break
+        else:
+            results, _ = self._search(" ".join(qa.question_terms(question)) or question,
+                                      LOCATE_CANDIDATES)  # fmt: skip
+            for r in results:
+                it = _item(r, self.conn)
+                about = next((w[7:] for w in it.why if w.startswith("about: ")), "")
+                cands.append((it, f"{r.name} ({planner._short(os.path.dirname(r.path))})"
+                                  + (f": {about[:LOCATE_DESC]}" if about else "")))  # fmt: skip
+        items = [c[0] for c in cands]
+        self.context.set_results(items, question, "results")
+        if not items:
+            return Reply("I couldn't find anything like that.", "results", [], intent)
+        llm = self.llm()
+        if not execute:
+            say = "Enter to ask." if llm is not None else f"Best match: {items[0].name}."
+            return Reply(say, "results", items, intent, selected=0)
+        pick: int | None = 0
+        answer = ""
+        if llm is not None:
+            try:
+                pick, answer = llm.choose(question, [c[1] for c in cands])
+            except LLMError as e:
+                # Never open a guess: show the closest ones instead.
+                answer = f"Couldn't ask the LLM ({e}); here are the closest."
+                pick = None
+        elif not clear_winner(items):
+            pick = None
+        if pick is None:
+            return Reply(answer or "I'm not sure which one; here are the closest.", "results",
+                         items, intent, selected=0)  # fmt: skip
+        target = items[pick]
+        items.insert(0, items.pop(pick))
+        self.context.set_results(items, question, "results")
+        ok = self.actions.reveal(target) if where else self.actions.open(target)
+        verb = "Showing" if where else "Opening"
+        say = (answer + " " if answer else "") + (f"{verb} {target.name}." if ok
+                                                 else self._not_opened(target))  # fmt: skip
+        return Reply(say.strip(), "results", items, intent, "reveal" if where else "open",
+                     target, 0)  # fmt: skip
+
+    def _not_opened(self, target: Item) -> str:
+        refused = getattr(self.actions, "last_refused", "")
+        if refused and refused == target.path:
+            self.actions.last_refused = ""  # type: ignore[attr-defined]
+            return (f"{target.name} is a program file, so I showed it in its folder instead"
+                    " of running it.")  # fmt: skip
+        return f"Couldn't open {target.name}."
+
+    def _embedder(self) -> object | None:
+        sem = self.semantic
+        return sem.embedder if sem is not None else None
+
+    def _ask(self, intent: Intent, *, execute: bool) -> Reply:
+        if intent.action == "locate":
+            return self._locate(intent, execute=execute)
+        if intent.project_hint:
+            return self._project_question(intent, execute=execute)
+        question = intent.query.strip()
+        personal = about_my_files(question)
         passages = qa.retrieve(self.conn, question, semantic=self.semantic, rules=self.rules())
+        # Not "my ..." and nothing in your files clearly about it: a general question.
+        if not qa.about_files(question, passages, personal):
+            return self._general(question, intent, execute=execute)
         items: list[Item] = []
         for p in passages:
             if any(it.file_id == p.file_id for it in items):
@@ -511,6 +871,11 @@ class Handler:
         except LLMError as e:
             return Reply(f"Couldn't ask the LLM ({e}). Best match: {best.name}.", "answer",
                          items, intent, selected=0, detail=quote)  # fmt: skip
+        if not ans.found and not personal:
+            # Your files don't say, and it wasn't about your things: answer it generally.
+            general = self._general(question, intent, execute=True)
+            general.items, general.detail = items, general.detail + "\n\n" + quote
+            return general
         src = passages[ans.sources[0]] if ans.sources else best
         if ans.found and ans.sources:
             # The cited file first.
@@ -520,8 +885,25 @@ class Handler:
         return Reply(say, "answer", items, intent, selected=0, detail=detail)
 
     def _find_or_open(self, intent: Intent, *, execute: bool) -> Reply:
+        self._open_with = None  # a new request: forget "open ... in VS Code" pending
+        if intent.kind == "open":
+            app_reply = self._open_app(intent, execute=execute)
+            if app_reply is not None:
+                return app_reply
         items: list[Item]
         note = ""
+        if intent.kind == "open" and not intent.project_hint:
+            # "open zachary": a project with exactly that name wins over files inside it.
+            q = " ".join(words(intent.query))
+            exact = [p for p in self._projects() if " ".join(words(p.name)) == q]
+            if len(exact) == 1:
+                self.context.set_results(exact, intent.query, "projects")
+                if not execute:
+                    return Reply(f"Enter to open {exact[0].name}.", "projects", exact, intent,
+                                 "open", exact[0], 0)  # fmt: skip
+                ok = self.actions.open(exact[0])
+                say = f"Opening {exact[0].name}." if ok else self._not_opened(exact[0])
+                return Reply(say, "projects", exact, intent, "open" if ok else None, exact[0], 0)
         if intent.project_hint:
             items = self._projects(intent.query)
             if not items:
@@ -547,7 +929,7 @@ class Handler:
                     ok = self.actions.open(target)
                     if ok and view == "results":
                         feedback.record(self.conn, search_terms(intent.query), target.file_id, 0)
-                    say = f"Opening {target.name}." if ok else f"Couldn't open {target.name}."
+                    say = f"Opening {target.name}." if ok else self._not_opened(target)
                     return Reply(say, view, items, intent, "open" if ok else None, target, 0)
                 return Reply(
                     f"Enter to open {target.name}.", view, items, intent, "open", target, 0
@@ -663,12 +1045,420 @@ class Handler:
             return Reply(say, self.context.view, self.context.items, intent)
         if not execute:
             self._pending = pending  # preview: don't consume it
-            return Reply(f"Enter to reopen {pending[2]}.", "session", pending[1], intent)
+            verb = "undo" if pending[0] == "undo" else "reopen"
+            return Reply(f"Enter to {verb} {pending[2]}.", self.context.view, pending[1], intent)
         _kind, items, what = pending
+        if _kind == "undo":
+            return self._run_undo(int(items[0].file_id) if items else 0, intent)
         opened = sum(1 for it in items if self.actions.open(it))
         say = f"Reopened {opened} of {len(items)} files." if opened < len(items) else (
             f"Reopened {what}.")  # fmt: skip
         return Reply(say, "session", items, intent, "open" if opened else None)
+
+    # -- apps: "open spotify", "open zachary in vscode" -----------------------------------
+    def _apps(self) -> list[App]:
+        return self.platform.list_apps() if self.platform is not None else []
+
+    def _app_by_id(self, app_id: str) -> App | None:
+        return next((a for a in self._apps() if a.id == app_id), None)
+
+    @staticmethod
+    def _app_item(app: App) -> Item:
+        return Item(0, app.location, app.name, "app", False, 0.0,
+                    [app.generic or "application"], 1.0, app.id)  # fmt: skip
+
+    def _launch_reply(self, app: App, intent: Intent, *, execute: bool) -> Reply:
+        items = [self._app_item(app)]
+        self.context.set_results(items, app.name, "apps")
+        if not execute:
+            return Reply(f"Enter to open {app.name}.", "apps", items, intent, "launch", items[0], 0)
+        ok = self.actions.launch(app.id)
+        say = f"Opening {app.name}." if ok else f"Couldn't open {app.name}."
+        return Reply(say, "apps", items, intent, "launch" if ok else None, items[0], 0)
+
+    def _open_with_reply(self, app: App, target: Item, intent: Intent, *, execute: bool
+                         ) -> Reply:  # fmt: skip
+        items = self.context.items or [target]
+        if not execute:
+            return Reply(f"Enter to open {target.name} in {app.name}.", self.context.view,
+                         items, intent, "open", target, 0)  # fmt: skip
+        self._open_with = None
+        ok = self.actions.open_with(app.id, target)
+        say = (f"Opening {target.name} in {app.name}." if ok
+               else f"Couldn't open {target.name} in {app.name}.")  # fmt: skip
+        return Reply(say, self.context.view, items, intent, "open" if ok else None, target)
+
+    def _open_app(self, intent: Intent, *, execute: bool) -> Reply | None:
+        """An app, or something to open in an app; None = an ordinary file search."""
+        apps = self._apps()
+        if not apps:
+            return None
+        if intent.app and intent.target:
+            m = app_index.find_app(intent.app, apps)
+            if m is not None and m[1] >= APP_MIN_SCORE and m[0].accepts_files:
+                return self._open_in(m[0], intent, execute=execute)
+            return None  # "open notes in downloads": a place, not an app
+        q = " ".join(w for w in words(intent.query) if w not in {"app", "application", "the"})
+        m = app_index.find_app(q, apps) if q else None
+        if m is None or m[1] < APP_MIN_SCORE:
+            return None
+        if m[1] < APP_SURE_SCORE:  # a close spelling ("spotfy"): only if no file wins
+            results, _ = self._search(intent.query, 2)
+            if results and clear_winner(results):
+                return None
+        return self._launch_reply(m[0], intent, execute=execute)
+
+    def _open_in(self, app: App, intent: Intent, *, execute: bool) -> Reply:
+        """ "open zachary in vscode": a project by name, else the best folder/file."""
+        want = words(intent.target)
+        items = [p for p in self._projects() if want and all(
+            any(n.startswith(w) for n in words(p.name)) for w in want)]  # fmt: skip
+        winner = len(items) == 1
+        if not items:
+            results, _ = self._search(intent.target, RESULT_LIMIT)
+            items = [_item(r, self.conn) for r in results]
+            winner = clear_winner(results)
+        self.context.set_results(items, intent.target, "results")
+        if not items:
+            return Reply(f"Nothing found for “{intent.target}”.", "results", [], intent)
+        if winner:
+            return self._open_with_reply(app, items[0], intent, execute=execute)
+        self._open_with = app
+        shown = items[:ASK_LIMIT]
+        self.context.set_results(shown, intent.target, "results")
+        return Reply(f"Which one should I open in {app.name}?", "results", shown, intent,
+                     selected=0)  # fmt: skip
+
+    # -- "how many files / pdfs do I have", "how much space do my videos take" -----------
+    def _stats(self, intent: Intent) -> Reply:
+        """Counted in the index, on this machine (instant; nothing is sent anywhere)."""
+        q = intent.query
+        toks = words(q)
+        if any(t in {"project", "projects"} for t in toks):
+            n = len(list_projects(self.conn))
+            return Reply(f"You have {n:,} project{'s' if n != 1 else ''}.", "none", [], intent)
+        where: list[str] = ["is_dir = 0", "is_excluded = 0"]
+        params: list[object] = []
+        label = "files"
+        kinds = {KIND_HINTS[t] for t in toks if t in KIND_HINTS}
+        exts = sorted({EXT_ALIASES.get(m.group(1), m.group(1)) for m in _EXT_RE.finditer(q)})
+        if "dir" in kinds:
+            where, label = ["is_dir = 1", "is_excluded = 0"], "folders"
+        elif exts:
+            marks = ",".join("?" * len(exts))
+            where.append(f"lower(ext) IN ({marks})")
+            params += ["." + e for e in exts]
+            label = "/".join(EXT_NAMES.get(e, e.upper()) for e in exts) + " files"
+        elif kinds:
+            marks = ",".join("?" * len(kinds))
+            where.append(f"kind IN ({marks})")
+            params += sorted(kinds)
+            label = " and ".join(sorted(KIND_LABELS.get(k, k) for k in kinds))
+        # A place only after "in / inside / from" ("how many files in downloads"), or
+        # before "mein"; "my videos" is the kind, not the Videos folder.
+        place = next((t for i, t in enumerate(toks) if t in STANDARD_FOLDERS and (
+            (i > 0 and toks[i - 1] in {"in", "inside", "from", "under"})
+            or (i + 1 < len(toks) and toks[i + 1] in {"mein", "me"}))), None)  # fmt: skip
+        if place is not None:
+            folder = self._place(place)
+            if folder is None:
+                return Reply(f"I don't have a {place.capitalize()} folder indexed.", "none", [],
+                             intent)  # fmt: skip
+            prefix = str(folder).rstrip("/\\") + os.sep
+            where.append("path >= ? AND path < ?")
+            params += [prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)]
+        tr = parse_time(q).range
+        if tr is not None:
+            where.append("mtime >= ? AND mtime < ?")
+            params += [tr.start, tr.end]
+        sql = " AND ".join(where)
+        n, size = self.conn.execute(
+            f"SELECT count(*), coalesce(sum(size), 0) FROM files WHERE {sql}", params
+        ).fetchone()
+        scope = (f" in {place.capitalize()}" if place else "") + (
+            f" changed {tr.label}" if tr is not None else "")  # fmt: skip
+        wants_size = any(t in {"space", "storage", "size", "big", "gb", "mb", "much"}
+                         for t in toks) and "many" not in toks  # fmt: skip
+        if wants_size and label != "folders":
+            say = f"Your {label}{scope} take {planner.human(size)} ({_count(n, 'file')})."
+        else:
+            total = f", {planner.human(size)} in total." if label != "folders" and n else "."
+            say = f"You have {n:,} {label}{scope}{total}"
+        detail = ""
+        if label == "files" and n and tr is None:
+            rows = self.conn.execute(
+                f"SELECT kind, count(*), sum(size) FROM files WHERE {sql} GROUP BY kind"
+                " ORDER BY count(*) DESC", params,
+            ).fetchall()  # fmt: skip
+            detail = "\n".join(
+                f"{KIND_LABELS.get(k, k).capitalize():12} {c:>8,}   {planner.human(sz or 0)}"
+                for k, c, sz in rows
+            )
+        self.context.set_results([], q, "none")
+        return Reply(say, "none", [], intent, detail=detail)
+
+    # -- creating files / folders, dictation ---------------------------------------------
+    def _embed(self) -> creator.Embed | None:
+        sem = self.semantic
+        return sem.embedder.encode if sem is not None else None
+
+    def _namer(self) -> creator.NameFolder | None:
+        llm = self.llm()
+        return llm.name_folder if llm is not None else None
+
+    def _place(self, place: str) -> Path | None:
+        """ "downloads" / "the zachary project" / "hackathon folder" -> an existing folder."""
+        w = [x for x in words(place) if x not in {"my", "the", "folder", "directory"}]
+        if not w:
+            return None
+        if len(w) == 1 and w[0] in STANDARD_FOLDERS:
+            bases = [*self.config.index_roots(), Path(os.path.expanduser("~"))]
+            for b in bases:
+                for cand in (b / w[0].capitalize(), b / w[0]):
+                    if cand.is_dir():
+                        return cand
+            return None
+        name = [x for x in w if x not in PROJECT_WORDS_]
+        for p in self._projects():
+            pw = words(p.name)
+            if name and all(any(n.startswith(x) for n in pw) for x in name):
+                return Path(p.path)
+        results, _ = self._search(" ".join(name or w), RESULT_LIMIT)
+        for r in results:
+            if r.is_dir and all(any(n.startswith(x) for n in words(r.name)) for x in name or w):
+                return Path(r.path)
+        return None
+
+    def _where(self, folder: Path) -> str:
+        return planner._short(str(folder))
+
+    def _create(self, intent: Intent, *, execute: bool) -> Reply:
+        spec = parse_create(intent.query)
+        folder = self._place(spec.place) if spec.place else None
+        if spec.place and folder is None:
+            return Reply(f"I couldn't find a folder “{spec.place}”.", "none", [], intent)
+        where = self._where(folder) if folder else "Documents/Zachary"
+        what = "folder" if spec.what == "folder" else f".{spec.fmt} file"
+        if not execute:
+            src = " with what you copied" if spec.paste else ""
+            return Reply(f"Enter to create a {what}{src} in {where}.", "none", [], intent)
+        if spec.what == "folder":
+            parent = folder or creator.base_folder()
+            problem = creation_problem(parent, self.config)
+            if problem is not None:
+                return Reply(f"I won't create folders in {self._where(parent)}: {problem}.",
+                             "none", [], intent)  # fmt: skip
+            made = creator.create_folder(self.conn, spec.name or "New folder", folder)
+            self.actions.open_created(made.path)
+            return Reply(f"Created the folder {made.path.name} in {self._where(made.path.parent)}."
+                         " Say “undo” to remove it.", "none", [], intent)  # fmt: skip
+        content = spec.content
+        if spec.paste:
+            content = (self._clipboard or "").strip()
+            if not content:
+                return Reply("Your clipboard is empty (or has no text).", "none", [], intent)
+        return self._write_and_open(spec, content, folder, intent)
+
+    def _write_and_open(self, spec: CreateSpec, content: str, folder: Path | None,
+                        intent: Intent) -> Reply:  # fmt: skip
+        target = folder or creator.base_folder()
+        problem = creation_problem(target, self.config)
+        if problem is not None:
+            return Reply(f"I won't create files in {self._where(target)}: {problem}.", "none",
+                         [], intent)  # fmt: skip
+        try:
+            made = creator.create_file(self.conn, content, fmt=spec.fmt, name=spec.name or None,
+                                       folder=folder, embed=self._embed(),
+                                       name_folder=self._namer())  # fmt: skip
+        except OSError as e:
+            return Reply(f"Couldn't create the file ({e.strerror or e}).", "none", [], intent)
+        opened = self.actions.open_created(made.path)  # only now that it's written
+        kind = {"new": " (a new folder)", "existing": ""}.get(made.sorted_into, "")
+        say = (f"Created {made.path.name} in {self._where(made.folder)}{kind}"
+               + (" and opened it." if opened else "."))  # fmt: skip
+        item = Item(0, str(made.path), made.path.name, "document", False, time.time(),
+                    [f"in {self._where(made.folder)}"])  # fmt: skip
+        return Reply(say + " Say “undo” to remove it.", "none", [item], intent,
+                     detail=content[:600])  # fmt: skip
+
+    def _notes(self, intent: Intent, *, execute: bool) -> Reply:
+        """Zachary's notes app (ui/notes.py): notes are .txt files in Documents/Zachary/Notes."""
+        what = intent.action or "open"
+        say = {
+            "open": "Opening your notes.",
+            "new": "New note.",
+            "dictate": "New note. Talk; say “stop dictation” when you're done.",
+        }[what]
+        if not execute:
+            return Reply(f"Enter: {say[0].lower()}{say[1:]}", "none", [], intent)
+        return Reply(say, "none", [], intent, notes=what)
+
+    def _start_dictation(self, intent: Intent, *, execute: bool) -> Reply:
+        spec = parse_create(intent.query)
+        folder = self._place(spec.place) if spec.place else None
+        if not execute:
+            return Reply("Enter to start dictation.", "none", [], intent)
+        self.dictation = Dictation(spec, folder, [], time.time())
+        self._save_draft()
+        fmt = spec.fmt.upper() if spec.fmt != "docx" else "Word"
+        return Reply(f"Dictating a {fmt} document. Talk; say “new paragraph” for a break and "
+                     "“stop dictation” when you're done.", "dictation", [], intent,
+                     dictating=True)  # fmt: skip
+
+    def _draft_path(self) -> Path:
+        db = self.conn.execute("PRAGMA database_list").fetchone()[2]
+        return Path(db).parent / "dictation-draft.txt" if db else Path("dictation-draft.txt")
+
+    def _save_draft(self) -> None:
+        d = self.dictation
+        try:
+            if d is None:
+                self._draft_path().unlink(missing_ok=True)
+            else:
+                self._draft_path().write_text(d.text(), encoding="utf-8")
+        except OSError:
+            log.debug("could not save the dictation draft", exc_info=True)
+
+    def _dictation_input(self, text: str, *, execute: bool) -> Reply:
+        d = self.dictation
+        assert d is not None
+        intent = Intent("dictate", query=text)
+        if not execute:
+            return Reply("Dictating… Enter adds this. Say “stop dictation” to finish.",
+                         "dictation", [], intent, detail=d.tail(), dictating=True)  # fmt: skip
+        if CANCEL_DICTATION.search(text):
+            self.dictation = None
+            self._save_draft()
+            return Reply("Dictation cancelled; nothing was saved.", "none", [], intent)
+        stop = STOP_DICTATION.search(text)
+        body = text[: stop.start()] if stop else text
+        if SCRATCH_THAT.match(body):
+            if d.parts:
+                d.parts.pop()
+            self._save_draft()
+            return Reply("", "dictation", [], intent, detail=d.tail(), dictating=True)
+        d.add(body)
+        self._save_draft()
+        if not stop:
+            return Reply("", "dictation", [], intent, detail=d.tail(), dictating=True)
+        self.dictation = None
+        content = d.text()
+        if not content.strip():
+            self._save_draft()
+            return Reply("Nothing was dictated, so no document was made.", "none", [], intent)
+        reply = self._write_and_open(d.spec, content, d.folder, intent)
+        self._save_draft()  # (removes the draft)
+        return reply
+
+    # -- Phase 7: clean / organize / undo (plans only; files change after approval) -------
+    def _plan_reply(self, plan: planner.Plan, intent: Intent) -> Reply:
+        items = [
+            Item(0, it.src, os.path.basename(it.src.rstrip("/\\")), "dir" if it.is_dir else
+                 "other", it.is_dir, it.mtime,
+                 [planner.LABELS[it.category] + ": " + it.reason
+                  + (f" → {planner._short(it.dst)}" if it.dst else "")], 0.0)
+            for it in plan.items[:RESULT_LIMIT]
+        ]  # fmt: skip
+        self.context.set_results([], "", "plan")
+        if not plan.items:
+            return Reply(plan.note, "plan", [], intent)
+        what = "Review and approve it" if plan.kind == "clean" else "Review the moves"
+        return Reply(f"{plan.note} {what} — nothing changes until you approve.", "plan", items,
+                     intent, plan_id=plan.id, detail=plan.title, plan=plan)  # fmt: skip
+
+    def _clean(self, intent: Intent, *, execute: bool) -> Reply:
+        q = set(words(intent.query))
+        cats = {c for w, c in CLEAN_CATEGORIES.items() if w in q}
+        scope = None
+        for w in q:
+            if w in STANDARD_FOLDERS:
+                cand = os.path.join(os.path.expanduser("~"), w.capitalize())
+                if os.path.isdir(cand):
+                    scope = cand
+        where = f" in {planner._short(scope)}" if scope else ""
+        if not execute:
+            return Reply(f"Enter to look for things to clean up{where}.", "plan", [], intent)
+        plan = planner.save(self.conn, planner.clean_plan(
+            self.conn, self.config, scope=scope, categories=cats or None))  # fmt: skip
+        return self._plan_reply(plan, intent)
+
+    def _organize(self, intent: Intent, *, execute: bool) -> Reply:
+        q = intent.query.strip()
+        if not q:
+            return Reply("Organize what? Try “organize my DSA notes”.", "none", [], intent)
+        want = set(words(q)) - {"notes", "stuff", "files", "documents", "docs"}
+        topic = None
+        if want:
+            scored = sorted(
+                ((len(want & set(words(t.label))) / len(want), t)
+                 for t in clustering.list_topics(self.conn)),
+                key=lambda x: -x[0],
+            )  # fmt: skip
+            if scored and scored[0][0] >= 0.5:
+                topic = scored[0][1]
+        if topic is not None:
+            label = topic.label
+            ids = clustering.topic_files(self.conn, topic.id, limit=500)
+        else:
+            label = q
+            results, _ = self._search(q, 60)
+            ids = [r.file_id for r in results if not r.is_dir and r.kind == "document"]
+        if not execute:
+            return Reply(f"Enter to plan putting “{label}” ({len(ids)} files) in one folder.",
+                         "plan", [], intent)  # fmt: skip
+        if not ids:
+            return Reply(f"I found no documents about “{q}”.", "none", [], intent)
+        plan = planner.save(self.conn, planner.organize_plan(self.conn, self.config, ids, label))
+        return self._plan_reply(plan, intent)
+
+    def _undo(self, intent: Intent, *, execute: bool) -> Reply:
+        plan = planner.latest(self.conn, ["executed", "failed"])
+        if plan is None:
+            return Reply("There's nothing to undo.", "none", [], intent)
+        n = self.conn.execute(
+            "SELECT count(*) FROM undo_log WHERE plan_id = ? AND op != 'mkdir'", (plan.id,)
+        ).fetchone()[0]
+        what = f"“{plan.title}” ({n} change{'s' if n != 1 else ''})"
+        marker = [Item(plan.id, "", plan.title, "other", False, plan.created_at, [])]
+        if execute:
+            self._pending = ("undo", marker, what)
+        return Reply(f"Undo {what}? Say yes to restore everything.", "plan", [], intent,
+                     plan_id=0)  # fmt: skip
+
+    def undo_plan(self, plan_id: int) -> Reply:
+        """The review window's Undo button (one click)."""
+        return self._run_undo(plan_id, Intent("undo_plan"))
+
+    def _run_undo(self, plan_id: int, intent: Intent) -> Reply:
+        plan = planner.load(self.conn, plan_id)
+        if plan is None or self.platform is None:
+            return Reply("There's nothing to undo.", "none", [], intent)
+        res = undo_mod.undo(self.conn, self.platform, plan)
+        detail = "\n".join(res.problems[:8])
+        return Reply(res.summary(), "plan", [], intent, detail=detail)
+
+    def approve_plan(self, plan_id: int, select: dict[int, bool] | None = None,
+                     dst: dict[int, str] | None = None) -> Reply:  # fmt: skip
+        """The review window's Approve button: the user's explicit approval."""
+        intent = Intent("approve")
+        plan = planner.load(self.conn, plan_id)
+        if plan is None or plan.status != "proposed":
+            return Reply("That plan is no longer waiting for approval.", "plan", [], intent)
+        if self.platform is None:
+            return Reply("Can't change files from here.", "plan", [], intent)
+        planner.edit(self.conn, plan, select=select, dst=dst)
+        planner.set_status(self.conn, plan, "approved")
+        res = executor.execute(self.conn, self.platform, self.config, plan)
+        problems = [f"{planner._short(i.src)}: {i.result}" for i in plan.items
+                    if i.result.startswith(("skipped", "failed"))]  # fmt: skip
+        return Reply(res.summary() + " Say “undo” to put everything back.", "plan", [], intent,
+                     plan_id=plan.id, detail="\n".join(problems[:8]), plan=plan)  # fmt: skip
+
+    def reject_plan(self, plan_id: int) -> Reply:
+        plan = planner.load(self.conn, plan_id)
+        if plan is not None and plan.status == "proposed":
+            planner.set_status(self.conn, plan, "rejected")
+        return Reply("Okay, nothing was changed.", "plan", [], Intent("reject"))
 
     def _related(self, intent: Intent) -> Reply:
         """Precomputed related files of a shown item or of the best match for a query."""
@@ -744,6 +1534,12 @@ class Handler:
                 return Reply("Nothing selected.", ctx.view, ctx.items, intent)
         if target.kind in {"topic", "session"}:
             return self._drill(target, intent, execute=execute)
+        if target.kind == "app" and intent.action != "reveal":
+            app = self._app_by_id(target.detail)
+            if app is not None:
+                return self._launch_reply(app, intent, execute=execute)
+        if self._open_with is not None and intent.action != "reveal":
+            return self._open_with_reply(self._open_with, target, intent, execute=execute)
         action = "reveal" if intent.kind == "reveal" or intent.action == "reveal" else "open"
         idx = ctx.focused
         if not execute:
@@ -757,5 +1553,5 @@ class Handler:
         if action == "reveal":
             say = f"Showing {target.name} in its folder." if ok else f"Couldn't show {target.name}."
         else:
-            say = f"Opening {target.name}." if ok else f"Couldn't open {target.name}."
+            say = f"Opening {target.name}." if ok else self._not_opened(target)
         return Reply(say, ctx.view, ctx.items, intent, action if ok else None, target, idx)

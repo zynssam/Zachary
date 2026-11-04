@@ -257,7 +257,28 @@ ALTER TABLE topics ADD COLUMN last_ts REAL NOT NULL DEFAULT 0;
 CREATE INDEX idx_topics_last ON topics(last_ts DESC);
 """
 
-MIGRATIONS: tuple[str, ...] = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3, _MIGRATION_4)
+# Migration 5: files/folders Zachary creates ("create a text file ...", dictation) are
+# undoable too: undo_log gets a 'create' op (dst = "size:mtime" at creation, so undo
+# only trashes it if it wasn't edited since). SQLite can't alter a CHECK: rebuild.
+_MIGRATION_5 = """
+CREATE TABLE undo_log_new (
+    id       INTEGER PRIMARY KEY,
+    plan_id  INTEGER NOT NULL REFERENCES action_plans(id) ON DELETE RESTRICT,
+    op       TEXT    NOT NULL CHECK (op IN ('move', 'rename', 'trash', 'mkdir', 'create')),
+    src      TEXT    NOT NULL,
+    dst      TEXT,
+    ts       REAL    NOT NULL
+);
+INSERT INTO undo_log_new(id, plan_id, op, src, dst, ts)
+    SELECT id, plan_id, op, src, dst, ts FROM undo_log;
+DROP TABLE undo_log;
+ALTER TABLE undo_log_new RENAME TO undo_log;
+CREATE INDEX idx_undo_log_plan ON undo_log(plan_id);
+"""
+
+MIGRATIONS: tuple[str, ...] = (
+    _MIGRATION_1, _MIGRATION_2, _MIGRATION_3, _MIGRATION_4, _MIGRATION_5,
+)  # fmt: skip
 SCHEMA_VERSION = len(MIGRATIONS)
 
 

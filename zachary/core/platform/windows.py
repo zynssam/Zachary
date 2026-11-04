@@ -25,6 +25,7 @@ from zachary.core.platform import (
     TreeWatcher,
     WatchLimit,
 )
+from zachary.core.platform.apps import App
 
 log = logging.getLogger(__name__)
 
@@ -460,6 +461,26 @@ class WindowsPlatform:
         """Explorer with the item selected. Paths can't contain '"' on Windows."""
         if sys.platform == "win32":
             subprocess.Popen(f'explorer /select,"{path}"', close_fds=True)
+
+    def list_apps(self) -> list[App]:
+        from zachary.core.platform import apps
+
+        return apps.list_apps()
+
+    def launch_app(self, app: App, file: Path | None = None) -> None:
+        from zachary.core.platform import apps
+
+        apps.launch(app, file)
+
+    def trash(self, path: Path) -> str:
+        from zachary.core.platform import trash
+
+        return trash.trash(path)
+
+    def restore(self, trashed: str, original: str) -> None:
+        from zachary.core.platform import trash
+
+        trash.restore(trashed, original)
 
     def spawn_detached(self, argv: list[str]) -> None:
         if sys.platform != "win32":

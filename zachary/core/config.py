@@ -158,6 +158,9 @@ class Settings:
     stt_language: str = "en-IN"  # Gnani: en-IN also handles English+Hindi mixing
     stt_model: str = "prisma-v3.0"
     stt_streaming: bool = True
+    # Send your project / app / topic / folder *names* (never file contents) to Gnani as
+    # recognition hints ("keyterms"), so "Zachary" is heard right. Off: names stay local.
+    stt_keyterms: bool = True
     tts_voice: str = "Shivani"
     tts_model: str = "timbre-v3.0"
     tts_language: str = "en-IN"

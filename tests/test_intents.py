@@ -261,8 +261,8 @@ def test_ask_intent(text: str) -> None:
 @pytest.mark.parametrize(
     ("text", "kind"),
     [
-        ("where is my resume", "find"),  # locate a file, not an answer
-        ("which file has my marks", "find"),
+        ("where is my resume", "ask"),  # a locate question: the LLM picks, then it opens
+        ("which file has my marks", "ask"),
         ("dsa notes?", "find"),
         ("fee receipt", "find"),
         ("open fee receipt", "open"),
@@ -294,3 +294,29 @@ def test_not_a_question(text: str, kind: str) -> None:
 def test_explain_intent(text: str, query: str, ordinal: int | None, project: bool) -> None:
     i = parse(text)
     assert (i.kind, i.query, i.ordinal, i.project_hint) == ("explain", query, ordinal, project)
+
+
+@pytest.mark.parametrize(
+    ("text", "kind", "query"),
+    [
+        ("clean up my downloads", "clean", "downloads"),
+        ("find duplicates", "clean", "duplicates"),
+        ("free up space", "clean", ""),
+        ("remove old installers", "clean", "old installers"),
+        ("delete empty folders", "clean", "empty"),
+        ("downloads saaf karo", "clean", "downloads"),  # Hinglish
+        ("claen my downloads", "clean", "downloads"),  # typo
+        ("organize my dsa stuff", "organize", "dsa"),
+        ("organise my machine learning notes", "organize", "machine learning notes"),
+        ("orgnize my dsa notes", "organize", "dsa notes"),  # typo
+        ("undo", "undo", ""),
+        ("undo the last cleanup", "undo", ""),
+        # Not destructive: stay searches.
+        ("open the cleanup report", "open", "the cleanup report"),
+        ("delete my resume", "find", "delete my resume"),
+        ("restore my files", "find", "restore my files"),
+    ],
+)
+def test_clean_organize_undo_intents(text: str, kind: str, query: str) -> None:
+    i = parse(text)
+    assert (i.kind, i.query) == (kind, query)

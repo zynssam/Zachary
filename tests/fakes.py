@@ -16,6 +16,7 @@ from zachary.core.platform import (
     TreeWatcher,
     WatchLimit,
 )
+from zachary.core.platform.apps import App
 
 
 class FakeHotkey:
@@ -48,6 +49,14 @@ class FakePlatform:
         self.opened: list[Path] = []
         self.revealed: list[Path] = []
         self.spawned: list[list[str]] = []
+        self.trashed: list[Path] = []
+        self.apps: list[App] = [
+            App("com.spotify.Client.desktop", "Spotify", "Music Player", location="/x/spotify"),
+            App("code.desktop", "Visual Studio Code", "Text Editor", location="/x/code",
+                accepts_files=True),
+            App("org.gnome.Calculator.desktop", "Calculator", location="/x/calc"),
+        ]  # fmt: skip
+        self.launched: list[tuple[str, Path | None]] = []
         self.native_watcher = True
         self.battery = False
         self.busy = False
@@ -72,6 +81,35 @@ class FakePlatform:
 
     def spawn_detached(self, argv: list[str]) -> None:
         self.spawned.append(argv)
+
+    def list_apps(self) -> list[App]:
+        return list(self.apps)
+
+    def launch_app(self, app: App, file: Path | None = None) -> None:
+        self.launched.append((app.id, file))
+
+    def trash(self, path: Path) -> str:
+        """A fake trash under the test root (the real one is tested separately)."""
+        import shutil
+
+        bin_ = self.root / "fake-trash"
+        bin_.mkdir(exist_ok=True)
+        dst = bin_ / f"{len(self.trashed)}-{path.name}"
+        shutil.move(str(path), dst)
+        self.trashed.append(path)
+        return str(dst)
+
+    def restore(self, trashed: str, original: str) -> None:
+        import shutil
+
+        from zachary.core.platform.trash import TrashError
+
+        if not trashed or not Path(trashed).exists():
+            raise TrashError("no longer in the trash")
+        if Path(original).exists():
+            raise TrashError("something else now exists at its old place")
+        Path(original).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(trashed, original)
 
     def try_lock(self, path: Path) -> object | None:
         return object()

@@ -256,3 +256,61 @@ def test_answer_panel_shows_the_passage_and_hides_after(qtbot: QtBot, bar: Quick
     assert bar.status.text() == "Due on 15 June."
     bar._on_reply(10_001, Reply("Top matches.", "results", [], r.intent))
     assert not bar.answer.isVisible()
+
+
+def test_plan_review_window(qtbot: QtBot) -> None:
+    from PySide6.QtCore import Qt as _Qt
+
+    from zachary.actions.planner import Plan, PlanItem
+    from zachary.brain.intents import Intent
+    from zachary.ui.plan_review import PlanReview
+
+    items = [PlanItem(1, "trash", "/h/Downloads/a (1).pdf", None, "duplicate", "same as a.pdf",
+                      2_000_000, OLD),
+             PlanItem(2, "trash", "/h/Downloads/setup.exe", None, "installer", "old", 50_000_000,
+                      OLD),
+             PlanItem(3, "trash", "/h/big.iso", None, "large", "big", 900_000_000, OLD,
+                      selected=False)]  # fmt: skip
+    plan = Plan("clean", "Clean up", items, id=7, note="3 things.")
+    w = PlanReview()
+    qtbot.addWidget(w)
+    w.show_plan(plan)
+    assert w.selection() == {1: True, 2: True, 3: False}  # large files not preselected
+    assert w.approve_btn.text() == "Move 2 to the trash (49.6 MB)"
+    rows = w._rows()
+    rows[0].setCheckState(0, _Qt.CheckState.Unchecked)  # the user unticks the duplicate
+    assert w.approve_btn.text().startswith("Move 1 to the trash")
+    with qtbot.waitSignal(w.approved) as sig:
+        w.approve_btn.click()
+    assert sig.args == [7, {1: False, 2: True, 3: False}, {}]
+    w.show_result(Reply("1 done.", "plan", [], Intent("approve"), plan_id=7, plan=plan))
+    assert w.undo_btn.isVisible() and not w.approve_btn.isVisible()
+    with qtbot.waitSignal(w.undo_requested) as sig2:
+        w.undo_btn.click()
+    assert sig2.args == [7]
+    with qtbot.waitSignal(w.rejected) as sig3:
+        w.show_plan(plan)
+        w.reject_btn.click()
+    assert sig3.args == [7]
+
+
+def test_untick_in_review_survives_the_engine(
+    qtbot: QtBot, bar: QuickBar, store: FileStore, home: Path, fake_platform: FakePlatform
+) -> None:
+    import os
+
+    data = os.urandom(50_000)
+    for name in ("deck.pdf", "deck (1).pdf", "deck (2).pdf"):
+        (home / "Work" / name).write_bytes(data)
+    scan(store)
+    with qtbot.waitSignal(bar.engine.replied, timeout=10000) as blocker:
+        bar.engine.ask("submit", "find duplicates")
+    reply: Reply = blocker.args[1]
+    assert reply.plan is not None and len(reply.plan.items) == 2
+    review = bar._review()
+    assert review.isVisible() and review.plan is not None  # opened by the reply
+    keep = reply.plan.items[0]
+    with qtbot.waitSignal(bar.engine.replied, timeout=10000):
+        bar.engine.ask("approve", (reply.plan.id, {keep.id: False}, {}))
+    assert [p.name for p in fake_platform.trashed] == [os.path.basename(reply.plan.items[1].src)]
+    assert os.path.exists(keep.src)
