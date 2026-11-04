@@ -48,3 +48,19 @@ def test_no_os_specific_imports_outside_platform() -> None:
         text = py.read_text(encoding="utf-8")
         for b in banned:
             assert b not in text, f"{py}: {b}"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="XDG autostart is Linux")
+def test_autostart_entry_on_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    plat = LinuxPlatform()
+    argv = ["/venv/bin/python", "-m", "zachary.assistant"]
+    assert plat.autostart(argv) == (
+        False,
+        str(tmp_path / "autostart" / "ai.zachary.Zachary.desktop"),
+    )
+    on, where = plat.autostart(argv, True)
+    text = Path(where).read_text()
+    assert on and "Exec=/venv/bin/python -m zachary.assistant" in text
+    assert "X-GNOME-Autostart-enabled=true" in text and "--show" not in text
+    assert plat.autostart(argv, False)[0] is False and not Path(where).exists()
