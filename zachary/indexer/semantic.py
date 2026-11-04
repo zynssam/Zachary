@@ -112,6 +112,7 @@ class SemanticIndexer:
         self.embedder = embedder
         self._ivf_version = -1
         self._centroids: FloatArray | None = None
+        self._ocr = False  # (ocr_enabled and Tesseract installed; read per batch)
 
     # -- queue -----------------------------------------------------------------------
     def pending_count(self) -> int:
@@ -145,6 +146,9 @@ class SemanticIndexer:
             return stats
         rules = self.config.path_rules()
         max_bytes = int(self.config.get_setting("embed_max_kb")) * 1024
+        from zachary.indexer.ocr import available as ocr_available
+
+        self._ocr = bool(self.config.get_setting("ocr_enabled")) and ocr_available()
         jobs = [
             _Job(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], rules.root_for(r[1]))
             for r in rows
@@ -158,7 +162,7 @@ class SemanticIndexer:
         return stats
 
     def _name_only(self, job: _Job, name_only_dirs: tuple[str, ...]) -> bool:
-        if not extractable(job.ext, job.kind):
+        if not extractable(job.ext, job.kind, self._ocr):
             return True
         if not name_only_dirs:
             return False
@@ -192,7 +196,8 @@ class SemanticIndexer:
         if job.new_hash == job.content_hash and self._has_chunks(job.id):
             job.reuse = True
             return
-        ex = extract(Path(job.path), job.ext, job.kind, job.size, max_bytes)
+        ex = extract(Path(job.path), job.ext, job.kind, job.size, max_bytes,
+                     ocr=self._ocr)  # fmt: skip
         if ex is None or not ex.text.strip():
             return
         job.title = None if job.kind == "code" else ((ex.title or "")[:300] or None)

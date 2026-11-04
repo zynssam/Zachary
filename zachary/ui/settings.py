@@ -222,6 +222,10 @@ class SettingsForm(QWidget):
         changed = {k for k, v in new.items() if getattr(before, k) != v}
         for k in changed:
             self.cfg.set_setting(k, new[k])
+        if new["ocr_enabled"] and not before.ocr_enabled:
+            from zachary.indexer.ocr import queue_for_ocr
+
+            queue_for_ocr(self.cfg.conn)  # images and scanned PDFs get read again
         if [str(r) for r in self.cfg.index_roots()] != roots:
             self.cfg.set_index_roots(roots)
         old_ex = {p for p, kind, src, on in self.cfg.list_excludes()
