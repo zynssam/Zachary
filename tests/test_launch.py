@@ -48,3 +48,14 @@ def test_entry_point_dispatches_parts(monkeypatch: pytest.MonkeyPatch) -> None:
     entry.main(["indexer", "--once"])
     entry.main(["--show"])  # no part: the assistant (double-clicking the app)
     assert seen == [("cli", ["status"]), ("indexer", ["--once"]), ("assistant", ["--show"])]
+
+
+def test_restart_hint_fits_how_zachary_was_started(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zachary import assistant
+
+    if sys.platform != "win32":
+        assert "pkill -f zachary.assistant" in assistant.restart_hint()  # from source
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "executable", "/home/u/Apps/Zachary/Zachary")
+        hint = assistant.restart_hint()
+        assert "pkill -f /home/u/Apps/Zachary/Zachary" in hint and hint.endswith(" -v")

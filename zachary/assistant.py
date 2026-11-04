@@ -25,7 +25,7 @@ from zachary.core.config import Config, default_db_path
 from zachary.core.db import get_state, open_db
 from zachary.core.hotkeys import HotkeyError, parse_hotkey
 from zachary.core.platform import Platform, get_platform
-from zachary.launch import self_command
+from zachary.launch import frozen, self_command
 from zachary.ui import style
 from zachary.ui.engine import Engine
 from zachary.ui.quickbar import QuickBar
@@ -39,6 +39,20 @@ INDEXER_STALE_S = 15.0
 def server_name() -> str:
     # ZACHARY_INSTANCE lets tests (or a second profile) run side by side.
     return f"zachary-assistant-{getpass.getuser()}{os.environ.get('ZACHARY_INSTANCE', '')}"
+
+
+def restart_hint() -> str:
+    """The command that stops the running Zachary and starts it here with logs."""
+    import shlex
+
+    plat: str = sys.platform  # (a plain str: both branches are type-checked)
+    if frozen():  # the installed app (one executable)
+        if plat == "win32":
+            return f'taskkill /IM Zachary.exe /F  &&  "{sys.executable}" -v'
+        return f"pkill -f {shlex.quote(sys.executable)}; {shlex.quote(sys.executable)} -v"
+    if plat == "win32":
+        return "(close Zachary from the tray, then)  python -m zachary.assistant -v"
+    return "pkill -f zachary.assistant; python -m zachary.assistant -v"
 
 
 def toggle_cmd() -> list[str]:
@@ -156,8 +170,8 @@ def main(argv: list[str] | None = None) -> int:
     if send_to_running(message):
         if message == b"show":  # started by hand: say why no new window/log appears
             print("Zachary is already running (its log isn't in this terminal); showing "
-                  "the bar.\nTo restart it here with logs:  pkill -f zachary.assistant && "
-                  "python -m zachary.assistant -v", file=sys.stderr)  # fmt: skip
+                  f"the bar.\nTo restart it here with logs:  {restart_hint()}",
+                  file=sys.stderr)  # fmt: skip
         return 0  # another instance owns the quick bar
     if args.talk:
         log.warning("no running assistant to talk to")

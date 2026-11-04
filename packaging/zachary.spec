@@ -44,6 +44,13 @@ a = Analysis(  # noqa: F821
     excludes=excludes,
     noarchive=False,
 )
+# Linux: use the system's own sound and keyboard libraries, not copies from the build
+# machine. A bundled libasound can't load the desktop's PipeWire/PulseAudio plugin (so
+# the mic fails with "Invalid sample rate"), and an old libxkbcommon spams warnings about
+# the newer keyboard files. Every desktop Linux has these; README lists the package.
+SYSTEM_LIBS = ("libasound.so", "libportaudio.so", "libxkbcommon", "libjack.so", "libpulse")
+if not WIN:
+    a.binaries = [b for b in a.binaries if not Path(b[0]).name.startswith(SYSTEM_LIBS)]
 pyz = PYZ(a.pure)  # noqa: F821
 exe = EXE(  # noqa: F821
     pyz,
