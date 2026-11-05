@@ -1,6 +1,6 @@
 name: build
-# The Windows and Linux apps (PyInstaller, packaging/zachary.spec), smoke-tested and
-# uploaded as artifacts. Runs on version tags, by hand, and when packaging changes.
+# The Linux app (PyInstaller, packaging/zachary.spec), smoke-tested and uploaded as a
+# download. (Windows: run from source; see README.) Runs on version tags, by hand, and when packaging changes.
 on:
   workflow_dispatch:
   push:
@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest]  # 22.04: older glibc, runs on more Linux systems
+        os: [ubuntu-22.04]  # 22.04: older glibc, runs on more Linux systems
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -48,13 +48,9 @@ jobs:
       - name: Package
         run: |
           cd dist
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a -tzip ../Zachary-windows-x64.zip Zachary >/dev/null
-          else
-            tar czf ../Zachary-linux-x64.tar.gz Zachary
-          fi
+          tar czf ../Zachary-linux-x64.tar.gz Zachary
       - uses: actions/upload-artifact@v4
         with:
-          name: Zachary-${{ runner.os }}
-          path: Zachary-*-x64.*
+          name: Zachary-Linux
+          path: Zachary-linux-x64.tar.gz
           retention-days: 30

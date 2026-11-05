@@ -22,18 +22,26 @@ and tidy them by typing or speaking naturally: "fees yesterday", "open the secon
 - **Open apps and folders:** "open spotify", "open zachary in vs code".
 
 ## Install
-**From a release build** (GitHub → Actions → *build*, or Releases):
-- **Windows:** unzip `Zachary-windows-x64.zip` and run `Zachary\Zachary.exe`.
-- **Linux:** run `tar xzf Zachary-linux-x64.tar.gz && ./Zachary/Zachary`.
+**Linux: the ready-made app.** On GitHub go to **Actions → build** → the latest run →
+**Artifacts → Zachary-Linux**, or from a terminal:
+```bash
+RUN=$(gh run list -R zynssam/Zachary -w build -s success -L 1 --json databaseId -q '.[0].databaseId')
+gh run download "$RUN" -R zynssam/Zachary -n Zachary-Linux -D ~/Downloads/zachary
+mkdir -p ~/Apps && tar xzf ~/Downloads/zachary/Zachary-linux-x64.tar.gz -C ~/Apps
+sudo dnf install -y portaudio            # (Ubuntu: sudo apt install libportaudio2)
+~/Apps/Zachary/Zachary
+```
+It shows up in your app menu after the first start. To uninstall, delete `~/Apps/Zachary`.
 
-**From source** (Python 3.11+):
+**Windows (or Linux) from source** (Python 3.11+, Git):
 ```bash
 git clone https://github.com/zynssam/Zachary && cd Zachary
-python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\Activate.ps1
 pip install -e .
 python -m zachary                                      # (= the assistant)
 ```
-On Linux you may need `libportaudio2` (the microphone) and `libxcb-cursor0` (Qt on X11).
+On Linux from source you may need `libportaudio2` (the microphone) and `libxcb-cursor0`
+(Qt on X11).
 
 ## First run
 A five-step setup opens on the first start:
@@ -124,8 +132,9 @@ Data folder: `~/.local/share/zachary` on Linux, `%LOCALAPPDATA%\Zachary` on Wind
 pip install -e ".[build]"
 pyinstaller packaging/zachary.spec --noconfirm     # -> dist/Zachary/
 ```
-CI (`.github/workflows/build.yml`) builds and smoke-tests Windows and Linux on version
-tags or by hand. Models aren't bundled; they download on first use: the embedding model
+CI (`.github/workflows/build.yml`) builds and smoke-tests the Linux app when packaging
+changes, on version tags, or by hand. (The spec also builds on Windows; there's no
+Windows download for now.) Models aren't bundled; they download on first use: the embedding model
 (~30 MB) and, if you turn on "Hey Zach", the Vosk model (~36 MB).
 
 ## Development

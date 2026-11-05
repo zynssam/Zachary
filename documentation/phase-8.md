@@ -5,7 +5,7 @@
 | Start at login (assistant, which starts the indexer) on Linux and Windows | ✅ | `core/platform/*.autostart` (XDG autostart / `HKCU\…\Run`, pythonw/no console), `cli autostart on\|off`, Settings, first-run setup |
 | Tray controls: pause, settings, exclude folders | ✅ | `ui/tray.py`: Open, Pause indexing, Exclude a folder…, Settings…, Quit. Without a tray (GNOME): "open settings" in the bar |
 | Optional OCR (Tesseract) for scanned PDFs and images | ✅ | `indexer/ocr.py`, `indexer/extract.py`, setting `ocr_enabled` (off) |
-| PyInstaller builds for Windows and Linux | ✅ | `packaging/zachary.spec`, `.github/workflows/build.yml` (build, smoke test, artifacts) |
+| PyInstaller builds for Windows and Linux | ✅ | `packaging/zachary.spec` (both). The download (`build.yml`) is Linux only, at your choice; Windows runs from source |
 | First-run setup: folders, Gnani key, hotkey, language | ✅ | `ui/settings.py` `FirstRun` (4 steps), `needs_first_run` |
 | README: setup, privacy, troubleshooting | ✅ | `README.md` |
 
