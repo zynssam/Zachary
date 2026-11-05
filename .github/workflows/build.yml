@@ -9,6 +9,8 @@ on:
     paths: ["packaging/**", ".github/workflows/build.yml"]
 jobs:
   app:
+    permissions:
+      contents: write  # (version tags: create the release and attach the app)
     strategy:
       fail-fast: false
       matrix:
@@ -54,3 +56,12 @@ jobs:
           name: Zachary-Linux
           path: Zachary-linux-x64.tar.gz
           retention-days: 30
+      - name: Attach to the GitHub release (version tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "Zachary $tag" --notes-file packaging/release-notes.md
+          gh release upload "$tag" Zachary-linux-x64.tar.gz --clobber

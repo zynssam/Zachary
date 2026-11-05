@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zachary"
-version = "0.0.1"
+version = "0.1.0"
 description = "Zachary: a fast desktop assistant with file memory"
 readme = "README.md"
 requires-python = ">=3.11"
