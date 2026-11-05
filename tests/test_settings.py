@@ -133,3 +133,36 @@ def test_open_settings_from_the_bar() -> None:
     assert parse("open settings").kind == "settings"
     assert parse("preferences").kind == "settings"
     assert parse("open settings.docx").kind != "settings"  # a file called settings
+
+
+def test_windows_gets_shortcuts_windows_allows(conn: sqlite3.Connection,
+                                               fake_platform: FakePlatform) -> None:  # fmt: skip
+    """Windows keeps Win+Space (keyboard language) for itself: different defaults there."""
+    fake_platform.name = "windows"
+    cfg = _cfg(conn, fake_platform)
+    s = cfg.load()
+    assert (s.quickbar_hotkey, s.voice_hotkey) == ("ctrl+alt+space", "ctrl+shift+space")
+    cfg.set_setting("quickbar_hotkey", "ctrl+alt+z")
+    cfg.seed_defaults()  # (every start) never overrides your choice
+    assert cfg.load().quickbar_hotkey == "ctrl+alt+z"
+
+
+def test_settings_refuse_win_space_on_windows_and_offer_a_restart(
+    qtbot: QtBot, conn: sqlite3.Connection, fake_platform: FakePlatform
+) -> None:
+    from zachary.ui.settings import SettingsWindow
+
+    fake_platform.name = "windows"
+    restarts: list[bool] = []
+    win = SettingsWindow(_cfg(conn, fake_platform), fake_platform,
+                         on_restart=lambda: restarts.append(True))  # fmt: skip
+    qtbot.addWidget(win)
+    win.form.quickbar_hotkey.setText("super+space")
+    assert win.form.apply()  # refused, with a reason
+    assert "Windows keeps super+space" in win.form.message.text()
+    win.form.quickbar_hotkey.setText("ctrl+alt+k")
+    save = next(b for b in win.findChildren(type(win.restart_btn)) if b.text() == "Save")
+    save.click()
+    assert not win.restart_btn.isHidden()  # a shortcut changed: offer to restart
+    win.restart_btn.click()
+    assert restarts == [True]

@@ -46,12 +46,17 @@ A five-step setup opens on the first start:
 
    If any key is missing, the setup says what won't work without it. Click Next again
    to add it later; search, notes and clean-up work without keys.
-4. **Shortcut.** Super+Space by default. On GNOME you confirm it once in a system
-   dialog.
+4. **Shortcut.** Super+Space by default on Linux; on GNOME you confirm it once in a
+   system dialog. On Windows the defaults are **Ctrl+Alt+Space** (open) and
+   **Ctrl+Shift+Space** (talk), because Windows keeps Win+Space for switching keyboard
+   language.
 5. **Language** (English with Hinglish, or Hindi), **OCR** for scanned files, and
    **start at login**.
 
-Change anything later in **Settings**: the tray menu, or type "open settings" in the bar.
+Finishing the setup restarts Zachary once, so your shortcut and voice settings are live
+straight away. Change anything later in **Settings**: the tray menu, or type "open
+settings" in the bar. After changing a shortcut or voice setting there, click **Restart
+now**.
 
 ## Privacy: what leaves your computer
 | What | Where it goes | When |

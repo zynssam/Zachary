@@ -56,6 +56,7 @@ KEY_HELP = {
                        "the backup for questions when Groq is busy"),
 }  # fmt: skip
 RESTART_KEYS = {"quickbar_hotkey", "voice_hotkey", "voice_enabled", "wake_word", "mic_device"}
+WINDOWS_RESERVED = {"super+space", "super+alt+space", "super+shift+space", "alt+space"}
 
 
 def tesseract_found() -> bool:
@@ -136,6 +137,7 @@ class SettingsForm(QWidget):
         except Exception:
             self.autostart.setEnabled(False)
 
+        self.needs_restart = False  # (shortcut / voice changed: apply() sets it)
         self.message = QLabel(self)
         self.message.setWordWrap(True)
         self.message.setStyleSheet(dim)
@@ -232,9 +234,14 @@ class SettingsForm(QWidget):
         problems = []
         for field, label in ((self.quickbar_hotkey, "quick bar"), (self.voice_hotkey, "talk")):
             try:
-                parse_hotkey(field.text().strip())
+                hk = parse_hotkey(field.text().strip())
             except HotkeyError as err:
                 problems.append(f"The {label} shortcut isn't valid: {err}")
+                continue
+            if getattr(self.platform, "name", "") == "windows" and str(hk) in WINDOWS_RESERVED:
+                problems.append(f"Windows keeps {hk} for itself (keyboard language and "
+                                f"system keys): choose another {label} shortcut, e.g. "
+                                "ctrl+alt+space.")  # fmt: skip
         roots = [self.roots.item(i).text() for i in range(self.roots.count())]
         if not roots:
             problems.append("Choose at least one folder to remember.")
@@ -277,8 +284,9 @@ class SettingsForm(QWidget):
         if self.autostart.isEnabled():
             self.platform.autostart(self_command("zachary.assistant"), self.autostart.isChecked())
         notes = ["Saved."]
-        if changed & RESTART_KEYS:
-            notes.append("Shortcut and voice changes apply after you restart Zachary.")
+        self.needs_restart = bool(changed & RESTART_KEYS) or self.needs_restart
+        if self.needs_restart:
+            notes.append("Shortcut and voice changes apply after Zachary restarts.")
         if new["wake_word"] and not before.wake_word:
             self.fetch_wake_model()
             notes.append("Downloading the “Hey Zach” model (36 MB) in the background.")
@@ -311,7 +319,9 @@ def _scroll(inner: QWidget) -> QScrollArea:
 
 
 class SettingsWindow(QWidget):
-    def __init__(self, cfg: Config, platform: Platform) -> None:
+    def __init__(
+        self, cfg: Config, platform: Platform, on_restart: Callable[[], None] | None = None
+    ) -> None:
         super().__init__(None, Qt.WindowType.Window)
         self.setWindowTitle("Zachary settings")
         self.resize(700, 760)
@@ -333,11 +343,21 @@ class SettingsWindow(QWidget):
         v.addStretch(1)
         save = QPushButton("Save", self)
         save.setStyleSheet(style.primary_css(style.theme()))
-        save.clicked.connect(self.form.apply)
+        self.restart_btn = QPushButton("Restart now", self)
+        self.restart_btn.setVisible(False)
+        if on_restart is not None:
+            self.restart_btn.clicked.connect(on_restart)
+
+        def saved() -> None:
+            if not self.form.apply():
+                self.restart_btn.setVisible(self.form.needs_restart and on_restart is not None)
+
+        save.clicked.connect(saved)
         lay = QVBoxLayout(self)
         lay.addWidget(_scroll(inner), 1)
         bottom = QHBoxLayout()
         bottom.addWidget(self.form.message, 1)
+        bottom.addWidget(self.restart_btn)
         bottom.addWidget(save)
         lay.addLayout(bottom)
 

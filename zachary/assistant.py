@@ -149,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--show", action="store_true", help="show the quick bar at start")
     ap.add_argument("--no-voice", action="store_true", help="don't open the microphone")
     ap.add_argument("-v", "--verbose", action="count", default=0)
+    ap.add_argument("--wait-for-exit", action="store_true",
+                    help="(restart) wait for the running Zachary to quit")  # fmt: skip
     args = ap.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG
@@ -166,6 +168,10 @@ def main(argv: list[str] | None = None) -> int:
     style.use_dark(app)  # (look)
     app.setWindowIcon(app_icon())
 
+    if args.wait_for_exit:  # a restart: let the old Zachary finish quitting first
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and send_to_running(b"ping", 500):
+            time.sleep(0.3)
     message = b"talk" if args.talk else b"toggle" if args.toggle else b"show"
     if send_to_running(message):
         if message == b"show":  # started by hand: say why no new window/log appears
@@ -216,8 +222,15 @@ def main(argv: list[str] | None = None) -> int:
 
     windows: dict[str, QWidget] = {}
 
+    def restart() -> None:
+        """Start a fresh Zachary (new shortcut / voice settings) and quit this one."""
+        extra = [] if args.db is None else ["--db", str(db_path)]
+        platform.spawn_detached(self_command("zachary.assistant", "--wait-for-exit", "--show",
+                                             *extra))  # fmt: skip
+        QTimer.singleShot(200, app.quit)
+
     def open_settings() -> None:
-        w = SettingsWindow(Config(open_db(db_path), platform), platform)
+        w = SettingsWindow(Config(open_db(db_path), platform), platform, on_restart=restart)
         windows["settings"] = w  # (keep a reference while it's open)
         w.show()
         w.raise_()
@@ -317,9 +330,9 @@ def main(argv: list[str] | None = None) -> int:
         windows["setup"] = setup
 
         def setup_done() -> None:
-            start_indexer()
-            bar.show_bar()
-            bar.status.setText("All set. Type anything, or press your shortcut later.")
+            # Restart so the chosen shortcut and voice settings are live straight away
+            # (this process registered the hotkey and skipped voice before setup ran).
+            restart()
 
         setup.finished.connect(setup_done)
         QTimer.singleShot(0, setup.show)
