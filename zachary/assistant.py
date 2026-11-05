@@ -55,6 +55,31 @@ def restart_hint() -> str:
     return "pkill -f zachary.assistant; python -m zachary.assistant -v"
 
 
+LOG_NAME = "zachary.log"
+
+
+def add_log_file(folder: Path) -> Path | None:
+    """Also log to <data folder>/zachary.log (INFO and up, 2 x 1 MB, local only), so a
+    problem can be looked at without a terminal (Settings has "Open log")."""
+    from logging.handlers import RotatingFileHandler
+
+    path = folder / LOG_NAME
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        h = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+    except OSError:
+        return None
+    h.setLevel(logging.INFO)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    for existing in root.handlers:  # the console keeps the level chosen with -v
+        if existing.level == logging.NOTSET:
+            existing.setLevel(root.level)
+    root.addHandler(h)
+    root.setLevel(min(root.level, logging.INFO))
+    return path
+
+
 def toggle_cmd() -> list[str]:
     return self_command("zachary.assistant", "--toggle")
 
@@ -185,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
 
     platform = get_platform()
     db_path = Path(args.db) if args.db else default_db_path(platform)
+    log_file = add_log_file(db_path.parent)
     conn = open_db(db_path)
     cfg = Config(conn, platform)
     cfg.seed_defaults()
@@ -216,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         if talk_handlers:
             talk_handlers[0]()
         else:
-            log.warning("voice is off: python -m zachary.cli set voice_enabled true")
+            log.warning("voice is off: turn on Voice commands in Settings")
 
     serve_commands(server, {b"toggle": bar.toggle, b"show": bar.show_bar, b"talk": talk})
 
@@ -229,8 +255,24 @@ def main(argv: list[str] | None = None) -> int:
                                              *extra))  # fmt: skip
         QTimer.singleShot(200, app.quit)
 
+    def hotkey_status() -> list[tuple[str, str, str | None, int]]:
+        """(what, shortcut, problem or None, times pressed) for Settings."""
+        st = Config(open_db(db_path), platform).load()
+        rows = [("Open the quick bar", st.quickbar_hotkey, backend, "open"),
+                ("Push-to-talk", st.voice_hotkey, voice_backend, "talk")]  # fmt: skip
+        out: list[tuple[str, str, str | None, int]] = []
+        for what, key, b, n in rows:
+            why: str | None
+            if b is None:
+                why = "off (turn on voice commands)" if n == "talk" else "not set up"
+            else:
+                why = getattr(b, "error", None)
+            out.append((what, key, why, presses[n]))
+        return out
+
     def open_settings() -> None:
-        w = SettingsWindow(Config(open_db(db_path), platform), platform, on_restart=restart)
+        w = SettingsWindow(Config(open_db(db_path), platform), platform, on_restart=restart,
+                           hotkey_status=hotkey_status, log_file=log_file)  # fmt: skip
         windows["settings"] = w  # (keep a reference while it's open)
         w.show()
         w.raise_()
@@ -263,13 +305,19 @@ def main(argv: list[str] | None = None) -> int:
 
     bridge = _HotkeyBridge()
     bridge.pressed.connect(lambda token, t0: bar.toggle(token, t0))
+    presses = {"open": 0, "talk": 0}  # (Settings shows whether the shortcuts work)
+
+    def pressed(which: str, b: _HotkeyBridge, tok: object) -> None:
+        presses[which] += 1
+        b.pressed.emit(tok, time.perf_counter())
+
     backend = None
     if not args.no_hotkey:
         try:
             hk = parse_hotkey(args.hotkey or settings.quickbar_hotkey)
             platform.ensure_app_registration(self_command("zachary.assistant"))
             backend = platform.global_hotkey(
-                hk, lambda tok: bridge.pressed.emit(tok, time.perf_counter()), "Open Zachary"
+                hk, lambda tok: pressed("open", bridge, tok), "Open Zachary"
             )
             backend.start()
         except HotkeyError as e:
@@ -280,7 +328,8 @@ def main(argv: list[str] | None = None) -> int:
             if err:
                 bar.show_bar()
                 bar.status.setText(
-                    f"Hotkey unavailable ({err}). " + platform.hotkey_hint(toggle_cmd())
+                    f"Shortcut unavailable ({err}). Type “open settings” here to pick "
+                    "another one, then click Restart now."
                 )
 
         QTimer.singleShot(4000, check_hotkey)
@@ -295,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             voice_backend = platform.global_hotkey(
                 parse_hotkey(settings.voice_hotkey),
-                lambda tok: vbridge.pressed.emit(tok, time.perf_counter()),
+                lambda tok: pressed("talk", vbridge, tok),
                 "Talk to Zachary",
                 "voice",
             )

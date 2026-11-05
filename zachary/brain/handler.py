@@ -685,8 +685,9 @@ class Handler:
         llm = self.llm()
         self.context.set_results([], question, "answer")
         if llm is None:
-            return Reply("That's a general question: turn on the LLM to answer it "
-                         "(cli set llm_enabled true).", "answer", [], intent)  # fmt: skip
+            return Reply("That's a general question: turn on “Answer questions with AI” in "
+                         "Settings (and add a Groq or Gemini key) to answer it.", "answer",
+                         [], intent)  # fmt: skip
         if not execute:
             return Reply("Enter to ask.", "answer", [], intent)
         try:
