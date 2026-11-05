@@ -8,6 +8,7 @@ Explorer open/reveal come later (see phase notes).
 from __future__ import annotations
 
 import contextlib
+import itertools
 import logging
 import os
 import struct
@@ -33,7 +34,8 @@ log = logging.getLogger(__name__)
 # --- Global hotkey: RegisterHotKey on a dedicated thread with its own message loop ----
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
 WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
-_HOTKEY_ID = 0x5A43  # "ZC"
+_HOTKEY_ID = 0x5A43  # "ZC": the first one; each hotkey gets its own id (see WindowsHotkey)
+_next_id = itertools.count(_HOTKEY_ID)
 _VK_NAMED = {"space": 0x20, "return": 0x0D, "escape": 0x1B, "tab": 0x09, "backspace": 0x08}
 
 
@@ -63,6 +65,8 @@ class WindowsHotkey:
         self.error: str | None = None
         self.ready = threading.Event()
         self.thread_id: int | None = None
+        # Its own id: two hotkeys (open + talk) with one id could be confused.
+        self.hotkey_id = next(_next_id)
         self._thread = threading.Thread(target=self._run, name="zach-hotkey", daemon=True)
 
     def start(self) -> None:
@@ -90,17 +94,24 @@ class WindowsHotkey:
         msg = wintypes.MSG()
         # Make sure this thread has a message queue before anyone posts to it.
         user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
-        if not user32.RegisterHotKey(None, _HOTKEY_ID, mods, vk):
-            self.error = f"{self.hotkey} is already used by another application"
+        if not user32.RegisterHotKey(None, self.hotkey_id, mods, vk):
+            code = kernel32.GetLastError()
+            if code == 1409:  # ERROR_HOTKEY_ALREADY_REGISTERED
+                self.error = f"{self.hotkey} is already used by Windows or another app"
+            else:
+                self.error = f"{self.hotkey} couldn't be registered (Windows error {code})"
+            log.warning("hotkey: %s", self.error)
             self.ready.set()
             return
+        log.info("hotkey: %s registered", self.hotkey)
         self.ready.set()
         try:
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-                if msg.message == WM_HOTKEY and msg.wParam == _HOTKEY_ID:
+                if msg.message == WM_HOTKEY and msg.wParam == self.hotkey_id:
+                    log.info("hotkey pressed: %s", self.hotkey)
                     self.callback(None)
         finally:
-            user32.UnregisterHotKey(None, _HOTKEY_ID)
+            user32.UnregisterHotKey(None, self.hotkey_id)
 
 
 # KNOWNFOLDERID GUIDs. Desktop/Documents may be redirected (e.g. to OneDrive).

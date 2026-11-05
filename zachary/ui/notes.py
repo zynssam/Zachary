@@ -224,7 +224,7 @@ class NotesWindow(QWidget):
         self.mic_btn = QPushButton("Dictate", self)
         self.mic_btn.setCheckable(True)
         self.mic_btn.setEnabled(False)
-        self.mic_btn.setToolTip("Voice is off: python -m zachary.cli set voice_enabled true")
+        self.mic_btn.setToolTip("Voice is off: turn on “Voice commands” in Settings")
         self.mic_btn.toggled.connect(self._mic)
         self.paste_btn = QPushButton("Paste", self)
         self.paste_btn.clicked.connect(self.paste_clipboard)

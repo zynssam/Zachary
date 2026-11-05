@@ -22,26 +22,27 @@ and tidy them by typing or speaking naturally: "fees yesterday", "open the secon
 - **Open apps and folders:** "open spotify", "open zachary in vs code".
 
 ## Install
-**Linux: the ready-made app.** On GitHub go to **Actions → build** → the latest run →
-**Artifacts → Zachary-Linux**, or from a terminal:
-```bash
-RUN=$(gh run list -R zynssam/Zachary -w build -s success -L 1 --json databaseId -q '.[0].databaseId')
-gh run download "$RUN" -R zynssam/Zachary -n Zachary-Linux -D ~/Downloads/zachary
-mkdir -p ~/Apps && tar xzf ~/Downloads/zachary/Zachary-linux-x64.tar.gz -C ~/Apps
-sudo dnf install -y portaudio            # (Ubuntu: sudo apt install libportaudio2)
-~/Apps/Zachary/Zachary
-```
-It shows up in your app menu after the first start. To uninstall, delete `~/Apps/Zachary`.
+Download from **[Releases](https://github.com/zynssam/Zachary/releases/latest)**:
+- **Windows:** unzip `Zachary-windows-x64.zip` and run `Zachary\Zachary.exe`. At "Windows
+  protected your PC", click **More info → Run anyway** (the app isn't signed).
+- **Linux:** run these once:
+  ```bash
+  mkdir -p ~/Apps && tar xzf Zachary-linux-x64.tar.gz -C ~/Apps
+  sudo dnf install -y portaudio        # Ubuntu/Debian: sudo apt install libportaudio2
+  ~/Apps/Zachary/Zachary
+  ```
+  It adds itself to your app menu.
 
-**Windows (or Linux) from source** (Python 3.11+, Git):
+After that, **everything is done in the app**: first-run setup, then Settings. No terminal
+needed. To uninstall, delete the app folder.
+
+**From source** (Python 3.11+):
 ```bash
 git clone https://github.com/zynssam/Zachary && cd Zachary
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\Activate.ps1
 pip install -e .
-python -m zachary                                      # (= the assistant)
+python -m zachary
 ```
-On Linux from source you may need `libportaudio2` (the microphone) and `libxcb-cursor0`
-(Qt on X11).
 
 ## First run
 A five-step setup opens on the first start:
@@ -84,7 +85,7 @@ now**.
 
 Data folder: `~/.local/share/zachary` on Linux, `%LOCALAPPDATA%\Zachary` on Windows.
 
-## Everyday commands (CLI)
+## Optional: terminal commands
 `python -m zachary cli <command>`; in a release build, `Zachary cli <command>`.
 
 | Command | Does |
@@ -100,41 +101,43 @@ Data folder: `~/.local/share/zachary` on Linux, `%LOCALAPPDATA%\Zachary` on Wind
 | `pause` · `resume` | pause indexing |
 
 ## Troubleshooting
-- **"inotify watch limit" (Linux):** Zachary watches folders for changes, and big
-  homes need a higher limit.
-  ```bash
-  sudo sysctl fs.inotify.max_user_watches=524288
-  echo fs.inotify.max_user_watches=524288 | sudo tee /etc/sysctl.d/90-zachary.conf
-  ```
-- **The shortcut does nothing (GNOME / Wayland):** confirm the shortcut dialog GNOME
-  shows on first start. If it's gone, run `python -m zachary.assistant -v` from a
-  terminal and look for "hotkey". You can also add a custom keyboard shortcut that runs
-  `Zachary --toggle` (from source: `python -m zachary.assistant --toggle`).
-- **Voice: "I didn't hear anything" or wrong words:**
-  - Check the microphone with `cli voice mics`. It lists each mic with a live level; pick
-    one with `cli voice mics <id>`, or choose it in Settings.
-  - A Gnani key must be set; `cli voice setup` shows whether it is found (and downloads
-    the local speech models).
-  - On networks that intercept HTTPS (some campus/office Wi-Fi), the Gnani and LLM calls
-    fail. Use another network.
-- **"Gnani key missing":** add it in Settings → Voice & keys, or put
-  `GNANI_API_KEY=...` in the data-folder `.env`.
-- **Scanned PDFs or images aren't searchable:** turn on OCR in Settings, then install
+Most answers are in **Settings**:
+- each shortcut shows ✓ "working" or ✗ with the reason;
+- **Open log file** shows what Zachary did.
+
+- **The shortcut does nothing:**
+  - Open Settings (the tray icon, or click the app again) and check the ✓/✗ next to
+    each shortcut.
+  - If it says "already used", type another (e.g. `ctrl+alt+z`), click **Save**, then
+    **Restart now**.
+  - On Windows, Win+Space can't be used (Windows switches keyboard language with it).
+  - On GNOME, approve the shortcut dialog shown on first start.
+- **Voice isn't heard, or holding Space does nothing:** in Settings:
+  - tick **Voice commands**;
+  - choose your **Microphone**;
+  - paste your **Gnani** key under API keys;
+  - then click **Restart now**.
+- **Questions aren't answered:** in Settings, tick **Answer questions with AI** and add a
+  Groq or Gemini key. Some campus or office Wi-Fi blocks these services; try another
+  network.
+- **Scanned PDFs or images aren't searchable:** turn on OCR in Settings and install
   Tesseract:
   - Fedora: `sudo dnf install tesseract tesseract-langpack-hin`
   - Ubuntu: `sudo apt install tesseract-ocr tesseract-ocr-hin`
   - Windows: the UB-Mannheim installer
-- **Zachary is already running:** starting it again shows the running bar. To restart
-  with logs: `pkill -f zachary.assistant && python -m zachary.assistant -v`.
+- **"inotify watch limit" (Linux, very large homes):**
+  ```bash
+  sudo sysctl fs.inotify.max_user_watches=524288
+  echo fs.inotify.max_user_watches=524288 | sudo tee /etc/sysctl.d/90-zachary.conf
+  ```
 
 ## Building the app
 ```bash
 pip install -e ".[build]"
 pyinstaller packaging/zachary.spec --noconfirm     # -> dist/Zachary/
 ```
-CI (`.github/workflows/build.yml`) builds and smoke-tests the Linux app when packaging
-changes, on version tags, or by hand. (The spec also builds on Windows; there's no
-Windows download for now.) Models aren't bundled; they download on first use: the embedding model
+CI (`.github/workflows/build.yml`) builds and smoke-tests the Linux and Windows apps
+when packaging changes, on version tags (and attaches them to the release), or by hand. Models aren't bundled; they download on first use: the embedding model
 (~30 MB) and, if you turn on "Hey Zach", the Vosk model (~36 MB).
 
 ## Development

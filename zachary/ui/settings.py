@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -46,7 +46,10 @@ from zachary.ui import style
 
 LANGUAGES = [("en-IN", "English (with Hinglish)"), ("hi-IN", "Hindi")]
 KEYS = [("GNANI_API_KEY", "Gnani.ai (voice)"), ("GROQ_API_KEY", "Groq (questions, free tier)"),
-        ("GEMINI_API_KEY", "Gemini (questions, fallback)")]  # fmt: skip
+        ("GEMINI_API_KEY", "Gemini (questions, fallback)"),
+        ("ANTHROPIC_API_KEY", "Claude (questions, paid, optional)")]  # fmt: skip
+PROVIDERS = [("groq", "Groq (free tier, fastest)"), ("gemini", "Gemini (free tier)"),
+             ("claude", "Claude (paid)")]  # fmt: skip
 # Where to get each key, and what stops working without it.
 KEY_HELP = {
     "GNANI_API_KEY": ("https://docs.gnani.ai/api/introduction/quick-start",
@@ -54,6 +57,7 @@ KEY_HELP = {
     "GROQ_API_KEY": ("https://console.groq.com/keys", "questions about your files and projects"),
     "GEMINI_API_KEY": ("https://aistudio.google.com/apikey",
                        "the backup for questions when Groq is busy"),
+    "ANTHROPIC_API_KEY": ("https://console.anthropic.com", "Claude answers (optional, paid)"),
 }  # fmt: skip
 RESTART_KEYS = {"quickbar_hotkey", "voice_hotkey", "voice_enabled", "wake_word", "mic_device"}
 WINDOWS_RESERVED = {"super+space", "super+alt+space", "super+shift+space", "alt+space"}
@@ -131,6 +135,23 @@ class SettingsForm(QWidget):
             "installer.", self)  # fmt: skip
         self.ocr_note.setWordWrap(True)
         self.ocr_note.setStyleSheet(dim)
+        # AI answers (questions about your files / projects), indexing, privacy
+        self.llm = QCheckBox("Answer questions with AI (uses your Groq / Gemini key)", self)
+        self.llm.setChecked(s.llm_enabled)
+        self.provider = QComboBox(self)
+        for code, label in PROVIDERS:
+            self.provider.addItem(label, code)
+        self.provider.setCurrentIndex(max(0, self.provider.findData(s.llm_provider)))
+        self.paused = QCheckBox(
+            "Pause indexing (Zachary stops reading new and changed files)", self
+        )
+        self.paused.setChecked(s.indexing_paused)
+        self.hidden = QCheckBox("Include hidden folders (.config, .local…; usually app data)", self)
+        self.hidden.setChecked(s.index_hidden_folders)
+        self.keyterms = QCheckBox("Send my project / app / folder names to Gnani as hints, so "
+                                  "they're heard right (names only, never file contents)",
+                                  self)  # fmt: skip
+        self.keyterms.setChecked(s.stt_keyterms)
         self.autostart = QCheckBox("Start Zachary when I log in", self)
         try:
             self.autostart.setChecked(platform.autostart(self_command("zachary.assistant"))[0])
@@ -183,11 +204,28 @@ class SettingsForm(QWidget):
                 f.addRow(label, self.keys[name])
         return box
 
-    def keys_box(self) -> QWidget:
-        """All three API keys, each with where to get it and what it's for."""
+    def ai_box(self) -> QWidget:
+        box = QWidget(self)
+        f = QFormLayout(box)
+        f.addRow(self.llm)
+        f.addRow("Answer with", self.provider)
+        return box
+
+    def indexing_box(self) -> QWidget:
+        box = QWidget(self)
+        f = QFormLayout(box)
+        f.addRow(self.paused)
+        f.addRow(self.hidden)
+        f.addRow(self.keyterms)
+        return box
+
+    def keys_box(self, with_ai: bool = False) -> QWidget:
+        """The API keys, each with where to get it and what it's for."""
         box = QWidget(self)
         v = QVBoxLayout(box)
         v.setContentsMargins(0, 0, 0, 0)
+        if with_ai:  # (first-run setup: answers are on as soon as there's a key)
+            v.addWidget(self.llm)
         dim = style.theme().dim
         for name, label in KEYS:
             url, used_for = KEY_HELP[name]
@@ -214,7 +252,10 @@ class SettingsForm(QWidget):
         f = QFormLayout(box)
         f.addRow("Open the quick bar", self.quickbar_hotkey)
         f.addRow("Push-to-talk", self.voice_hotkey)
-        hint = QLabel("e.g. super+space, ctrl+alt+space. On GNOME you confirm it once.", box)
+        win = getattr(self.platform, "name", "") == "windows"
+        hint = QLabel("e.g. ctrl+alt+space, ctrl+shift+space (Windows keeps Win+Space)." if win
+                      else "e.g. super+space, ctrl+alt+space. On GNOME you confirm it once.",
+                      box)  # fmt: skip
         hint.setStyleSheet(f"color: {style.theme().dim};")
         f.addRow(hint)
         return box
@@ -259,7 +300,21 @@ class SettingsForm(QWidget):
             "tts_language": self.language.currentData(),
             "mic_device": self.mic.currentData(),
             "ocr_enabled": self.ocr.isChecked(),
+            "llm_enabled": self.llm.isChecked(),
+            "llm_provider": self.provider.currentData(),
+            "indexing_paused": self.paused.isChecked(),
+            "index_hidden_folders": self.hidden.isChecked(),
+            "stt_keyterms": self.keyterms.isChecked(),
         }
+        # Answer with a provider you have a key for (Groq -> Gemini -> Claude).
+        typed = {n for n, e in self.keys.items() if e.text().strip()}
+        have = {n for n, _l in KEYS if n in typed or has_secret(n)}
+        need = {"groq": "GROQ_API_KEY", "gemini": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY"}
+        if new["llm_enabled"] and need[new["llm_provider"]] not in have:
+            for code, _label in PROVIDERS:
+                if need[code] in have:
+                    new["llm_provider"] = code
+                    break
         changed = {k for k, v in new.items() if getattr(before, k) != v}
         for k in changed:
             self.cfg.set_setting(k, new[k])
@@ -276,6 +331,8 @@ class SettingsForm(QWidget):
             self.cfg.add_exclude(p, "path")
         for p in old_ex - new_ex:
             self.cfg.remove_exclude(p, "path")
+        if "GNANI_API_KEY" in typed:
+            self.needs_restart = True  # (voice reads its key at start)
         for name, field_ in self.keys.items():
             if field_.text().strip():
                 set_secret(name, field_.text().strip())
@@ -310,6 +367,21 @@ class SettingsForm(QWidget):
         threading.Thread(target=run, name="zach-vosk-download", daemon=True).start()
 
 
+def hotkey_html(rows: list[tuple[str, str, str | None, int]]) -> str:
+    lines = []
+    for what, key, problem, n in rows:
+        if problem:
+            lines.append(f"<span style='color:{style.WARN}'>✗</span> {what} ({key}): {problem}."
+                         " Pick another shortcut, Save, then Restart now.")  # fmt: skip
+        elif n:
+            lines.append(f"<span style='color:#4ADE80'>✓</span> {what} ({key}): working "
+                         f"(pressed {n} times).")  # fmt: skip
+        else:
+            lines.append(f"<span style='color:#4ADE80'>✓</span> {what} ({key}): ready. "
+                         "Press it to test.")  # fmt: skip
+    return "<br>".join(lines)
+
+
 def _scroll(inner: QWidget) -> QScrollArea:
     sa = QScrollArea()
     sa.setWidgetResizable(True)
@@ -320,7 +392,12 @@ def _scroll(inner: QWidget) -> QScrollArea:
 
 class SettingsWindow(QWidget):
     def __init__(
-        self, cfg: Config, platform: Platform, on_restart: Callable[[], None] | None = None
+        self,
+        cfg: Config,
+        platform: Platform,
+        on_restart: Callable[[], None] | None = None,
+        hotkey_status: Callable[[], list[tuple[str, str, str | None, int]]] | None = None,
+        log_file: Path | None = None,
     ) -> None:
         super().__init__(None, Qt.WindowType.Window)
         self.setWindowTitle("Zachary settings")
@@ -335,12 +412,31 @@ class SettingsWindow(QWidget):
                            ("Shortcuts", self.form.shortcuts_box()),
                            ("Voice", self.form.voice_box(with_keys=False)),
                            ("API keys", self.form.keys_box()),
+                           ("Answers (AI)", self.form.ai_box()),
+                           ("Indexing & privacy", self.form.indexing_box()),
                            ("Language & extras", self.form.extras_box())):  # fmt: skip
             head = QLabel(title, inner)
             head.setFont(style.font(head.font(), 1.2, 600))
             v.addWidget(head)
             v.addWidget(box)
         v.addStretch(1)
+        # Are the shortcuts working? (live: registered, and how often pressed)
+        self.hotkeys = QLabel(self)
+        self.hotkeys.setWordWrap(True)
+        self.hotkeys.setTextFormat(Qt.TextFormat.RichText)
+        self._hotkey_status = hotkey_status
+        if hotkey_status is not None:
+            v.insertWidget(4, self.hotkeys)  # (under the Shortcuts fields)
+            self._timer = QTimer(self)
+            self._timer.setInterval(1000)
+            self._timer.timeout.connect(self.refresh_hotkeys)
+            self._timer.start()
+            self.refresh_hotkeys()
+        if log_file is not None:
+            open_log = QPushButton("Open log file", inner)
+            open_log.setToolTip(str(log_file))
+            open_log.clicked.connect(lambda: platform.open_path(log_file))
+            v.addWidget(open_log, 0, Qt.AlignmentFlag.AlignLeft)
         save = QPushButton("Save", self)
         save.setStyleSheet(style.primary_css(style.theme()))
         self.restart_btn = QPushButton("Restart now", self)
@@ -360,6 +456,10 @@ class SettingsWindow(QWidget):
         bottom.addWidget(self.restart_btn)
         bottom.addWidget(save)
         lay.addLayout(bottom)
+
+    def refresh_hotkeys(self) -> None:
+        if self._hotkey_status is not None and self.isVisible():
+            self.hotkeys.setText(hotkey_html(self._hotkey_status()))
 
 
 class FirstRun(QWidget):
@@ -392,9 +492,11 @@ class FirstRun(QWidget):
         self.form = SettingsForm(cfg, platform, self)
         self.pages = QStackedWidget(self)
         bodies = [self.form.folders_box(), self.form.voice_box(with_keys=False),
-                  self.form.keys_box(), self.form.shortcuts_box(),
+                  self.form.keys_box(with_ai=True), self.form.shortcuts_box(),
                   self.form.extras_box()]  # fmt: skip
         self._keys_page = 2
+        self.form.llm.setChecked(True)  # (answers on; they work once a key is there)
+        self.form.voice_enabled.setChecked(True)  # (push-to-talk: the mic opens only on a press)
         self._warned_keys = False
         for (title, sub), body in zip(self.STEPS, bodies, strict=True):
             page = QWidget()

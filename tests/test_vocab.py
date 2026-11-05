@@ -123,7 +123,7 @@ def test_general_question_sends_only_the_question(
 
 
 def test_general_question_without_llm(h: Handler) -> None:
-    assert "turn on the LLM" in h.submit("how many planets are there").say
+    assert "Answer questions with AI" in h.submit("how many planets are there").say
 
 
 def test_impersonal_question_named_like_a_file_is_answered_from_it(

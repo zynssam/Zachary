@@ -166,3 +166,74 @@ def test_settings_refuse_win_space_on_windows_and_offer_a_restart(
     assert not win.restart_btn.isHidden()  # a shortcut changed: offer to restart
     win.restart_btn.click()
     assert restarts == [True]
+
+
+def test_everything_is_in_settings_no_terminal_needed(
+    qtbot: QtBot, conn: sqlite3.Connection, fake_platform: FakePlatform, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """AI answers, provider, pausing, hidden folders and name hints are all settings."""
+    from zachary.core import env
+    from zachary.ui import settings as st
+
+    monkeypatch.setattr(env, "secrets_file", lambda: tmp_path / "zenv")
+    monkeypatch.setattr(st, "has_secret", lambda _n: False)
+    cfg = _cfg(conn, fake_platform)
+    form = st.SettingsForm(cfg, fake_platform)
+    qtbot.addWidget(form)
+    form.llm.setChecked(True)
+    form.provider.setCurrentIndex(form.provider.findData("groq"))
+    form.keys["GEMINI_API_KEY"].setText("AIza-test")  # only a Gemini key...
+    form.paused.setChecked(True)
+    form.hidden.setChecked(True)
+    form.keyterms.setChecked(False)
+    assert form.apply() == []
+    s = cfg.load()
+    assert s.llm_enabled and s.llm_provider == "gemini"  # ...so Gemini answers
+    assert s.indexing_paused and s.index_hidden_folders and not s.stt_keyterms
+
+
+def test_first_run_turns_on_answers_and_voice(qtbot: QtBot, conn: sqlite3.Connection,
+                                              fake_platform: FakePlatform) -> None:  # fmt: skip
+    from zachary.ui.settings import FirstRun
+
+    setup = FirstRun(_cfg(conn, fake_platform), fake_platform)
+    qtbot.addWidget(setup)
+    assert setup.form.llm.isChecked() and setup.form.voice_enabled.isChecked()
+
+
+def test_shortcut_status_says_what_works() -> None:
+    from zachary.ui.settings import hotkey_html
+
+    html = hotkey_html([("Open the quick bar", "ctrl+alt+space", None, 2),
+                        ("Push-to-talk", "ctrl+shift+space", "already used by Windows", 0)])  # fmt: skip
+    assert "working (pressed 2 times)" in html and "already used by Windows" in html
+    assert "Restart now" in html
+
+
+def test_each_windows_hotkey_gets_its_own_id() -> None:
+    from zachary.core.hotkeys import parse_hotkey
+    from zachary.core.platform.windows import WindowsHotkey
+
+    a = WindowsHotkey(parse_hotkey("ctrl+alt+space"), lambda _t: None)
+    b = WindowsHotkey(parse_hotkey("ctrl+shift+space"), lambda _t: None)
+    assert a.hotkey_id != b.hotkey_id
+
+
+def test_log_file_is_written_to_the_data_folder(tmp_path: Path) -> None:
+    import logging
+
+    from zachary.assistant import add_log_file
+
+    path = add_log_file(tmp_path)
+    try:
+        logging.getLogger("zachary.test").info("hello from the log")
+        for h in logging.getLogger().handlers:
+            h.flush()
+        assert path is not None and "hello from the log" in path.read_text()
+    finally:
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            if getattr(h, "baseFilename", "") == str(path):
+                root.removeHandler(h)
+                h.close()
