@@ -7,6 +7,7 @@ Explorer open/reveal come later (see phase notes).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import struct
@@ -517,6 +518,31 @@ class WindowsPlatform:
 
     def ensure_app_registration(self, exec_argv: list[str]) -> None:
         """Nothing needed for hotkeys on Windows (Start-menu entry comes with packaging)."""
+
+    def autostart(self, exec_argv: list[str], enabled: bool | None = None) -> tuple[bool, str]:
+        """HKCU\\...\\Run (per user, no admin). pythonw.exe: no console window."""
+        if sys.platform != "win32":  # (keeps type-checking on Linux happy)
+            return False, "not on Windows"
+        import winreg
+
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        where = "HKCU\\" + key_path + "\\Zachary"
+        argv = list(exec_argv)
+        exe = Path(argv[0])
+        if exe.name.lower() == "python.exe" and (exe.parent / "pythonw.exe").exists():
+            argv[0] = str(exe.parent / "pythonw.exe")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:  # fmt: skip
+            if enabled is True:
+                winreg.SetValueEx(k, "Zachary", 0, winreg.REG_SZ, subprocess.list2cmdline(argv))
+            elif enabled is False:
+                with contextlib.suppress(FileNotFoundError):
+                    winreg.DeleteValue(k, "Zachary")
+            try:
+                winreg.QueryValueEx(k, "Zachary")
+                return True, where
+            except FileNotFoundError:
+                return False, where
 
     def global_hotkey(
         self,

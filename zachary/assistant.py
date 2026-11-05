@@ -19,12 +19,13 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from zachary.core.config import Config, default_db_path
 from zachary.core.db import get_state, open_db
 from zachary.core.hotkeys import HotkeyError, parse_hotkey
 from zachary.core.platform import Platform, get_platform
+from zachary.launch import frozen, self_command
 from zachary.ui import style
 from zachary.ui.engine import Engine
 from zachary.ui.quickbar import QuickBar
@@ -40,8 +41,22 @@ def server_name() -> str:
     return f"zachary-assistant-{getpass.getuser()}{os.environ.get('ZACHARY_INSTANCE', '')}"
 
 
+def restart_hint() -> str:
+    """The command that stops the running Zachary and starts it here with logs."""
+    import shlex
+
+    plat: str = sys.platform  # (a plain str: both branches are type-checked)
+    if frozen():  # the installed app (one executable)
+        if plat == "win32":
+            return f'taskkill /IM Zachary.exe /F  &&  "{sys.executable}" -v'
+        return f"pkill -f {shlex.quote(sys.executable)}; {shlex.quote(sys.executable)} -v"
+    if plat == "win32":
+        return "(close Zachary from the tray, then)  python -m zachary.assistant -v"
+    return "pkill -f zachary.assistant; python -m zachary.assistant -v"
+
+
 def toggle_cmd() -> list[str]:
-    return [sys.executable, "-m", "zachary.assistant", "--toggle"]
+    return self_command("zachary.assistant", "--toggle")
 
 
 def send_to_running(message: bytes, timeout_ms: int = 3000) -> bool:
@@ -113,7 +128,7 @@ def ensure_indexer(platform: Platform, db_path: Path) -> bool:
     """Start the indexer daemon unless it is alive. It refuses to run twice (lock)."""
     if indexer_running(db_path):
         return False
-    platform.spawn_detached([sys.executable, "-m", "zachary.indexer", "--db", str(db_path)])
+    platform.spawn_detached(self_command("zachary.indexer", "--db", str(db_path)))
     return True
 
 
@@ -134,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--show", action="store_true", help="show the quick bar at start")
     ap.add_argument("--no-voice", action="store_true", help="don't open the microphone")
     ap.add_argument("-v", "--verbose", action="count", default=0)
+    ap.add_argument("--wait-for-exit", action="store_true",
+                    help="(restart) wait for the running Zachary to quit")  # fmt: skip
     args = ap.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG
@@ -151,12 +168,16 @@ def main(argv: list[str] | None = None) -> int:
     style.use_dark(app)  # (look)
     app.setWindowIcon(app_icon())
 
+    if args.wait_for_exit:  # a restart: let the old Zachary finish quitting first
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and send_to_running(b"ping", 500):
+            time.sleep(0.3)
     message = b"talk" if args.talk else b"toggle" if args.toggle else b"show"
     if send_to_running(message):
         if message == b"show":  # started by hand: say why no new window/log appears
             print("Zachary is already running (its log isn't in this terminal); showing "
-                  "the bar.\nTo restart it here with logs:  pkill -f zachary.assistant && "
-                  "python -m zachary.assistant -v", file=sys.stderr)  # fmt: skip
+                  f"the bar.\nTo restart it here with logs:  {restart_hint()}",
+                  file=sys.stderr)  # fmt: skip
         return 0  # another instance owns the quick bar
     if args.talk:
         log.warning("no running assistant to talk to")
@@ -168,10 +189,17 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config(conn, platform)
     cfg.seed_defaults()
     settings = cfg.load()
+    from zachary.ui.settings import FirstRun, SettingsWindow, needs_first_run
+
+    first_run = needs_first_run(cfg)
     conn.close()
 
-    if not args.no_indexer:
-        ensure_indexer(platform, db_path)
+    def start_indexer() -> None:
+        if not args.no_indexer:
+            ensure_indexer(platform, db_path)
+
+    if not first_run:  # (first start: only once you've chosen your folders)
+        start_indexer()
 
     engine = Engine(db_path, platform)
     engine.start()
@@ -192,6 +220,33 @@ def main(argv: list[str] | None = None) -> int:
 
     serve_commands(server, {b"toggle": bar.toggle, b"show": bar.show_bar, b"talk": talk})
 
+    windows: dict[str, QWidget] = {}
+
+    def restart() -> None:
+        """Start a fresh Zachary (new shortcut / voice settings) and quit this one."""
+        extra = [] if args.db is None else ["--db", str(db_path)]
+        platform.spawn_detached(self_command("zachary.assistant", "--wait-for-exit", "--show",
+                                             *extra))  # fmt: skip
+        QTimer.singleShot(200, app.quit)
+
+    def open_settings() -> None:
+        w = SettingsWindow(Config(open_db(db_path), platform), platform, on_restart=restart)
+        windows["settings"] = w  # (keep a reference while it's open)
+        w.show()
+        w.raise_()
+        w.activateWindow()
+
+    def exclude_folder() -> None:
+        from PySide6.QtWidgets import QFileDialog
+
+        d = QFileDialog.getExistingDirectory(None, "Never look in this folder", str(Path.home()))
+        if d:
+            c = Config(open_db(db_path), platform)
+            c.add_exclude(d, "path")
+            c.conn.close()
+            bar.status.setText(f"Excluded {d}: forgotten and never read again.")
+
+    bar.open_settings = open_settings  # "open settings" in the bar (no tray on GNOME)
     tray = None
     if Tray.available():
         tray = Tray(
@@ -199,6 +254,8 @@ def main(argv: list[str] | None = None) -> int:
             on_pause=lambda p: (engine.ask("pause", p), None)[1],
             on_quit=app.quit,
             paused=settings.indexing_paused,
+            on_settings=open_settings,
+            on_exclude=exclude_folder,
         )
         tray.show()
     else:
@@ -210,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_hotkey:
         try:
             hk = parse_hotkey(args.hotkey or settings.quickbar_hotkey)
-            platform.ensure_app_registration([sys.executable, "-m", "zachary.assistant"])
+            platform.ensure_app_registration(self_command("zachary.assistant"))
             backend = platform.global_hotkey(
                 hk, lambda tok: bridge.pressed.emit(tok, time.perf_counter()), "Open Zachary"
             )
@@ -268,7 +325,18 @@ def main(argv: list[str] | None = None) -> int:
         bar.talk.connect(voice.push_to_talk)
         bar.hold_talk.connect(voice.hold_talk)
         bar.visibility.connect(voice.bar_visible)
-    if args.show or args.toggle:
+    if first_run:
+        setup = FirstRun(Config(open_db(db_path), platform), platform)
+        windows["setup"] = setup
+
+        def setup_done() -> None:
+            # Restart so the chosen shortcut and voice settings are live straight away
+            # (this process registered the hotkey and skipped voice before setup ran).
+            restart()
+
+        setup.finished.connect(setup_done)
+        QTimer.singleShot(0, setup.show)
+    elif args.show or args.toggle:
         QTimer.singleShot(0, bar.show_bar)
     # Warm the engine's DB connection and the cached list so the first open is fast.
     QTimer.singleShot(0, lambda: engine.ask("preview", ""))

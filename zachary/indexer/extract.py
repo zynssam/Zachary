@@ -20,6 +20,7 @@ TEXT_EXTS = frozenset({
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml", ".html", ".htm",
 })  # fmt: skip
 OFFICE_EXTS = frozenset({".pdf", ".docx", ".pptx", ".xlsx"})
+OCR_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif"})
 MAX_FILE_BYTES = 200 * 1024 * 1024  # never open files bigger than this
 TEXT_READ_FACTOR = 2  # read up to 2x max_bytes of raw bytes for text files
 
@@ -151,13 +152,29 @@ def _first_line(text: str) -> str | None:
     return None
 
 
-def extract(path: Path, ext: str, kind: str, size: int, max_bytes: int) -> Extracted | None:
-    """Text from the start of a document / code / text file, or None (name only)."""
+def extract(
+    path: Path, ext: str, kind: str, size: int, max_bytes: int, ocr: bool = False
+) -> Extracted | None:
+    """Text from the start of a document / code / text file, or None (name only).
+    ``ocr``: also read images, and scanned PDFs (almost no text), with Tesseract."""
     if size <= 0 or size > MAX_FILE_BYTES:
         return None
     try:
+        if ocr and ext in OCR_IMAGE_EXTS:
+            from zachary.indexer.ocr import ocr_image
+
+            text, cut = _clip([ocr_image(path)], max_bytes)
+            return Extracted(text, None, cut) if text else None
         if ext == ".pdf":
-            return _pdf(path, max_bytes)
+            ex = _pdf(path, max_bytes)
+            if ocr:
+                from zachary.indexer.ocr import looks_scanned, ocr_pdf
+
+                if looks_scanned(ex.text, 3):
+                    text, cut = _clip([ocr_pdf(path)], max_bytes)
+                    if text:
+                        return Extracted(text, ex.title, cut)
+            return ex
         if ext == ".docx":
             return _docx(path, max_bytes)
         if ext == ".pptx":
@@ -175,5 +192,6 @@ def extract(path: Path, ext: str, kind: str, size: int, max_bytes: int) -> Extra
     return None
 
 
-def extractable(ext: str, kind: str) -> bool:
-    return ext in OFFICE_EXTS or kind == "code" or ext in TEXT_EXTS
+def extractable(ext: str, kind: str, ocr: bool = False) -> bool:
+    return (ext in OFFICE_EXTS or kind == "code" or ext in TEXT_EXTS
+            or (ocr and ext in OCR_IMAGE_EXTS))  # fmt: skip

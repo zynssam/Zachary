@@ -167,9 +167,14 @@ class Settings:
     speak_replies: bool = True
     offline_stt_model: str = "tiny"
     mic_device: str = ""  # "" = system default input; see `cli voice mics`
+    # Phase 8. First-run setup shown until done; OCR (Tesseract, installed separately)
+    # for scanned PDFs and images: off by default (slow, runs in the background).
+    setup_done: bool = False
+    ocr_enabled: bool = False
 
 
 _SETTING_KEYS: tuple[str, ...] = tuple(Settings.__dataclass_fields__)
+WINDOWS_HOTKEYS = {"quickbar_hotkey": "ctrl+alt+space", "voice_hotkey": "ctrl+shift+space"}
 
 
 def default_db_path(platform: Platform | None = None) -> Path:
@@ -375,6 +380,14 @@ class Config:
                 "VALUES (?, ?, 'default')",
                 rows,
             )
+        # Windows reserves Win+Space (keyboard language) and Win+Alt+... for itself, so
+        # Zachary's shortcuts can't be registered there: Windows gets its own defaults.
+        if getattr(self.platform, "name", "") == "windows":
+            for key, value in WINDOWS_HOTKEYS.items():
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+                    (key, json.dumps(value)),
+                )
 
     def get_setting(self, key: str) -> Any:
         if key not in _SETTING_KEYS:

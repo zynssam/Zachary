@@ -825,6 +825,18 @@ def vars_of(cfg: Config) -> dict[str, object]:
     return {k: getattr(s, k) for k in s.__dataclass_fields__}
 
 
+def cmd_autostart(args: argparse.Namespace) -> int:
+    """Start Zachary when you log in, so "Hey Zach" and the hotkey always work."""
+    from zachary.core.platform import get_platform
+    from zachary.launch import self_command
+
+    want = {"on": True, "off": False}.get(args.state or "")
+    argv = self_command("zachary.assistant")
+    on, where = get_platform().autostart(argv, want)
+    print(f"start at login: {'on' if on else 'off'}  ({where})")
+    return 0
+
+
 def cmd_pause(args: argparse.Namespace, paused: bool) -> int:
     _, cfg = _open(args)
     cfg.set_setting("indexing_paused", paused)
@@ -945,6 +957,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("key", nargs="?")
     s.add_argument("value", nargs="?")
     s.set_defaults(fn=cmd_set)
+
+    s = sub.add_parser("autostart", help="start Zachary at login: autostart [on|off]")
+    s.add_argument("state", nargs="?", choices=["on", "off"])
+    s.set_defaults(fn=cmd_autostart)
 
     s = sub.add_parser("pause", help="pause indexing")
     s.set_defaults(fn=lambda a: cmd_pause(a, True))

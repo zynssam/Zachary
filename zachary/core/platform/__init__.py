@@ -134,6 +134,11 @@ class Platform(Protocol):
         """Register the app with the desktop if a hotkey backend needs it."""
         ...
 
+    def autostart(self, exec_argv: list[str], enabled: bool | None = None) -> tuple[bool, str]:
+        """Start ``exec_argv`` when you log in: turn on/off (None = just ask).
+        Returns (on?, where it's registered)."""
+        ...
+
     def global_hotkey(
         self,
         hotkey: Hotkey,

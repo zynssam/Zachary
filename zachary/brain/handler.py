@@ -127,6 +127,7 @@ class Reply:
     plan: planner.Plan | None = None  # ...and the plan itself (no DB reads on the UI thread)
     dictating: bool = False  # dictation mode is on (the UI keeps listening)
     notes: str = ""  # open the notes app: open | new | dictate (submit only)
+    settings: bool = False  # open the settings window (submit only)
 
 
 def clear_winner(results: list[SearchResult] | list[Item]) -> bool:
@@ -459,6 +460,9 @@ class Handler:
             reply = self._start_dictation(intent, execute=execute)
         elif intent.kind == "notes":
             reply = self._notes(intent, execute=execute)
+        elif intent.kind == "settings":
+            reply = (Reply("Opening settings.", "none", [], intent, settings=True) if execute
+                     else Reply("Enter: open settings.", "none", [], intent))  # fmt: skip
         elif intent.kind == "clean":
             reply = self._clean(intent, execute=execute)
         elif intent.kind == "organize":

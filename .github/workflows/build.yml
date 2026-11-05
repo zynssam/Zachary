@@ -1,0 +1,56 @@
+name: build
+# The Linux app (PyInstaller, packaging/zachary.spec), smoke-tested and uploaded as a
+# download. (Windows: run from source; see README.) Runs on version tags, by hand, and when packaging changes.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+    branches: ["**"]
+    paths: ["packaging/**", ".github/workflows/build.yml"]
+jobs:
+  app:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04]  # 22.04: older glibc, runs on more Linux systems
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libegl1 libgl1 libxkbcommon0 libfontconfig1 \
+            libdbus-1-3 libglib2.0-0 libportaudio2 libxcb-cursor0
+      - run: pip install ".[build]"
+      - run: pyinstaller packaging/zachary.spec --noconfirm
+      - name: Smoke test (index a folder, search it, run the indexer once)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -e
+          mkdir -p smoke/docs
+          echo "hostel fee due 15 November" > smoke/docs/fees.txt
+          Z=dist/Zachary/Zachary
+          [ -f "$Z.exe" ] && Z="$Z.exe"
+          ROOT="$(cd smoke/docs && pwd -W 2>/dev/null || pwd)"
+          "$Z" cli --db smoke/z.db set index_roots "[\"${ROOT//\\/\\\\}\"]"
+          "$Z" cli --db smoke/z.db scan
+          "$Z" cli --db smoke/z.db search fees
+          "$Z" indexer --db smoke/z.db --once
+          echo "frozen app OK"
+      - name: Package
+        run: |
+          cd dist
+          tar czf ../Zachary-linux-x64.tar.gz Zachary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zachary-Linux
+          path: Zachary-linux-x64.tar.gz
+          retention-days: 30
